@@ -14,10 +14,15 @@
 
 ## 构建
 
-```powershell
-# Windows（需要 Rust MSVC toolchain + Strawberry Perl + VS Build Tools/SDK）
-powershell -File scripts\build.ps1 build
-```
+原理：`rusqlite` 的 `bundled-sqlcipher-vendored-openssl` 特性在构建时源码编译 SQLCipher + OpenSSL（openssl-src），需要 C 工具链与 perl。Windows 的 openssl 构建流程直接调用 MSVC 的 cl/link（绕过 cc crate 探测），必须注入 vcvars 环境——`build.ps1` 用 vswhere 自动定位 vcvars64.bat（`QQFLOW_VCVARS` 环境变量可覆盖），并自动检查/前置 Strawberry Perl 与 nasm（Git 的 MSYS perl 会被拒绝）。
+
+| 平台 | 前置条件 | 构建命令 |
+|---|---|---|
+| Windows | Rust MSVC toolchain + Visual Studio（Desktop C++ 工作负载）+ [Strawberry Perl](https://strawberryperl.com)（含 nasm） | `powershell -File scripts\build.ps1 build` |
+| Linux | Rust + `build-essential`（gcc/make；perl 系统自带） | `bash scripts/build.sh build` |
+| macOS | Rust + Xcode Command Line Tools（`xcode-select --install`；perl 系统自带） | `bash scripts/build.sh build` |
+
+wrapper 透传全部 cargo 参数（`clippy`/`test`/`build --release` 等同理）；工具链由 `rust-toolchain.toml` 锁定（rustc 1.97.1）。
 
 ## 运行
 
@@ -66,7 +71,8 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=<token>"
 ## 测试
 
 ```powershell
-powershell -File scripts\build.ps1 test
+powershell -File scripts\build.ps1 test          # Windows
+bash scripts/build.sh test                        # Linux/macOS
 ```
 
 - `tests/sqlcipher_roundtrip.rs`：自建 SQLCipher 测试库（QQ 同参数 + 1024B 头 + WAL）验证

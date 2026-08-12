@@ -1,17 +1,82 @@
-# Build wrapper: initializes MSVC environment (vcvars64) then runs cargo.
+# Build wrapper v2: locates the MSVC environment via vswhere (falling back
+# to the legacy path), verifies perl/nasm/cargo, then runs cargo.
+#
+# Why this exists: rusqlite bundles SQLCipher + vendored OpenSSL
+# (openssl-src), whose perl Configure + nmake flow calls cl.exe/link.exe
+# directly and needs INCLUDE/LIB/PATH from vcvars64.bat — it bypasses the
+# cc crate's automatic MSVC detection. perl must be a native Windows Perl
+# (Strawberry): Git's MSYS perl mangles Windows paths in Configure.
+#
 # Usage: powershell -File scripts\build.ps1 [cargo args...]
+# Override the VS environment script with: $env:QQFLOW_VCVARS = "...vcvars64.bat"
 $ErrorActionPreference = "Stop"
-$vcvars = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found at $vcvars" }
 
-# Capture the environment produced by vcvars64.bat and apply it to this process.
+# --- 1. Locate vcvars64.bat: QQFLOW_VCVARS > vswhere > legacy fallback ---
+$vcvars = $env:QQFLOW_VCVARS
+if (-not $vcvars) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $vsPath = & $vswhere -latest -products "*" `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+        if ($vsPath) {
+            $candidate = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+            if (Test-Path $candidate) { $vcvars = $candidate }
+        }
+    }
+}
+if (-not $vcvars) {
+    $fallback = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+    if (Test-Path $fallback) { $vcvars = $fallback }
+}
+if (-not $vcvars) {
+    throw "vcvars64.bat not found. Install Visual Studio with the 'Desktop development with C++' workload, or set QQFLOW_VCVARS to your vcvars64.bat."
+}
+if (-not (Test-Path $vcvars)) {
+    throw "vcvars64.bat does not exist: $vcvars (check QQFLOW_VCVARS or your Visual Studio install)"
+}
+Write-Host "MSVC env script: $vcvars"
+
+# --- 2. Toolchain prerequisites (prepend BEFORE capturing vcvars env) ---
+$strawPerl = "C:\Strawberry\perl\bin"
+if (Test-Path "$strawPerl\perl.exe") {
+    $env:PATH = "$strawPerl;$env:PATH"
+} else {
+    $perlCmd = Get-Command perl -ErrorAction SilentlyContinue
+    if ($perlCmd) {
+        if ($perlCmd.Source -match "Git") {
+            throw "Found Git's MSYS perl at $($perlCmd.Source). openssl-src requires native Windows Perl - install Strawberry Perl: https://strawberryperl.com"
+        }
+        Write-Warning "Using non-Strawberry perl: $($perlCmd.Source)"
+    } else {
+        throw "perl not found (openssl-src needs it to run Configure). Install Strawberry Perl: https://strawberryperl.com"
+    }
+}
+if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+    if (Test-Path "C:\Strawberry\c\bin\nasm.exe") {
+        $env:PATH = "C:\Strawberry\c\bin;$env:PATH"
+    } else {
+        throw "nasm not found (OpenSSL x64 assembly). It ships with Strawberry Perl, or get it from https://nasm.us"
+    }
+}
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $cargoPath = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
+    if (Test-Path $cargoPath) {
+        $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+    } else {
+        throw "cargo not found. Install via rustup: https://rustup.rs"
+    }
+}
+
+# --- 3. Capture the vcvars environment into this process ---
 $envBlock = cmd /c "`"$vcvars`" >nul 2>&1 && set"
+if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed (exit $LASTEXITCODE)" }
 foreach ($line in $envBlock) {
     $i = $line.IndexOf('=')
     if ($i -gt 0) { [Environment]::SetEnvironmentVariable($line.Substring(0, $i), $line.Substring($i + 1), "Process") }
 }
 
-$env:PATH = "C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
+# --- 4. Passthrough ---
 Set-Location $PSScriptRoot\..
 & cargo @args
 exit $LASTEXITCODE

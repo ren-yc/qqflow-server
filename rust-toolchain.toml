@@ -1,0 +1,7 @@
+# Pinned toolchain: version-locked stable so clippy lint sets and behavior
+# are reproducible across machines (rustup auto-installs this toolchain).
+# Update by changing the version, then commit.
+[toolchain]
+channel = "1.97.1"   # rustc 1.97.1 (2026-07-14), matches the locally verified toolchain
+profile = "minimal"
+components = ["clippy", "rustfmt"]

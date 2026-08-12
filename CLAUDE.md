@@ -10,17 +10,21 @@ Headless HTTP API + SSE service that reads **local QQ NT chat records** (`nt_msg
 
 ## Commands
 
-All cargo invocations must go through the wrapper — it initializes the MSVC environment (vcvars64) plus Strawberry Perl (needed to build the vendored OpenSSL used by `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature). The wrapper passes through cargo args, so any cargo command works through it:
+All cargo invocations on Windows must go through the wrapper — the vendored OpenSSL build (openssl-src, via `rusqlite`'s `bundled-sqlcipher-vendored-openssl`) calls cl/link directly and needs the vcvars environment plus native Windows Perl. The wrapper locates `vcvars64.bat` via vswhere (`QQFLOW_VCVARS` env var overrides), prepends Strawberry Perl/nasm to PATH, and **rejects Git's MSYS perl** (it mangles paths in openssl Configure). Linux/macOS use `scripts/build.sh` (system perl + gcc/clang, no vcvars). Both pass through cargo args:
 
 ```powershell
-powershell -File scripts\build.ps1 build          # debug build
+powershell -File scripts\build.ps1 build          # debug build (Windows)
 powershell -File scripts\build.ps1 test           # all tests (integration + unit)
 powershell -File scripts\build.ps1 test roundtrip # single test by name filter
 powershell -File scripts\build.ps1 run
 powershell -File scripts\build.ps1 clippy
 ```
 
-The wrapper hardcodes `vcvars64.bat` at `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat` — update it if the VS path differs.
+```bash
+bash scripts/build.sh test                        # same on Linux/macOS
+```
+
+The toolchain is pinned by `rust-toolchain.toml` (rustc 1.97.1, version-locked for reproducible clippy lints); rustup auto-installs it on first use.
 
 Run against real data — **config-only, no CLI arguments**; configuration comes exclusively from `./qqflow-server.json` in the working directory (a missing file falls back to defaults):
 
