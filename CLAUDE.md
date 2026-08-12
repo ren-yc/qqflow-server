@@ -1,0 +1,111 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Overview
+
+Headless HTTP API + SSE service that reads **local QQ NT chat records** (`nt_msg.db`, SQLCipher-encrypted, 1024-byte custom header, WAL mode). This is an **independent project**; other projects (WeFlow HTTP API, QQBackup tools, etc.) are used only as functional references — e.g. the HTTP interface follows the WeFlow HTTP API contract (paths, params, response envelopes, SSE field names). Docs and 调研 notes are in Chinese; code comments are bilingual.
+
+**Deliberately out of scope:** key extraction (keys come from external tools like `QQBackup/qq-win-db-key`), media export, SNS endpoints.
+
+## Commands
+
+All cargo invocations must go through the wrapper — it initializes the MSVC environment (vcvars64) plus Strawberry Perl (needed to build the vendored OpenSSL used by `rusqlite`'s `bundled-sqlcipher-vendored-openssl` feature). The wrapper passes through cargo args, so any cargo command works through it:
+
+```powershell
+powershell -File scripts\build.ps1 build          # debug build
+powershell -File scripts\build.ps1 test           # all tests (integration + unit)
+powershell -File scripts\build.ps1 test roundtrip # single test by name filter
+powershell -File scripts\build.ps1 run
+powershell -File scripts\build.ps1 clippy
+```
+
+The wrapper hardcodes `vcvars64.bat` at `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat` — update it if the VS path differs.
+
+Run against real data — **config-only, no CLI arguments**; configuration comes exclusively from `./qqflow-server.json` in the working directory (a missing file falls back to defaults):
+
+```powershell
+.\qqflow-server.exe
+```
+
+Config fields (snake_case, all optional, serde `deny_unknown_fields` — unknown fields or type errors are fatal): `port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `poll_interval` / `data_dir` / `db_path` / `log`. See the README for an example.
+
+- `db_path` overrides database discovery: a Tencent Files-style root directory (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`) or a direct `nt_msg.db` file (account name taken from the nearest all-digit ancestor dir, fallback `custom`).
+- Keys (16 printable-ASCII bytes per account): `"keys"` object (`{"<qq>": "<key>"}`), optional `"keys_file"` external file (overrides `keys` for the same qq), or `"ask_key": true` interactive stdin. Invalid entries are skipped with a warning; persisted to `<data-dir>/keys.json` (write-only — not auto-loaded).
+
+Default `127.0.0.1:5031` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`, printed on first start. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
+
+## Architecture
+
+### Data pipeline
+
+```
+nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
+  → db::mirror::Mirror   copies per-account into <data-dir>/mirror/<qq>/
+                         (header stripped from main.db; WAL copied verbatim)
+  → db::decrypt::open_decrypted
+                         SQLCipher PRAGMA suite (page_size=4096, kdf_iter=4000,
+                         HMAC-SHA1, PBKDF2-SHA512, aes-256-cbc); retries with
+                         HMAC-SHA512; verifies via sqlite_master
+  → store::index::build_index / append_new
+                         full-table scan → in-memory Store; incremental rowid
+                         appends afterwards
+  → server (axum) + poller (tokio broadcast)
+```
+
+### The in-memory index (core design decision)
+
+`nt_msg.db` message columns have no useful indexes — SQL filtering means a 30–60 s full table scan per query on a real (~190 MB) database. So the server scans both tables **once at startup** into a `HashMap`-based `Store` and keeps it incrementally updated: the poller appends rows with `rowid > watermark` and the same `Store` is the single source of truth for both HTTP queries and SSE events. All query logic (`store::query`) works against this in-memory structure, never SQL.
+
+- Table shapes (numeric column names are QQ-version-dependent, treat as fragile):
+  - `group_msg_table`: `"40021"` group id, `"40001"` seq, `"40020"` sender uid, `"40093"` nickname, `"40800"` message blob
+  - `c2c_msg_table`: `"40020"` peer uid, `"40001"` seq, `"40093"` nickname, `"40800"` blob
+- Message timestamp is packed in the high 32 bits of seq: `seq_to_time(seq) = seq >> 16` (`parser::types`).
+- Conversation map key: `g:<groupId>` / `c:<peerUid>` (`store::conv_key`). `classify_talker` disambiguates: all-digit → group, `u_`-prefixed → c2c.
+- Conversations have a `dirty` flag; append-only changes trigger a lazy re-sort by `(ts, rowid)` on next query (`Conversation::ensure_sorted`).
+
+### Poller / real-time path
+
+One poll task per account (`poller::spawn`, runs in `spawn_blocking`), default 1500 ms interval. Each tick:
+1. `Mirror::sync()` — re-copies the source WAL (cheap). If the source main file's size/mtime changed (SQLite checkpoint merged WAL pages), rebuilds the whole mirror.
+2. Reopens the decrypted connection, then `index::append_new` per table for `rowid > watermark`.
+3. Emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
+
+SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events; broadcast lag re-syncs the client with a fresh `sync`. KeepAlive ping every 15 s.
+
+### Startup sequence (`server::run_with`)
+
+Parse args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → load keys (`KeyStore`, validated + persisted to `<data-dir>/keys.json`) → bind listener **early** so `/health` reports "starting" during index build → per-account `spawn_blocking` index build (CPU-bound decrypt + full scan) → start pollers → set ready flag → wait for Ctrl-C → signal shutdown watch, abort poll tasks, delete mirror dir.
+
+### Heuristic message parser (`parser`)
+
+Message BLOBs are protobuf-ish with no stable schema, so text extraction is heuristic by design (inherited from QQFlow behavior): scan for runs of common Han characters (U+4E00–U+9FA5, which avoids protobuf varint codepoint garbage), ≥ 2 chars with > 60% common ratio, plus an ASCII fallback; media recognized by byte signatures (`.jpg/.png/.gif/gchatpic`, `.amr/.silk/.ptt`, `shortvideo/.mp4`); recall/system by characteristic phrases ("你猜猜撤回了什么", "拍了拍", "撤回了一条", "修改群名"). An iteration budget (`n*50`) bounds worst-case cost. This is intentionally tolerant of QQ version churn — expect degraded output, not crashes.
+
+### Concurrency
+
+- `parking_lot::RwLock<Store>` shared via `Arc` — single lock for the whole store (poller writes, handlers read).
+- tokio `broadcast` for SSE events; `watch` channel for shutdown; CPU-bound decrypt/scan work in `spawn_blocking`.
+- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState`, "indexing"/"ready"/"error"), a global `ready` AtomicBool, and the token.
+- Auth: Bearer header / `?access_token=` (recommended for SSE) / POST JSON body, constant-time comparison (`config::constant_time_eq`).
+
+## Known issues
+
+- **c2c (private-chat) messages were silently dropped** — FIXED: `store/index.rs` now uses per-table column mapping (group 6 cols / c2c 5 cols, peer = sender). Guarded by the `fake_db_indexes_c2c_rows` regression test in `tests/real_db_groundtruth.rs`.
+
+## Version-fragility notes
+
+- Numeric column names (`"40021"`, `"40800"`, …), table layouts, and the uid→QQ mapping table all vary with QQ versions; code degrades gracefully (best-effort queries, heuristic parsing).
+- `store::mapping::load_uid_map` is currently **dead code** — defined for future UID→QQ-number resolution but never called.
+- `MessageOut::is_send` is hardcoded `0` — v1 limitation: message direction is not reliably derivable from the available columns.
+
+## Tests
+
+- `tests/sqlcipher_roundtrip.rs` — self-built SQLCipher test database with QQ's exact PRAGMA parameters + fake 1024-byte header + WAL. Proves: decryption round-trip, WAL-only writes visible through the mirror (real-time polling path), checkpoint-triggered mirror rebuild, wrong-key failure. **Never touches real QQ data.**
+- `tests/api_smoke.rs` — HTTP layer contract tests via `tower::ServiceExt::oneshot` (no network, no real DB); builds a fake `AppState` with seeded conversations.
+- Unit tests live inline in modules (`parser`, `keystore`, `decrypt`, `mirror`).
+- Note for `sqlcipher_roundtrip`: the mirror's reader connection must be dropped before the mirror is rebuilt underneath it.
+
+## External references
+
+- WeFlow API contract: `weflow-api.md` in the local `campus-info-hub-py` project (`src/sources/weflow/`)
+- Research notes: local Claude plan document `https-github-com-yfgug-qqflow-1-github-concurrent-lovelace.md` (plans directory)

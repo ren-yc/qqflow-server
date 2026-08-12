@@ -78,7 +78,8 @@ impl ChatType {
     }
 }
 
-/// QQ NT stores the message time in the high 32 bits of the "40001" seq value.
+/// QQ NT stores the message time in the high 32 bits of the "40001" seq
+/// value (verified against a real database: seq = (ts << 32) | low32).
 pub fn seq_to_time(seq: i64) -> i64 {
-    seq >> 16
+    seq >> 32
 }

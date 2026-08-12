@@ -10,16 +10,16 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::store::query::{query_messages, MessageQuery};
 use crate::store::AppState;
 
-use super::{authorized, parse_time_bound};
+use super::{authorized, merge_body, parse_time_bound};
 use crate::server::error::ApiError;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Params {
     pub talker: Option<String>,
     #[serde(default = "default_limit")]
@@ -48,7 +48,9 @@ pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(params): Query<Params>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let params = merge_body(params, &body).await?;
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());
     }

@@ -24,7 +24,19 @@ fn guess_group_name(text: &str, current: &str) -> String {
     for marker in ["修改群名为", "已将群名修改为"] {
         if let Some(idx) = text.find(marker) {
             let name = text[idx + marker.len()..].trim();
-            let name = name.trim_matches(|c: char| c.is_ascii_whitespace() || c == '"' || c == '\'' || c == '，' || c == '。');
+            let name = name.trim_matches(|c: char| {
+                c.is_ascii_whitespace()
+                    || c == '"'
+                    || c == '\''
+                    || c == '，'
+                    || c == '。'
+                    || c == '「'
+                    || c == '」'
+                    || c == '（'
+                    || c == '）'
+                    || c == '('
+                    || c == ')'
+            });
             if !name.is_empty() && name.chars().count() <= 64 {
                 return name.to_string();
             }
@@ -97,18 +109,38 @@ fn scan_table(
     let mut stmt = conn
         .prepare(&sql)
         .with_context(|| format!("prepare scan {table}"))?;
-    let rows = stmt.query_map([], |row| {
-        let rowid: i64 = row.get(0)?;
-        let a: String = row.get(1)?;
-        let seq: i64 = row.get(2)?;
-        let uid: String = row.get(3)?;
-        let nick: String = row.get(4)?;
-        let blob: Vec<u8> = row.get(5)?;
-        Ok((rowid, a, seq, uid, nick, blob))
+    // Column mapping differs per table (the c2c query has one column fewer
+    // and no separate sender column — the peer is the sender):
+    //   group: rowid, "40021"(talker), "40001"(seq), "40020"(sender), "40093"(nick), "40800"(blob)
+    //   c2c:   rowid, "40020"(peer=talker=sender), "40001"(seq), "40093"(nick), "40800"(blob)
+    let rows = stmt.query_map([], |row| match chat_type {
+        ChatType::Group => {
+            let rowid: i64 = row.get(0)?;
+            let a: String = row.get(1)?;
+            let seq: i64 = row.get(2)?;
+            let uid: String = row.get(3)?;
+            let nick: String = row.get(4)?;
+            let blob: Vec<u8> = row.get(5)?;
+            Ok((rowid, a, seq, uid, nick, blob))
+        }
+        ChatType::C2c => {
+            let rowid: i64 = row.get(0)?;
+            let a: String = row.get(1)?;
+            let seq: i64 = row.get(2)?;
+            let nick: String = row.get(3)?;
+            let blob: Vec<u8> = row.get(4)?;
+            Ok((rowid, a.clone(), seq, a, nick, blob))
+        }
     })?;
     let mut watermark = 0i64;
-    for r in rows.flatten() {
-        let (rowid, a, seq, uid, nick, blob) = r;
+    for r in rows {
+        let (rowid, a, seq, uid, nick, blob) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("scan {table}: row skipped: {e}");
+                continue;
+            }
+        };
         apply_row(store, chat_type, rowid, &a, &uid, &nick, seq, &blob);
         watermark = watermark.max(rowid);
     }
@@ -145,19 +177,36 @@ pub fn append_new(
     let mut stmt = conn
         .prepare(&sql)
         .with_context(|| format!("prepare append {table}"))?;
-    let rows = stmt.query_map([watermark], |row| {
-        let rowid: i64 = row.get(0)?;
-        let a: String = row.get(1)?;
-        let seq: i64 = row.get(2)?;
-        let uid: String = row.get(3)?;
-        let nick: String = row.get(4)?;
-        let blob: Vec<u8> = row.get(5)?;
-        Ok((rowid, a, seq, uid, nick, blob))
+    // Same per-table column mapping as `scan_table`; see its comment.
+    let rows = stmt.query_map([watermark], |row| match chat_type {
+        ChatType::Group => {
+            let rowid: i64 = row.get(0)?;
+            let a: String = row.get(1)?;
+            let seq: i64 = row.get(2)?;
+            let uid: String = row.get(3)?;
+            let nick: String = row.get(4)?;
+            let blob: Vec<u8> = row.get(5)?;
+            Ok((rowid, a, seq, uid, nick, blob))
+        }
+        ChatType::C2c => {
+            let rowid: i64 = row.get(0)?;
+            let a: String = row.get(1)?;
+            let seq: i64 = row.get(2)?;
+            let nick: String = row.get(3)?;
+            let blob: Vec<u8> = row.get(4)?;
+            Ok((rowid, a.clone(), seq, a, nick, blob))
+        }
     })?;
     let mut new_wm = watermark;
     let mut appended = Vec::new();
-    for r in rows.flatten() {
-        let (rowid, a, seq, uid, nick, blob) = r;
+    for r in rows {
+        let (rowid, a, seq, uid, nick, blob) = match r {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("append {table}: row skipped: {e}");
+                continue;
+            }
+        };
         apply_row(store, chat_type, rowid, &a, &uid, &nick, seq, &blob);
         new_wm = new_wm.max(rowid);
         appended.push(MessageRecord {

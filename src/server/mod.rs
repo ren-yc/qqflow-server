@@ -9,13 +9,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::routing::get;
-use clap::Parser;
 use axum::Router;
 use parking_lot::RwLock;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::cli::Args;
 use crate::config;
 use crate::db;
 use crate::db::mirror::Mirror;
@@ -48,33 +46,32 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Full startup: parse args, load keys, scan accounts, build indexes,
+/// Full startup: load config, load keys, scan accounts, build indexes,
 /// start pollers, bind the server. Runs until Ctrl-C.
 pub async fn serve() -> Result<()> {
-    let args = Args::parse();
-    run_with(args).await
+    let cfg = config::load()?;
+    crate::logging::init(&cfg.log);
+    run_with(cfg).await
 }
 
-pub async fn run_with(args: Args) -> Result<()> {
-    crate::logging::init(&args.log);
-    let data_dir = config::data_dir(args.data_dir.as_deref())?;
-    let token = config::load_or_create_token(&data_dir, args.token.as_deref())?;
+pub async fn run_with(cfg: config::Config) -> Result<()> {
+    let data_dir = config::data_dir(cfg.data_dir.as_deref())?;
+    let token = config::load_or_create_token(&data_dir, cfg.token.as_deref())?;
 
     // ---- accounts & keys -------------------------------------------------
-    let mut accounts = db::scan::scan_accounts()?;
-    if !args.qq.is_empty() {
-        accounts.retain(|a| args.qq.contains(&a.qq));
+    let mut accounts = db::scan::scan_accounts(cfg.db_path.as_deref())?;
+    if !cfg.qq.is_empty() {
+        accounts.retain(|a| cfg.qq.contains(&a.qq));
     }
     if accounts.is_empty() {
-        anyhow::bail!("未找到 QQ 数据库（nt_msg.db）。请确认 QQ 已安装并登录过。");
+        anyhow::bail!("未找到 QQ 数据库（nt_msg.db）。请确认 QQ 已安装并登录过，或在配置文件中设置 db_path。");
     }
     let qq_list: Vec<String> = accounts.iter().map(|a| a.qq.clone()).collect();
-    let mut keys = KeyStore::load(&args.key, args.keys_file.as_deref(), args.ask_key, &qq_list)?;
-    keys.bind_positional(&qq_list);
+    let keys = KeyStore::load(&cfg.keys, cfg.keys_file.as_deref(), cfg.ask_key, &qq_list)?;
     for a in &accounts {
         if keys.get(&a.qq).is_none() {
             anyhow::bail!(
-                "缺少 QQ {} 的数据库密钥。请先用 qq-win-db-key 提取，再以 --key 或 --keys-file 提供。",
+                "缺少 QQ {} 的数据库密钥。请先用 qq-win-db-key 提取，再在配置文件中设置 keys 或 keys_file。",
                 a.qq
             );
         }
@@ -96,7 +93,7 @@ pub async fn run_with(args: Args) -> Result<()> {
 
     // ---- server (bind early; /health reports "starting") ------------------
     let app = build_router(state.clone());
-    let addr = format!("{}:{}", args.host, args.port);
+    let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -116,7 +113,7 @@ pub async fn run_with(args: Args) -> Result<()> {
         let tx = tx.clone();
         let accounts_state = accounts_state.clone();
         let mirror_root = data_dir.join("mirror");
-        let poll_ms = args.poll_interval;
+        let poll_ms = cfg.poll_interval;
         let qq = info.qq.clone();
 
         // Index build is CPU-bound (decrypt + full scan): run in blocking pool.

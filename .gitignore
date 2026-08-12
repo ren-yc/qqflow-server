@@ -22,3 +22,6 @@ Desktop.ini
 # Local overrides
 *.local
 .env
+
+# Config files
+qqflow-server.json

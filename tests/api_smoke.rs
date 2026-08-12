@@ -233,8 +233,9 @@ fn query_messages_keyword() {
 
 #[test]
 fn seq_time_extraction() {
-    // seq = (time << 16) | seqno
-    assert_eq!(seq_to_time(0x6771A6B50001), 0x6771A6B5);
+    // Real QQ layout (verified against a real database): seq = (time << 32) | low32.
+    let seq = (0x6771A6B5i64 << 32) | 1;
+    assert_eq!(seq_to_time(seq), 0x6771A6B5);
 }
 
 #[test]

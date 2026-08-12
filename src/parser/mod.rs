@@ -38,9 +38,97 @@ fn is_valid_chat_text(s: &str) -> bool {
     s.chars().count() >= MIN_TEXT_LEN && common_ratio(s) > MIN_COMMON_RATIO
 }
 
-fn looks_like_json(s: &str) -> bool {
-    let t = s.trim_start();
-    t.starts_with('{') || t.starts_with('[')
+/// JSON-structured message check (mini-program / share / card):
+/// ≥ 50 chars with > 12% JSON syntax characters.
+fn is_json_blob(text: &str) -> bool {
+    let total = text.chars().count() as f64;
+    if total < 50.0 {
+        return false;
+    }
+    let json_chars = text
+        .chars()
+        .filter(|c| matches!(c, '{' | '}' | '"' | ':' | '[' | ']'))
+        .count() as f64;
+    json_chars / total > 0.12
+}
+
+/// Extract a single JSON string field value (handles \" escapes).
+fn extract_json_field(text: &str, field_name: &str) -> Option<String> {
+    let search = format!("\"{}\":\"", field_name);
+    let pos = text.find(&search)?;
+    let after_key = &text[pos + search.len()..];
+    let mut result = String::new();
+    let mut in_escape = false;
+    for c in after_key.chars() {
+        if in_escape {
+            result.push(c);
+            in_escape = false;
+            continue;
+        }
+        if c == '\\' {
+            in_escape = true;
+            continue;
+        }
+        if c == '"' {
+            break;
+        }
+        result.push(c);
+    }
+    let cleaned = result
+        .replace("\\/", "/")
+        .replace("\\n", " ")
+        .replace("\\t", " ")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Try to extract human-readable content from a JSON-structured message
+/// (mini-program / share / card). Returns None when not JSON-structured.
+/// Behavior matches the reference implementation: prompt/desc/title/nick
+/// joined with " | " ("来自: " prefix for nick), fallback "[小程序/分享]".
+fn extract_json_blob(text: &str) -> Option<String> {
+    if !is_json_blob(text) {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    // prompt is most common for shares/mini-programs; strip QQ's "[小程序]" etc. prefixes.
+    if let Some(p) = extract_json_field(text, "prompt") {
+        // QQ prefixes share prompts with bracketed labels like "[小程序]";
+        // strip only a leading bracket group, never real text.
+        let cleaned = match p.find(']') {
+            Some(idx) if p.starts_with('[') => p[idx + 1..].trim_start().to_string(),
+            _ => p,
+        };
+        if !cleaned.is_empty() {
+            parts.push(cleaned);
+        }
+    }
+    if let Some(d) = extract_json_field(text, "desc")
+        && !parts.iter().any(|p| p == &d)
+    {
+        parts.push(d);
+    }
+    if let Some(t) = extract_json_field(text, "title")
+        && !parts.iter().any(|p| p == &t)
+    {
+        parts.push(t);
+    }
+    if let Some(n) = extract_json_field(text, "nick") {
+        let nick_text = format!("来自: {n}");
+        if !parts.iter().any(|p| p.contains(&nick_text)) {
+            parts.push(nick_text);
+        }
+    }
+    Some(if parts.is_empty() {
+        "[小程序/分享]".to_string()
+    } else {
+        parts.join(" | ")
+    })
 }
 
 fn media_type_from_bytes(blob: &[u8]) -> Option<MsgType> {
@@ -168,12 +256,20 @@ pub fn extract_text(blob: &[u8]) -> ParsedMessage {
         if s.contains("你猜猜撤回了什么") {
             return ParsedMessage { msg_type: MsgType::Recall, content: s.into() };
         }
-        if s.contains("拍了拍") || s.contains("撤回了一条") || s.contains("修改群名") {
+        // "已将群名修改为/修改群名为" are the actual rename-message shapes
+        // ("修改群名" alone never appears in real rename messages).
+        if s.contains("拍了拍")
+            || s.contains("撤回了一条")
+            || s.contains("修改群名")
+            || s.contains("已将群名修改为")
+            || s.contains("修改群名为")
+        {
             return ParsedMessage { msg_type: MsgType::System, content: s.into() };
         }
-        // Whole-buffer UTF-8 parse: JSON-shaped payloads (mini-program etc.).
-        if looks_like_json(s) && is_valid_chat_text(s.trim_matches(|c: char| c == '{' || c == '}' || c == '[' || c == ']' || c.is_ascii_whitespace())) {
-            return ParsedMessage { msg_type: MsgType::Other, content: s.into() };
+        // Structured JSON payloads (mini-program / share / card): extract
+        // prompt/desc/title/nick instead of dumping raw JSON.
+        if let Some(extracted) = extract_json_blob(s.trim()) {
+            return ParsedMessage { msg_type: MsgType::Other, content: extracted };
         }
     }
 
@@ -232,5 +328,50 @@ mod tests {
         // A one-char or invalid blob must not produce nonsense text.
         let p = extract_text(&[0xE5, 0x8F, 0x91]); // partial UTF-8
         assert!(matches!(p.msg_type, MsgType::Other | MsgType::Text));
+    }
+
+    #[test]
+    fn miniapp_json_fields_extracted() {
+        let blob = r#"{"appID":"x","prompt":"分享一个链接","desc":"有趣内容","title":"标题"}"#.as_bytes();
+        let p = extract_text(blob);
+        assert_eq!(p.msg_type, MsgType::Other);
+        assert!(p.content.contains("分享一个链接"), "got: {}", p.content);
+        assert!(p.content.contains("有趣内容"), "got: {}", p.content);
+        assert!(p.content.contains("标题"), "got: {}", p.content);
+    }
+
+    #[test]
+    fn miniapp_bracket_label_stripped_not_text() {
+        // "[小程序]xxx" prefix is stripped, but a plain "分享..." prompt text
+        // must NOT be eaten by the label stripping.
+        let blob = r#"{"appID":"x","prompt":"[小程序]分享一个链接","desc":"有趣内容"}"#.as_bytes();
+        let p = extract_text(blob);
+        assert_eq!(p.msg_type, MsgType::Other);
+        assert!(p.content.contains("分享一个链接"), "got: {}", p.content);
+        assert!(!p.content.contains('['), "got: {}", p.content);
+    }
+
+    #[test]
+    fn miniapp_json_fallback_label() {
+        // JSON-structured but without extractable fields -> generic label.
+        let blob = r#"{"type":1,"code":2,"data":{},"x":true,"y":null,"z":12345}"#.as_bytes();
+        let p = extract_text(blob);
+        assert_eq!(p.msg_type, MsgType::Other);
+        assert!(p.content.contains("小程序"), "got: {}", p.content);
+    }
+
+    #[test]
+    fn rename_message_is_system() {
+        // Real QQ rename messages say "已将群名修改为", which must classify
+        // as System so the index can extract the new group name.
+        let p = extract_text("群主已将群名修改为「测试群」".as_bytes());
+        assert_eq!(p.msg_type, MsgType::System);
+    }
+
+    #[test]
+    fn plain_ascii_is_not_miniapp() {
+        // Long plain ASCII has ~0% JSON-syntax chars: must stay text.
+        let p = extract_text(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(p.msg_type, MsgType::Text);
     }
 }

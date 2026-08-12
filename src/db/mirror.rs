@@ -92,7 +92,14 @@ impl Mirror {
     /// Poll-time sync: re-copy the WAL (cheap, ≤ ~4 MB). If the source main
     /// file changed (checkpoint or rebuild), refresh the whole mirror.
     /// Returns true when a rebuild happened.
+    ///
+    /// Order matters: the WAL is copied BEFORE stat'ing the main file. If a
+    /// checkpoint lands between the two operations, the stat detects the
+    /// main-file change and triggers a full rebuild; copying WAL-first means
+    /// we never combine a stale main with a reset WAL (whose salt would not
+    /// match, silently dropping tail frames until the next poll).
     pub fn sync(&mut self) -> Result<bool> {
+        self.copy_wal_verbatim()?;
         let meta = std::fs::metadata(&self.src_main)
             .with_context(|| format!("stat {}", self.src_main.display()))?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -101,7 +108,6 @@ impl Mirror {
             self.rebuild()?;
             return Ok(true);
         }
-        self.copy_wal_verbatim()?;
         Ok(false)
     }
 

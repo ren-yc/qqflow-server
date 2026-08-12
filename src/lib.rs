@@ -8,7 +8,6 @@
 //! Key extraction is intentionally NOT implemented — keys come from external
 //! tools (e.g. QQBackup/qq-win-db-key) via CLI / keys file / interactive input.
 
-pub mod cli;
 pub mod config;
 pub mod db;
 pub mod keystore;

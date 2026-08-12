@@ -1,6 +1,6 @@
 //! Locate per-account QQ NT chat databases (`nt_msg.db`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -31,7 +31,14 @@ fn documents_dir() -> PathBuf {
 /// on Windows; on Linux/macOS glob `~/.config/QQ/nt_qq_*/nt_db/` (Linux) and
 /// `~/Library/Application Support/QQ/nt_qq_*/nt_db/` (macOS) for files matching
 /// `*msg*.db` and pick the largest as the chat database (v1 heuristic).
-pub fn scan_accounts() -> Result<Vec<DbInfo>> {
+///
+/// `override_root` (from `--db-path`) bypasses platform discovery: a directory
+/// is treated as a Tencent Files-style root (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`),
+/// a file is used directly as the chat database.
+pub fn scan_accounts(override_root: Option<&Path>) -> Result<Vec<DbInfo>> {
+    if let Some(p) = override_root {
+        return scan_custom(p);
+    }
     #[cfg(target_os = "windows")]
     {
         scan_windows()
@@ -58,12 +65,16 @@ pub fn scan_accounts() -> Result<Vec<DbInfo>> {
 
 #[cfg(target_os = "windows")]
 fn scan_windows() -> Result<Vec<DbInfo>> {
-    let base = documents_dir().join("Tencent Files");
+    scan_root(&documents_dir().join("Tencent Files"))
+}
+
+/// Walk a Tencent Files-style root: `<root>/<digits>/nt_qq/nt_db/nt_msg.db`.
+fn scan_root(base: &Path) -> Result<Vec<DbInfo>> {
     let mut out = Vec::new();
     if !base.is_dir() {
         return Ok(out);
     }
-    let entries = std::fs::read_dir(&base).with_context(|| format!("read {}", base.display()))?;
+    let entries = std::fs::read_dir(base).with_context(|| format!("read {}", base.display()))?;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if !name.chars().all(|c| c.is_ascii_digit()) {
@@ -76,6 +87,35 @@ fn scan_windows() -> Result<Vec<DbInfo>> {
     }
     out.sort_by(|a, b| a.qq.cmp(&b.qq));
     Ok(out)
+}
+
+/// `--db-path` override: direct file, or Tencent Files-style root directory.
+fn scan_custom(path: &Path) -> Result<Vec<DbInfo>> {
+    if path.is_file() {
+        let qq = nearest_digit_dir(path).unwrap_or_else(|| "custom".to_string());
+        return Ok(vec![DbInfo { qq, path: path.to_path_buf() }]);
+    }
+    if path.is_dir() {
+        let out = scan_root(path)?;
+        if out.is_empty() {
+            anyhow::bail!("--db-path 目录下未找到 nt_msg.db: {}", path.display());
+        }
+        return Ok(out);
+    }
+    anyhow::bail!("--db-path 不存在: {}", path.display())
+}
+
+/// Best-effort account number from a direct db path: the nearest ancestor
+/// directory whose name is all digits.
+fn nearest_digit_dir(path: &Path) -> Option<String> {
+    path.ancestors().find_map(|a| {
+        let n = a.file_name()?.to_string_lossy();
+        if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+            Some(n.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

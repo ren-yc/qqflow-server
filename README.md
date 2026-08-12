@@ -1,18 +1,15 @@
 # qqflow-server
 
 无头 HTTP API + SSE 服务：读取本地 QQ NT 版聊天记录（SQLCipher 解密 `nt_msg.db`）。
-接口形态与 **WeFlow HTTP API** 兼容（`E:\Camp\SJTU\campus-info-hub-py\src\sources\weflow\weflow-api.md` 为契约参考），便于与 campus-info-hub-py 等既有项目对接。
-
-> 调研背景见 `C:\Users\ryc\.claude\plans\https-github-com-yfgug-qqflow-1-github-concurrent-lovelace.md`
-> （QQFlow 密钥可替代性、WeFlow 接口对齐、技术栈与跨平台论证）。
+独立项目。接口形态参考 **WeFlow HTTP API**（契约见 campus-info-hub-py 项目 `src/sources/weflow/weflow-api.md`），仅作为功能实现参考。
 
 ## 范围（v1）
 
 - ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头
 - ✅ 数据读取：全量扫描建内存索引 + rowid 水位线增量轮询（WAL 通过镜像目录同步，支持 QQ 运行中实时读取）
-- ✅ 服务封装：axum HTTP + SSE，WeFlow 兼容端点与字段
+- ✅ 服务封装：axum HTTP + SSE，WeFlow 参考端点与字段
 - ✅ 三平台：Windows / Linux / macOS（仅路径探测不同，代码已按平台门控）
-- ❌ **不做密钥提取**：密钥由外部工具提供（`QQBackup/qq-win-db-key` 等），三种输入方式见下
+- ❌ **不做密钥提取**：密钥由外部工具提供（`QQBackup/qq-win-db-key` 等），输入方式见运行节
 - ❌ 媒体文件导出、SNS 接口（QQ 无此数据）：v1 不实现
 
 ## 构建
@@ -28,11 +25,22 @@ powershell -File scripts\build.ps1 build
 # 1. 用独立工具提取密钥（问题 1 结论即输入来源）
 irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/windows/ntqq/windows_ntqq_get_key.ps1 | iex
 
-# 2. 启动（三选一提供密钥）
-.\qqflow-server.exe --key <16字节密钥> --qq <QQ号>
-.\qqflow-server.exe --keys-file keys.json
-.\qqflow-server.exe --ask-key --qq <QQ号>
+# 2. 启动（无命令行参数，配置仅由当前目录 ./qqflow-server.json 提供；文件缺失时使用默认值）
+.\qqflow-server.exe
 ```
+
+配置文件示例（`keys` 直接映射账号→密钥；密钥也可经 `keys_file` 外部文件或 `ask_key` 交互输入）：
+
+```json
+{
+  "port": 5031, "host": "127.0.0.1", "log": "info",
+  "keys": { "<QQ号>": "<16字节密钥>" },
+  "db_path": "D:\\AppData\\Tencent Files",
+  "poll_interval": 1500
+}
+```
+
+可用字段：`port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `poll_interval` / `data_dir` / `db_path` / `log`。未知字段或类型错误 → 启动失败（提示具体字段）；配置文件缺失 → 全部使用默认值。
 
 默认 `http://127.0.0.1:5031`，token 自动生成并持久化到 `<data-dir>/token.txt`（首次启动打印）。
 
