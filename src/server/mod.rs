@@ -18,6 +18,7 @@ use crate::config;
 use crate::db;
 use crate::db::mirror::Mirror;
 use crate::keystore::KeyStore;
+use crate::poller;
 use crate::poller::Event;
 use crate::store::index;
 use crate::store::{AppState, Store};
@@ -43,6 +44,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/contacts", get(contacts::handler).post(contacts::handler))
         .route("/api/v1/group-members", get(group_members::handler).post(group_members::handler))
         .route("/api/v1/push/messages", get(push_events::handler).post(push_events::handler))
+        .route("/api/v1/sync", get(sync::handler).post(sync::handler))
         .with_state(state)
 }
 
@@ -83,12 +85,14 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
     let (tx, _) = broadcast::channel::<Event>(1024);
     let accounts_state = Arc::new(RwLock::new(Vec::<AccountState>::new()));
     let ready = Arc::new(AtomicBool::new(false));
+    let sync_engine = Arc::new(poller::SyncEngine::new());
     let state = Arc::new(AppState {
         store: store.clone(),
         events: tx.clone(),
         accounts: accounts_state.clone(),
         ready: ready.clone(),
         token: Arc::new(token.clone()),
+        sync: sync_engine.clone(),
     });
 
     // ---- server (bind early; /health reports "starting") ------------------
@@ -149,12 +153,17 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         });
         let mirror = handle.await.map_err(|e| anyhow::anyhow!("index task panicked: {e}"))??;
 
-        // Keep the mirror alive in the poller task.
-        let task = tokio::spawn(crate::poller::spawn(
-            mirror,
+        // Share the mirror between the change-driven poll task and the
+        // manual-sync endpoint (both call AccountSync::poll_once).
+        let account = Arc::new(poller::AccountSync::new(
+            Arc::new(parking_lot::Mutex::new(mirror)),
             key.clone(),
             store.clone(),
-            tx,
+            tx.clone(),
+        ));
+        sync_engine.register(account.clone());
+        let task = tokio::spawn(crate::poller::spawn(
+            account,
             std::time::Duration::from_millis(poll_ms),
             shutdown_rx.clone(),
         ));

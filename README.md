@@ -41,7 +41,7 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
   "port": 5031, "host": "127.0.0.1", "log": "info",
   "keys": { "<QQ号>": "<16字节密钥>" },
   "db_path": "D:\\AppData\\Tencent Files",
-  "poll_interval": 1500
+  "poll_interval": 200
 }
 ```
 

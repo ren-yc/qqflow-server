@@ -82,4 +82,7 @@ pub struct AppState {
     pub ready: Arc<std::sync::atomic::AtomicBool>,
     /// Access token (Bearer header / access_token query / POST body).
     pub token: Arc<String>,
+    /// Per-account sync engines; powers the manual-sync endpoint and the
+    /// change-driven poll tasks.
+    pub sync: Arc<poller::SyncEngine>,
 }

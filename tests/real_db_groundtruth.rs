@@ -169,6 +169,51 @@ fn fake_db_indexes_c2c_rows() {
     assert_eq!(c2c.msgs.len(), 2, "both c2c messages must be present");
 }
 
+/// Manual-sync path: `AccountSync::poll_once` picks up rows appended to
+/// the database between calls and broadcasts SSE events for them (this is
+/// what `POST /api/v1/sync` drives).
+#[test]
+fn manual_sync_picks_up_new_rows() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let path = build_fake_db();
+    let info = scan::DbInfo { qq: FAKE_QQ.into(), path };
+    let mirror_dir = std::env::temp_dir().join("qqflow_fake_mirror");
+    let mirror = Mirror::new(&info, &mirror_dir).unwrap();
+    let mirror = std::sync::Arc::new(parking_lot::Mutex::new(mirror));
+    let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::poller::Event>(16);
+    let account = qqflow_server::poller::AccountSync::new(mirror.clone(), FAKE_KEY.into(), store, tx);
+
+    let first = account.poll_once().unwrap();
+    assert_eq!(first.len(), 8, "initial poll returns all rows (6 group + 2 c2c)");
+    // The receiver was subscribed before the first poll: drain the initial
+    // batch of events so try_recv below sees only the new row's event.
+    while rx.try_recv().is_ok() {}
+
+    // Append a new group row directly into the mirror DB (simulates QQ
+    // writing a new message between polls).
+    {
+        let conn = decrypt::open_decrypted(&mirror.lock().main_path, FAKE_KEY).unwrap();
+        let ts: i64 = 1782864000;
+        conn.execute(
+            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["10001", (ts << 32) | 7, "u_a", "张三", "手动同步新增".as_bytes()],
+        )
+        .unwrap();
+    }
+
+    let second = account.poll_once().unwrap();
+    assert_eq!(second.len(), 1, "second poll returns only the new row");
+    assert_eq!(second[0].parsed.content, "手动同步新增");
+
+    // The new row must also be broadcast as an SSE event.
+    let ev = rx.try_recv().unwrap();
+    assert_eq!(ev.event, "message.new");
+    assert_eq!(ev.content, "手动同步新增");
+
+    let _ = std::fs::remove_dir_all(&mirror_dir);
+}
+
 /// Ground truth over a REAL QQ database. Ignored by default; requires
 /// QQFLOW_TEST_DB_ROOT + QQFLOW_TEST_DB_KEY env vars.
 #[test]

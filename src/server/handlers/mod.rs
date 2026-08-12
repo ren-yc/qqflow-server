@@ -7,6 +7,7 @@ pub mod health;
 pub mod messages;
 pub mod push_events;
 pub mod sessions;
+pub mod sync;
 
 use axum::http::HeaderMap;
 

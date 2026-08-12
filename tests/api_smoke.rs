@@ -58,6 +58,7 @@ fn test_state() -> Arc<AppState> {
         accounts: Arc::new(RwLock::new(Vec::new())),
         ready: Arc::new(AtomicBool::new(true)),
         token: Arc::new("test-token-123456".into()),
+        sync: Arc::new(qqflow_server::poller::SyncEngine::new()),
     })
 }
 
@@ -87,6 +88,23 @@ async fn auth_required() {
     let (s, v) = get("/api/v1/sessions", false).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     assert_eq!(v["success"], false);
+}
+
+#[tokio::test]
+async fn sync_no_auth() {
+    let (s, _) = get("/api/v1/sync", false).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn sync_empty_engine_shape() {
+    // Empty SyncEngine (no accounts registered): sync succeeds with 0 rows.
+    let (s, v) = get("/api/v1/sync?access_token=test-token-123456&limit=5", true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["synced"], 0);
+    assert_eq!(v["count"], 0);
+    assert!(v["messages"].is_array());
 }
 
 #[tokio::test]

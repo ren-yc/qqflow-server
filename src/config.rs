@@ -31,7 +31,9 @@ pub struct Config {
     pub ask_key: bool,
     /// Restrict to these QQ accounts (by default all scanned accounts are used).
     pub qq: Vec<String>,
-    /// Polling interval for new messages, in milliseconds.
+    /// Change-detection cadence: how often the poll loop stats the source
+    /// WAL/main files for new messages, in milliseconds. A full sync only
+    /// runs when the files changed, so this can be fast at idle.
     pub poll_interval: u64,
     /// Data directory (keys, token, mirror cache). Platform default:
     /// Windows %LOCALAPPDATA%\qqflow-server, Linux ~/.local/share/qqflow-server,
@@ -54,7 +56,7 @@ impl Default for Config {
             keys_file: None,
             ask_key: false,
             qq: Vec::new(),
-            poll_interval: 1500,
+            poll_interval: 200,
             data_dir: None,
             db_path: None,
             log: "info".into(),

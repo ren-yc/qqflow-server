@@ -70,10 +70,14 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 
 ### Poller / real-time path
 
-One poll task per account (`poller::spawn`, runs in `spawn_blocking`), default 1500 ms interval. Each tick:
-1. `Mirror::sync()` — re-copies the source WAL (cheap). If the source main file's size/mtime changed (SQLite checkpoint merged WAL pages), rebuilds the whole mirror.
+One change-driven poll task per account (`poller::spawn`, runs in `spawn_blocking`). Every `poll_interval` (default 200 ms) it runs `Mirror::changed()` — two metadata stats on the source WAL/main files, no IO — and only when something changed runs the full sync (`AccountSync::poll_once`):
+1. `Mirror::sync()` — re-copies the source WAL (cheap; if the source main file's size/mtime changed, SQLite checkpointed and the whole mirror is rebuilt).
 2. Reopens the decrypted connection, then `index::append_new` per table for `rowid > watermark`.
 3. Emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
+
+Idle periods cost only the stat; a failed sync sets a retry flag so the next tick retries even with unchanged stats.
+
+**Manual sync**: the same per-account `AccountSync` (mirror behind `Arc<Mutex>`) is shared with `GET|POST /api/v1/sync`, which runs `SyncEngine::sync_all()` on demand and returns the newly appended records (newest first) — for client init / manual refresh. Concurrent poll/sync passes serialize on the mirror mutex and the store write lock.
 
 SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events; broadcast lag re-syncs the client with a fresh `sync`. KeepAlive ping every 15 s.
 

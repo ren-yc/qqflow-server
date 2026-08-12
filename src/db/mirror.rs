@@ -27,6 +27,15 @@ pub struct Mirror {
     pub wal_path: PathBuf,
     src_len: u64,
     src_mtime: SystemTime,
+    /// Source WAL (len, mtime) as of the last copy; drives the cheap
+    /// `changed()` check of the fast poll loop.
+    wal_stat: Option<(u64, SystemTime)>,
+}
+
+/// Stat a file as (len, mtime), None when absent.
+fn stat_of(path: &Path) -> Option<(u64, SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
 }
 
 impl Mirror {
@@ -42,6 +51,7 @@ impl Mirror {
             wal_path: dir.join("main.db-wal"),
             src_len: 0,
             src_mtime: SystemTime::UNIX_EPOCH,
+            wal_stat: None,
         };
         m.rebuild()?;
         Ok(m)
@@ -65,7 +75,7 @@ impl Mirror {
             .with_context(|| format!("copy {} -> {}", self.src_main.display(), self.main_path.display()))?;
         dst.flush().ok();
 
-        self.copy_wal_verbatim()?;
+        self.copy_wal_and_track()?;
         // Drop any stale shared-memory index from a previous incarnation:
         // the WAL was replaced, so a leftover -shm index is meaningless and
         // can confuse SQLCipher's salt checks on the next open.
@@ -89,6 +99,35 @@ impl Mirror {
         Ok(())
     }
 
+    /// Copy the source WAL and refresh its tracked stat. If the source
+    /// changed WHILE the copy ran (a frame appended mid-copy), the tracked
+    /// stat is kept at the pre-copy value so the next `changed()` check
+    /// re-triggers and picks the frame up — never silently drop it.
+    fn copy_wal_and_track(&mut self) -> Result<()> {
+        let pre = stat_of(&self.src_wal);
+        self.copy_wal_verbatim()?;
+        let post = stat_of(&self.src_wal);
+        self.wal_stat = if pre == post { post } else { pre };
+        Ok(())
+    }
+
+    /// Cheap change detection for the fast poll loop: stat the source main
+    /// file (checkpoint/rebuild) and the source WAL (new frames) against
+    /// the values captured at the last sync. Two metadata calls, no IO.
+    pub fn changed(&self) -> bool {
+        let main_unchanged = match std::fs::metadata(&self.src_main) {
+            Ok(m) => {
+                m.len() == self.src_len
+                    && m.modified().unwrap_or(SystemTime::UNIX_EPOCH) == self.src_mtime
+            }
+            Err(_) => false, // main file missing/unreadable: force a sync attempt
+        };
+        if !main_unchanged {
+            return true;
+        }
+        stat_of(&self.src_wal) != self.wal_stat
+    }
+
     /// Poll-time sync: re-copy the WAL (cheap, ≤ ~4 MB). If the source main
     /// file changed (checkpoint or rebuild), refresh the whole mirror.
     /// Returns true when a rebuild happened.
@@ -99,7 +138,7 @@ impl Mirror {
     /// we never combine a stale main with a reset WAL (whose salt would not
     /// match, silently dropping tail frames until the next poll).
     pub fn sync(&mut self) -> Result<bool> {
-        self.copy_wal_verbatim()?;
+        self.copy_wal_and_track()?;
         let meta = std::fs::metadata(&self.src_main)
             .with_context(|| format!("stat {}", self.src_main.display()))?;
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
