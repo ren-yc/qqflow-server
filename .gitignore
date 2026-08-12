@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Build logs
+*.log
+
+# Local data (keys/token/mirror cache created at runtime)
+keys.json
+token.txt
+/mirror
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local overrides
+*.local
+.env

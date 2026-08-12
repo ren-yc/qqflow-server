@@ -1,0 +1,181 @@
+//! HTTP layer: axum router with WeFlow-compatible endpoints.
+
+pub mod auth;
+pub mod error;
+pub mod handlers;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use axum::routing::get;
+use clap::Parser;
+use axum::Router;
+use parking_lot::RwLock;
+use serde::Serialize;
+use tokio::sync::broadcast;
+
+use crate::cli::Args;
+use crate::config;
+use crate::db;
+use crate::db::mirror::Mirror;
+use crate::keystore::KeyStore;
+use crate::poller::Event;
+use crate::store::index;
+use crate::store::{AppState, Store};
+
+/// Per-account readiness (exposed via /health and used for startup gating).
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountState {
+    pub qq: String,
+    pub state: String, // "indexing" | "ready" | "error"
+    pub message_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub fn build_router(state: Arc<AppState>) -> Router {
+    use handlers::*;
+    Router::new()
+        .route("/health", get(health::handler).post(health::handler))
+        .route("/api/v1/health", get(health::handler).post(health::handler))
+        .route("/api/v1/messages", get(messages::handler).post(messages::handler))
+        .route("/api/v1/sessions", get(sessions::handler).post(sessions::handler))
+        .route("/api/v1/sessions/{id}/messages", get(chatlab_pull::handler))
+        .route("/api/v1/contacts", get(contacts::handler).post(contacts::handler))
+        .route("/api/v1/group-members", get(group_members::handler).post(group_members::handler))
+        .route("/api/v1/push/messages", get(push_events::handler).post(push_events::handler))
+        .with_state(state)
+}
+
+/// Full startup: parse args, load keys, scan accounts, build indexes,
+/// start pollers, bind the server. Runs until Ctrl-C.
+pub async fn serve() -> Result<()> {
+    let args = Args::parse();
+    run_with(args).await
+}
+
+pub async fn run_with(args: Args) -> Result<()> {
+    crate::logging::init(&args.log);
+    let data_dir = config::data_dir(args.data_dir.as_deref())?;
+    let token = config::load_or_create_token(&data_dir, args.token.as_deref())?;
+
+    // ---- accounts & keys -------------------------------------------------
+    let mut accounts = db::scan::scan_accounts()?;
+    if !args.qq.is_empty() {
+        accounts.retain(|a| args.qq.contains(&a.qq));
+    }
+    if accounts.is_empty() {
+        anyhow::bail!("未找到 QQ 数据库（nt_msg.db）。请确认 QQ 已安装并登录过。");
+    }
+    let qq_list: Vec<String> = accounts.iter().map(|a| a.qq.clone()).collect();
+    let mut keys = KeyStore::load(&args.key, args.keys_file.as_deref(), args.ask_key, &qq_list)?;
+    keys.bind_positional(&qq_list);
+    for a in &accounts {
+        if keys.get(&a.qq).is_none() {
+            anyhow::bail!(
+                "缺少 QQ {} 的数据库密钥。请先用 qq-win-db-key 提取，再以 --key 或 --keys-file 提供。",
+                a.qq
+            );
+        }
+    }
+    keys.save(&data_dir)?;
+
+    // ---- state -----------------------------------------------------------
+    let store = Arc::new(RwLock::new(Store::default()));
+    let (tx, _) = broadcast::channel::<Event>(1024);
+    let accounts_state = Arc::new(RwLock::new(Vec::<AccountState>::new()));
+    let ready = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(AppState {
+        store: store.clone(),
+        events: tx.clone(),
+        accounts: accounts_state.clone(),
+        ready: ready.clone(),
+        token: Arc::new(token.clone()),
+    });
+
+    // ---- server (bind early; /health reports "starting") ------------------
+    let app = build_router(state.clone());
+    let addr = format!("{}:{}", args.host, args.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
+    tracing::info!("[init] 服务启动: http://{addr}  (token 已生成/加载)");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            tracing::error!("http server error: {e}");
+        }
+    });
+
+    // ---- per-account index build + poller ---------------------------------
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut poll_tasks = Vec::new();
+    for info in accounts {
+        let key = keys.get(&info.qq).unwrap().to_string();
+        let store = store.clone();
+        let tx = tx.clone();
+        let accounts_state = accounts_state.clone();
+        let mirror_root = data_dir.join("mirror");
+        let poll_ms = args.poll_interval;
+        let qq = info.qq.clone();
+
+        // Index build is CPU-bound (decrypt + full scan): run in blocking pool.
+        let key_for_index = key.clone();
+        let store_for_index = store.clone();
+        let handle = tokio::task::spawn_blocking(move || -> Result<Mirror> {
+            {
+                let mut accs = accounts_state.write();
+                accs.push(AccountState {
+                    qq: qq.clone(),
+                    state: "indexing".into(),
+                    message_count: 0,
+                    error: None,
+                });
+            }
+            let mirror = db::mirror::Mirror::new(&info, &mirror_root)?;
+            let conn = db::decrypt::open_decrypted(&mirror.main_path, &key_for_index)?;
+            let st = index::build_index(&conn)?;
+            let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
+            {
+                let mut guard = store_for_index.write();
+                *guard = st;
+            }
+            {
+                let mut accs = accounts_state.write();
+                if let Some(a) = accs.iter_mut().find(|a| a.qq == qq) {
+                    a.state = "ready".into();
+                    a.message_count = count;
+                }
+            }
+            tracing::info!("[init] QQ {qq} 索引完成: {count} 条消息");
+            Ok(mirror)
+        });
+        let mirror = handle.await.map_err(|e| anyhow::anyhow!("index task panicked: {e}"))??;
+
+        // Keep the mirror alive in the poller task.
+        let task = tokio::spawn(crate::poller::spawn(
+            mirror,
+            key.clone(),
+            store.clone(),
+            tx,
+            std::time::Duration::from_millis(poll_ms),
+            shutdown_rx.clone(),
+        ));
+        poll_tasks.push(task);
+    }
+
+    ready.store(true, Ordering::SeqCst);
+    tracing::info!("[init] 全部就绪");
+
+    // ---- shutdown ----------------------------------------------------------
+    tokio::signal::ctrl_c().await.ok();
+    tracing::info!("收到退出信号，清理中…");
+    shutdown_tx.send(true).ok();
+    for t in poll_tasks {
+        t.abort();
+    }
+    // Remove mirror dirs (they only hold SQLCipher ciphertext, but keep
+    // the workspace tidy).
+    let _ = std::fs::remove_dir_all(data_dir.join("mirror"));
+    Ok(())
+}
