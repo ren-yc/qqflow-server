@@ -61,6 +61,13 @@ impl Mirror {
     pub fn rebuild(&mut self) -> Result<()> {
         let meta = std::fs::metadata(&self.src_main)
             .with_context(|| format!("stat {}", self.src_main.display()))?;
+        if meta.len() <= CUSTOM_HEADER_LEN {
+            anyhow::bail!(
+                "源数据库过小: {} ({} 字节 <= 自定义头 {CUSTOM_HEADER_LEN} 字节)，不是有效的 nt_msg.db",
+                self.src_main.display(),
+                meta.len()
+            );
+        }
         self.src_len = meta.len();
         self.src_mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 

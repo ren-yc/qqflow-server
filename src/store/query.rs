@@ -64,8 +64,9 @@ pub struct MessageQuery<'a> {
 
 /// Messages for one session, newest first (WeFlow semantics), with hasMore.
 pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool) {
-    let (chat_type, talker) = classify_talker(q.talker);
-    let Some(conv) = store.conversation(chat_type, talker) else {
+    // find_conversation also probes the other chat type, so an all-digit
+    // c2c peer uid (which classifies as "group") still resolves.
+    let Some(conv) = store.find_conversation(q.talker) else {
         return (Vec::new(), false);
     };
     // Work on a sorted snapshot of indexes.
@@ -107,11 +108,17 @@ pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool
     (out, has_more)
 }
 
+/// Newest message ts of a conversation. Appends do not re-sort `msgs`, so
+/// the newest row is the max over the vec, not the tail.
+fn conv_last_ts(c: &crate::store::Conversation) -> i64 {
+    c.msgs.iter().map(|m| m.ts).max().unwrap_or(0)
+}
+
 /// Sessions sorted by last message time (newest first).
 pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<SessionInfo> {
     let kw = keyword.map(|k| k.to_lowercase());
     let mut all: Vec<&crate::store::Conversation> = store.convs.values().collect();
-    all.sort_by_key(|c| std::cmp::Reverse(c.last_ts()));
+    all.sort_by_key(|c| std::cmp::Reverse(conv_last_ts(c)));
     all.into_iter()
         .filter(|c| {
             if let Some(k) = &kw {
@@ -127,7 +134,7 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
             username: c.talker.clone(),
             display_name: c.name.clone(),
             r#type: c.chat_type.weflow_code(),
-            last_timestamp: c.last_ts(),
+            last_timestamp: conv_last_ts(c),
             unread_count: 0,
         })
         .collect()
@@ -176,5 +183,43 @@ pub fn classify_talker(talker: &str) -> (ChatType, &str) {
         (ChatType::Group, talker)
     } else {
         (ChatType::C2c, talker)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::types::{MessageRecord, MsgType, ParsedMessage};
+    use crate::store::{conv_key, Conversation, Store};
+
+    fn rec(rowid: i64, ts: i64) -> MessageRecord {
+        MessageRecord {
+            rowid,
+            seq: (ts << 32) | rowid,
+            ts,
+            chat_type: ChatType::Group,
+            talker: "10001".into(),
+            from_uid: "u_a".into(),
+            from_nick: "张三".into(),
+            parsed: ParsedMessage { msg_type: MsgType::Text, content: "x".into() },
+        }
+    }
+
+    #[test]
+    fn sessions_last_ts_is_max_not_tail() {
+        let mut store = Store::default();
+        // Sorted at build, then a backfilled older row lands at the tail —
+        // last_timestamp must still be the newest ts (max), not the tail.
+        let conv = Conversation {
+            chat_type: ChatType::Group,
+            talker: "10001".into(),
+            name: "项目群".into(),
+            msgs: vec![rec(1, 200), rec(2, 100)],
+            dirty: false,
+        };
+        store.convs.insert(conv_key(ChatType::Group, "10001"), conv);
+        let sessions = query_sessions(&store, None, 10, 0);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].last_timestamp, 200, "newest ts, not the unsorted tail");
     }
 }

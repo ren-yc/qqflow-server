@@ -39,7 +39,8 @@ pub struct Config {
     /// Slow fallback poll (ms): `Mirror::changed()` (zero-IO stats) as a
     /// safety net against file-watch events being silently lost (inotify /
     /// ReadDirectoryChangesW buffer overflow). 0 = disabled (not
-    /// recommended: missed events would never recover).
+    /// recommended: missed events would never recover). The watcher
+    /// re-attach retry (every 10 s) is independent of this setting.
     pub watch_fallback_ms: u64,
     /// Data directory (keys, token, mirror cache). Platform default:
     /// Windows %LOCALAPPDATA%\qqflow-server, Linux ~/.local/share/qqflow-server,

@@ -39,9 +39,6 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    pub fn last_ts(&self) -> i64 {
-        self.msgs.last().map(|m| m.ts).unwrap_or(0)
-    }
     pub fn message_count(&self) -> usize {
         self.msgs.len()
     }
@@ -70,6 +67,19 @@ impl Store {
     pub fn conversation_mut(&mut self, chat_type: ChatType, talker: &str) -> Option<&mut Conversation> {
         self.convs.get_mut(&conv_key(chat_type, talker))
     }
+
+    /// Look up a conversation by talker string, falling back to the other
+    /// chat type when the primary classification misses (an all-digit c2c
+    /// peer uid would otherwise only ever be looked up under `g:`).
+    pub fn find_conversation(&self, talker: &str) -> Option<&Conversation> {
+        let (primary, _) = crate::store::query::classify_talker(talker);
+        let alt = match primary {
+            ChatType::Group => ChatType::C2c,
+            ChatType::C2c => ChatType::Group,
+        };
+        self.conversation(primary, talker)
+            .or_else(|| self.conversation(alt, talker))
+    }
 }
 
 /// Shared application state handed to the HTTP layer and poller tasks.
@@ -85,4 +95,26 @@ pub struct AppState {
     /// Per-account sync engines; powers the manual-sync endpoint and the
     /// change-driven poll tasks.
     pub sync: Arc<sync::SyncEngine>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_conversation_falls_back_to_other_type() {
+        let mut store = Store::default();
+        let conv = Conversation {
+            chat_type: ChatType::C2c,
+            talker: "12345".into(),
+            name: "数字UID好友".into(),
+            msgs: Vec::new(),
+            dirty: false,
+        };
+        store.convs.insert(conv_key(ChatType::C2c, "12345"), conv);
+        let found = store
+            .find_conversation("12345")
+            .expect("all-digit c2c peer must resolve via fallback");
+        assert_eq!(found.chat_type, ChatType::C2c);
+    }
 }

@@ -94,9 +94,13 @@ pub async fn handler(
 /// ChatLab-style envelope for /api/v1/messages (meta + members + messages).
 fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query::MessageOut]) -> Value {
     let store = state.store.read();
-    let (chat_type, _) = crate::store::query::classify_talker(talker);
-    let name = store
-        .conversation(chat_type, talker)
+    // find_conversation falls back to the other chat type, so an all-digit
+    // c2c peer uid resolves to its real conversation (and real meta.type).
+    let conv = store.find_conversation(talker);
+    let chat_type = conv
+        .map(|c| c.chat_type)
+        .unwrap_or_else(|| crate::store::query::classify_talker(talker).0);
+    let name = conv
         .map(|c| c.name.clone())
         .unwrap_or_else(|| talker.to_string());
     // members: uid -> name seen in this session

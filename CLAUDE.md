@@ -37,7 +37,7 @@ Config fields (snake_case, all optional, serde `deny_unknown_fields` — unknown
 - `db_path` overrides database discovery: a Tencent Files-style root directory (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`) or a direct `nt_msg.db` file (account name taken from the nearest all-digit ancestor dir, fallback `custom`).
 - Keys (16 printable-ASCII bytes per account): `"keys"` object (`{"<qq>": "<key>"}`), optional `"keys_file"` external file (overrides `keys` for the same qq), or `"ask_key": true` interactive stdin. Invalid entries are skipped with a warning; persisted to `<data-dir>/keys.json` (write-only — not auto-loaded).
 
-Default `127.0.0.1:5031` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`, printed on first start. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
+Default `127.0.0.1:5031` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`; the startup log prints the file path, not the token value. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
 
 ## Architecture
 
@@ -51,9 +51,9 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
                          SQLCipher PRAGMA suite (page_size=4096, kdf_iter=4000,
                          HMAC-SHA1, PBKDF2-SHA512, aes-256-cbc); retries with
                          HMAC-SHA512; verifies via sqlite_master
-  → store::index::build_index / append_new
+  → store::index::build_index / read_new + apply_records
                          full-table scan → in-memory Store; incremental rowid
-                         appends afterwards
+                         reads + apply afterwards (two-phase, see below)
   → server (axum) + sync engine (watch task + tokio broadcast)
 ```
 
@@ -72,14 +72,14 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 
 File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`watch_debounce_ms`, default 350 ms), then runs the full sync (`AccountSync::poll_once`). A slow fallback poll (`watch_fallback_ms`, default 30 s) re-checks `Mirror::changed()` — two metadata stats, no IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated). The full sync:
 1. `Mirror::sync()` — re-copies the source WAL (cheap; if the source main file's size/mtime changed, SQLite checkpointed and the whole mirror is rebuilt).
-2. Reopens the decrypted connection, then `index::append_new` per table for `rowid > watermark`.
-3. Emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
+2. Reopens the decrypted connection, then reads per table with `index::read_new` (`rowid > watermark`, pure read — a failure in either table leaves the store untouched).
+3. Applies both tables under a single store write-lock (`index::apply_records` + watermark write-back) and emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
 
 Idle periods cost only the stat; a failed sync sets a retry flag so the next tick retries even with unchanged stats.
 
 **Manual sync**: the same per-account `AccountSync` (mirror behind `Arc<Mutex>`) is shared with `GET|POST /api/v1/sync`, which runs `SyncEngine::sync_all()` on demand and returns the newly appended records (newest first) — for client init / manual refresh. Concurrent poll/sync passes serialize on the mirror mutex and the store write lock.
 
-SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events; broadcast lag re-syncs the client with a fresh `sync`. KeepAlive ping every 15 s.
+SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events; a fresh `sync` is also broadcast when an account's index build completes (clients connected during indexing start with a `(0,0)` baseline and are re-baselined by it), and broadcast lag re-syncs the client the same way. KeepAlive ping every 15 s. SSE has no ready gate — it serves 200 even while indexing.
 
 ### Startup sequence (`server::run_with`)
 

@@ -48,6 +48,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Replace the store with a freshly built index and re-baseline SSE
+/// subscribers: a client that connected while we were indexing received a
+/// `sync(0,0)` event and would otherwise never learn the real watermarks.
+fn install_index(store: &Arc<RwLock<Store>>, tx: &broadcast::Sender<Event>, st: Store) {
+    let (wm_g, wm_c) = {
+        let mut guard = store.write();
+        *guard = st;
+        (guard.watermark_group, guard.watermark_c2c)
+    };
+    let _ = tx.send(Event::sync(wm_g, wm_c, chrono::Utc::now().timestamp()));
+}
+
 /// Full startup: load config, load keys, scan accounts, build indexes,
 /// start pollers, bind the server. Runs until Ctrl-C.
 pub async fn serve() -> Result<()> {
@@ -127,6 +139,7 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         // Index build is CPU-bound (decrypt + full scan): run in blocking pool.
         let key_for_index = key.clone();
         let store_for_index = store.clone();
+        let tx_for_build = tx.clone();
         let handle = tokio::task::spawn_blocking(move || -> Result<Mirror> {
             {
                 let mut accs = accounts_state.write();
@@ -141,10 +154,9 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
             let conn = db::decrypt::open_decrypted(&mirror.main_path, &key_for_index)?;
             let st = index::build_index(&conn)?;
             let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
-            {
-                let mut guard = store_for_index.write();
-                *guard = st;
-            }
+            // Replace the store and re-baseline SSE subscribers in one step
+            // (clients connected during indexing hold a sync(0,0) baseline).
+            install_index(&store_for_index, &tx_for_build, st);
             {
                 let mut accs = accounts_state.write();
                 if let Some(a) = accs.iter_mut().find(|a| a.qq == qq) {
@@ -196,4 +208,22 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
     // the workspace tidy).
     let _ = std::fs::remove_dir_all(data_dir.join("mirror"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn install_index_rebaselines_subscribers() {
+        let store = Arc::new(RwLock::new(Store::default()));
+        let (tx, mut rx) = broadcast::channel::<Event>(16);
+        let st = Store { watermark_group: 42, watermark_c2c: 7, ..Store::default() };
+        install_index(&store, &tx, st);
+        assert_eq!(store.read().watermark_group, 42, "store replaced");
+        let ev = rx.try_recv().expect("build completion broadcasts a sync baseline");
+        assert_eq!(ev.event, "sync");
+        assert_eq!(ev.last_rowid_group, Some(42));
+        assert_eq!(ev.last_rowid_c2c, Some(7));
+    }
 }

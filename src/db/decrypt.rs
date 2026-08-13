@@ -32,6 +32,17 @@ fn pragma_suite(key: &str, hmac: &str) -> String {
 /// Open `path` (a header-stripped SQLCipher database) with the given key.
 /// Verifies by reading sqlite_master; retries with HMAC-SHA512 on failure.
 pub fn open_decrypted(path: &Path, key: &str) -> Result<Connection> {
+    // `Connection::open` creates missing files by default — a missing or
+    // header-less mirror main.db must fail loudly instead of "verifying" as
+    // a freshly created empty database.
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("镜像数据库不存在: {}", path.display()))?;
+    if meta.len() == 0 {
+        anyhow::bail!(
+            "镜像数据库为空: {}（源库小于 1024 字节自定义头或镜像损坏）",
+            path.display()
+        );
+    }
     for hmac in ["HMAC_SHA1", "HMAC_SHA512"] {
         let conn = Connection::open(path)
             .with_context(|| format!("open {}", path.display()))?;
@@ -56,9 +67,10 @@ pub fn open_decrypted(path: &Path, key: &str) -> Result<Connection> {
 }
 
 /// Verify the key by reading sqlite_master (only possible with a valid key).
+/// Requires at least one table: an empty database would trivially "verify".
 pub fn verify(conn: &Connection) -> Result<bool> {
     let n: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-    Ok(n >= 0)
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -69,5 +81,31 @@ mod tests {
     fn escape_key_sql() {
         assert_eq!(escape_key("a'b"), "a''b");
         assert_eq!(escape_key("plain16bytestr"), "plain16bytestr");
+    }
+
+    #[test]
+    fn empty_and_missing_database_rejected() {
+        let dir = std::env::temp_dir().join(format!("qqflow_decrypt_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.db");
+        std::fs::write(&empty, b"").unwrap();
+        let err = open_decrypted(&empty, "0123456789abcdef").unwrap_err();
+        assert!(format!("{err:#}").contains("为空"), "got: {err:#}");
+
+        let missing = dir.join("missing.db");
+        let err = open_decrypted(&missing, "0123456789abcdef").unwrap_err();
+        assert!(format!("{err:#}").contains("不存在"), "got: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn garbage_file_reports_key_error() {
+        let dir = std::env::temp_dir().join(format!("qqflow_decrypt_garbage_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let junk = dir.join("junk.db");
+        std::fs::write(&junk, vec![0xAAu8; 8192]).unwrap();
+        let err = open_decrypted(&junk, "0123456789abcdef").unwrap_err();
+        assert!(format!("{err:#}").contains("密钥"), "got: {err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

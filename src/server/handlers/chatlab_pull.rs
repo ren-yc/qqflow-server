@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 
 use crate::parser::types::ChatType;
 use crate::server::error::ApiError;
-use crate::store::query::classify_talker;
 use crate::store::AppState;
 
 use super::{authorized, parse_time_bound};
@@ -50,26 +49,44 @@ pub async fn handler(
     let end = params.end.as_deref().and_then(|s| parse_time_bound(s, true));
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-    let (chat_type, talker) = classify_talker(&id);
     let store = state.store.read();
-    let Some(conv) = store.conversation(chat_type, talker) else {
+    // find_conversation falls back to the other chat type when the primary
+    // classification misses (an all-digit c2c peer uid classifies as group).
+    let Some(conv) = store.find_conversation(&id) else {
         return Err(ApiError::not_found(format!("会话不存在: {id}")));
     };
+    let chat_type = conv.chat_type;
+    let talker = conv.talker.clone();
 
-    // Chronological messages within [since, end].
+    // Chronological messages within (since, end] — `since` is exclusive, so
+    // a client resuming with `nextSince` never re-fetches the boundary
+    // second and can neither loop nor see duplicates.
     let mut idx: Vec<usize> = conv.msgs.iter().enumerate().map(|(i, _)| i).collect();
     idx.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
     let filtered: Vec<usize> = idx
         .into_iter()
         .filter(|&i| {
             let m = &conv.msgs[i];
-            since.is_none_or(|s| m.ts >= s) && end.is_none_or(|e| m.ts <= e)
+            since.is_none_or(|s| m.ts > s) && end.is_none_or(|e| m.ts <= e)
         })
         .collect();
 
     let total = filtered.len();
-    let page: Vec<usize> = filtered.iter().copied().skip(params.offset).take(limit).collect();
-    let has_more = params.offset + page.len() < total;
+    // Page from `offset`, extending to the end of the last second's ts
+    // group: pages never split a second, so `nextSince` strictly advances.
+    let start = params.offset.min(total);
+    let mut page_end = start;
+    let mut prev_ts = None;
+    while page_end < total {
+        let ts_j = conv.msgs[filtered[page_end]].ts;
+        if prev_ts.is_some_and(|p| p != ts_j) && page_end - start >= limit {
+            break;
+        }
+        prev_ts = Some(ts_j);
+        page_end += 1;
+    }
+    let page = &filtered[start..page_end];
+    let has_more = page_end < total;
 
     let messages: Vec<Value> = page
         .iter()
@@ -122,7 +139,7 @@ pub async fn handler(
         "sync": {
             "hasMore": has_more,
             "nextSince": if has_more { next_since } else { watermark },
-            "nextOffset": if has_more { params.offset + page.len() } else { 0 },
+            "nextOffset": if has_more { start.saturating_add(page.len()) } else { 0 },
             "watermark": watermark,
         }
     })))

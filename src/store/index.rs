@@ -45,6 +45,38 @@ fn guess_group_name(text: &str, current: &str) -> String {
     current.to_string()
 }
 
+/// Apply one parsed record: conversation create/lookup, group-name guess,
+/// uid -> nickname map update, message push (sets `dirty`).
+fn apply_record(store: &mut Store, rec: MessageRecord) {
+    let key = conv_key(rec.chat_type, &rec.talker);
+    let conv = store.convs.entry(key).or_insert_with(|| {
+        let name = if rec.chat_type == ChatType::Group {
+            rec.talker.clone() // placeholder until a rename message appears
+        } else {
+            rec.from_nick.clone()
+        };
+        super::Conversation {
+            chat_type: rec.chat_type,
+            talker: rec.talker.clone(),
+            name,
+            msgs: Vec::new(),
+            dirty: false,
+        }
+    });
+    // Update group name from rename system messages.
+    if rec.chat_type == ChatType::Group && rec.parsed.msg_type == crate::parser::types::MsgType::System {
+        let new_name = guess_group_name(&rec.parsed.content, &conv.name);
+        if new_name != conv.name && new_name != rec.talker {
+            conv.name = new_name;
+        }
+    }
+    if !rec.from_nick.is_empty() {
+        store.uid_names.insert(rec.from_uid.clone(), rec.from_nick.clone());
+    }
+    conv.msgs.push(rec);
+    conv.dirty = true;
+}
+
 #[allow(clippy::too_many_arguments)] // one call site per scanned row
 fn apply_row(
     store: &mut Store,
@@ -56,46 +88,17 @@ fn apply_row(
     seq: i64,
     blob: &[u8],
 ) {
-    let parsed = parser::extract_text(blob);
-    let ts = seq_to_time(seq);
     let rec = MessageRecord {
         rowid,
         seq,
-        ts,
+        ts: seq_to_time(seq),
         chat_type,
         talker: talker.to_string(),
         from_uid: from_uid.to_string(),
         from_nick: from_nick.to_string(),
-        parsed,
+        parsed: parser::extract_text(blob),
     };
-
-    let key = conv_key(chat_type, talker);
-    let conv = store.convs.entry(key).or_insert_with(|| {
-        let name = if chat_type == ChatType::Group {
-            talker.to_string() // placeholder until a rename message appears
-        } else {
-            from_nick.to_string()
-        };
-        super::Conversation {
-            chat_type,
-            talker: talker.to_string(),
-            name,
-            msgs: Vec::new(),
-            dirty: false,
-        }
-    });
-    // Update group name from rename system messages.
-    if chat_type == ChatType::Group && rec.parsed.msg_type == crate::parser::types::MsgType::System {
-        let new_name = guess_group_name(&rec.parsed.content, &conv.name);
-        if new_name != conv.name && new_name != talker {
-            conv.name = new_name;
-        }
-    }
-    if !from_nick.is_empty() {
-        store.uid_names.insert(from_uid.to_string(), from_nick.to_string());
-    }
-    conv.msgs.push(rec);
-    conv.dirty = true;
+    apply_record(store, rec);
 }
 
 fn scan_table(
@@ -161,12 +164,13 @@ pub fn build_index(conn: &Connection) -> Result<Store> {
     Ok(store)
 }
 
-/// Poll-time incremental append: rows with rowid > watermark for one table.
-/// Returns the new watermark and the appended records (for SSE events).
-pub fn append_new(
+/// Poll-time read: rows with rowid > watermark for one table, parsed into
+/// records. Pure read — the store is not touched, so when the companion
+/// table's read fails there is nothing to roll back and a retry simply
+/// re-reads the same rows (no duplicates).
+pub fn read_new(
     conn: &Connection,
     chat_type: ChatType,
-    store: &mut Store,
     watermark: i64,
 ) -> Result<(i64, Vec<MessageRecord>)> {
     let (table, cols) = match chat_type {
@@ -176,7 +180,7 @@ pub fn append_new(
     let sql = format!("SELECT rowid, {cols} FROM {table} WHERE rowid > ?1");
     let mut stmt = conn
         .prepare(&sql)
-        .with_context(|| format!("prepare append {table}"))?;
+        .with_context(|| format!("prepare read {table}"))?;
     // Same per-table column mapping as `scan_table`; see its comment.
     let rows = stmt.query_map([watermark], |row| match chat_type {
         ChatType::Group => {
@@ -198,18 +202,16 @@ pub fn append_new(
         }
     })?;
     let mut new_wm = watermark;
-    let mut appended = Vec::new();
+    let mut records = Vec::new();
     for r in rows {
         let (rowid, a, seq, uid, nick, blob) = match r {
             Ok(v) => v,
             Err(e) => {
-                tracing::debug!("append {table}: row skipped: {e}");
+                tracing::debug!("read {table}: row skipped: {e}");
                 continue;
             }
         };
-        apply_row(store, chat_type, rowid, &a, &uid, &nick, seq, &blob);
-        new_wm = new_wm.max(rowid);
-        appended.push(MessageRecord {
+        records.push(MessageRecord {
             rowid,
             seq,
             ts: seq_to_time(seq),
@@ -219,6 +221,15 @@ pub fn append_new(
             from_nick: nick,
             parsed: crate::parser::extract_text(&blob),
         });
+        new_wm = new_wm.max(rowid);
     }
-    Ok((new_wm, appended))
+    Ok((new_wm, records))
+}
+
+/// Apply records read by `read_new` to the store (single write-lock critical
+/// section; callers write the watermarks in the same section).
+pub fn apply_records(store: &mut Store, records: &[MessageRecord]) {
+    for rec in records {
+        apply_record(store, rec.clone());
+    }
 }

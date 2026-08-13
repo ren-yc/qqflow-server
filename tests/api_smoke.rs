@@ -15,6 +15,18 @@ use qqflow_server::store::query::{query_messages, MessageQuery};
 use serde_json::Value;
 use tower::ServiceExt;
 
+fn state_with(store: Store, ready: bool) -> Arc<AppState> {
+    let (tx, _) = tokio::sync::broadcast::channel(1024);
+    Arc::new(AppState {
+        store: Arc::new(RwLock::new(store)),
+        events: tx,
+        accounts: Arc::new(RwLock::new(Vec::new())),
+        ready: Arc::new(AtomicBool::new(ready)),
+        token: Arc::new("test-token-123456".into()),
+        sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
+    })
+}
+
 fn test_state() -> Arc<AppState> {
     let mut store = Store::default();
     // group 10001 with two messages
@@ -50,16 +62,19 @@ fn test_state() -> Arc<AppState> {
     store.watermark_group = 2;
     store.uid_names.insert("u_a".into(), "张三".into());
     store.uid_names.insert("u_b".into(), "李四".into());
+    state_with(store, true)
+}
 
-    let (tx, _) = tokio::sync::broadcast::channel(1024);
-    Arc::new(AppState {
-        store: Arc::new(RwLock::new(store)),
-        events: tx,
-        accounts: Arc::new(RwLock::new(Vec::new())),
-        ready: Arc::new(AtomicBool::new(true)),
-        token: Arc::new("test-token-123456".into()),
-        sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
-    })
+/// Send a GET through `app` and return (status, json).
+async fn call(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).method("GET").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
 }
 
 async fn get(uri: &str, token: bool) -> (StatusCode, Value) {
@@ -291,4 +306,140 @@ fn wrong_talker_returns_empty() {
     let (items, has_more) = query_messages(&store, &q);
     assert!(items.is_empty());
     assert!(!has_more);
+}
+
+/// Conversation whose first 5 messages share one second and 2 land later —
+/// regression fixture for chatlab-pull boundary-second pagination.
+fn ts_boundary_state() -> Arc<AppState> {
+    let mut store = Store::default();
+    let base: i64 = 0x6771A6B5;
+    let mk = |rowid: i64, ts: i64, content: &str| MessageRecord {
+        rowid,
+        seq: (ts << 32) | rowid,
+        ts,
+        chat_type: ChatType::Group,
+        talker: "10001".into(),
+        from_uid: "u_a".into(),
+        from_nick: "张三".into(),
+        parsed: ParsedMessage { msg_type: MsgType::Text, content: content.into() },
+    };
+    let conv = Conversation {
+        chat_type: ChatType::Group,
+        talker: "10001".into(),
+        name: "项目群".into(),
+        msgs: vec![
+            mk(1, base, "m1"),
+            mk(2, base, "m2"),
+            mk(3, base, "m3"),
+            mk(4, base, "m4"),
+            mk(5, base, "m5"),
+            mk(6, base + 1, "m6"),
+            mk(7, base + 1, "m7"),
+        ],
+        dirty: false,
+    };
+    store.convs.insert(conv_key(ChatType::Group, "10001"), conv);
+    state_with(store, true)
+}
+
+#[tokio::test]
+async fn chatlab_pull_boundary_second_pages_cleanly() {
+    let app = build_router(ts_boundary_state());
+    let (s1, v1) = call(
+        app.clone(),
+        "/api/v1/sessions/10001/messages?limit=3&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    // limit=3, but the page completes the whole second: 5 boundary messages.
+    let msgs1 = v1["messages"].as_array().unwrap();
+    assert_eq!(msgs1.len(), 5, "page completes the whole second");
+    assert_eq!(v1["sync"]["hasMore"], true);
+    let next_since = v1["sync"]["nextSince"].as_i64().unwrap();
+    assert_eq!(next_since, 0x6771A6B5);
+
+    // Resume with nextSince (exclusive): remaining rows, no overlap, done.
+    let (s2, v2) = call(
+        app,
+        &format!("/api/v1/sessions/10001/messages?since={next_since}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let msgs2 = v2["messages"].as_array().unwrap();
+    assert_eq!(msgs2.len(), 2, "second page carries the remaining rows");
+    assert_eq!(v2["sync"]["hasMore"], false);
+
+    let ids = |msgs: &Vec<Value>| -> std::collections::BTreeSet<String> {
+        msgs.iter()
+            .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(ids(msgs1).is_disjoint(&ids(msgs2)), "pages must not overlap");
+}
+
+#[tokio::test]
+async fn chatlab_pull_huge_offset_does_not_panic() {
+    let app = build_router(ts_boundary_state());
+    let (s, v) = call(
+        app,
+        "/api/v1/sessions/10001/messages?offset=18446744073709551615&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 0);
+    assert_eq!(v["sync"]["hasMore"], false);
+    assert_eq!(v["sync"]["nextOffset"], 0);
+}
+
+#[tokio::test]
+async fn all_digit_c2c_talker_resolves_via_fallback() {
+    let mut store = Store::default();
+    let seq = (0x6771A6B5i64 << 32) | 1;
+    let conv = Conversation {
+        chat_type: ChatType::C2c,
+        talker: "12345".into(),
+        name: "数字UID好友".into(),
+        msgs: vec![MessageRecord {
+            rowid: 1,
+            seq,
+            ts: seq_to_time(seq),
+            chat_type: ChatType::C2c,
+            talker: "12345".into(),
+            from_uid: "12345".into(),
+            from_nick: "数字UID好友".into(),
+            parsed: ParsedMessage { msg_type: MsgType::Text, content: "在吗".into() },
+        }],
+        dirty: false,
+    };
+    store.convs.insert(conv_key(ChatType::C2c, "12345"), conv);
+    let app = build_router(state_with(store, true));
+
+    let (s, v) = call(app.clone(), "/api/v1/messages?talker=12345&access_token=test-token-123456").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(v["messages"][0]["content"], "在吗");
+
+    let (s, v) = call(app, "/api/v1/sessions/12345/messages?access_token=test-token-123456").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["meta"]["type"], "private");
+    assert_eq!(v["meta"]["groupId"], "12345");
+}
+
+#[tokio::test]
+async fn sse_connects_before_ready() {
+    // SSE stays open during indexing (no ready gate); the initial sync
+    // event carries the current (0,0) watermarks and the build-completion
+    // broadcast re-baselines the client.
+    let app = build_router(state_with(Store::default(), false));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/push/messages?access_token=test-token-123456")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

@@ -40,6 +40,10 @@ pub struct WatchConfig {
 /// e.g. `nt_uid_mapping.db`, is ignored).
 const WATCH_FILES: [&str; 3] = ["nt_msg.db", "nt_msg.db-wal", "nt_msg.db-shm"];
 
+/// Re-attach retry interval when the slow fallback poll is disabled
+/// (`watch_fallback_ms: 0`).
+const REATTACH_INTERVAL: Duration = Duration::from_secs(10);
+
 fn is_relevant(name: &OsStr) -> bool {
     WATCH_FILES.iter().any(|w| name.eq_ignore_ascii_case(OsStr::new(w)))
 }
@@ -59,20 +63,14 @@ pub async fn spawn(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<WatchMsg>();
     let mut watcher = rebuild_watcher(&tx, &watch_dir, cfg.debounce);
-    let mut fallback = cfg.fallback.map(|d| {
-        let mut iv = tokio::time::interval(d);
-        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        iv
-    });
+    // One interval drives both jobs: the watcher re-attach (always) and the
+    // slow fallback sync (only when `fallback` is configured). With
+    // `watch_fallback_ms: 0` the re-attach must still run, or one backend
+    // error would permanently kill event-driven sync.
+    let mut iv = tokio::time::interval(cfg.fallback.unwrap_or(REATTACH_INTERVAL));
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        let fallback_tick = async {
-            if let Some(iv) = fallback.as_mut() {
-                iv.tick().await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
         tokio::select! {
             biased;
             _ = shutdown.changed() => { drop(watcher); break; }
@@ -91,17 +89,17 @@ pub async fn spawn(
                         sync_once(account.clone()).await;
                     }
                     Some(WatchMsg::BackendError) => {
-                        tracing::warn!("watcher backend error; re-attaching on next fallback tick");
+                        tracing::warn!("watcher backend error; re-attaching on next tick");
                         watcher = None;
                     }
-                    None => {} // channel closed (watcher dropped) -> fallback tick rebuilds
+                    None => {} // channel closed (watcher dropped) -> next tick rebuilds
                 }
             }
-            _ = fallback_tick => {
+            _ = iv.tick() => {
                 if watcher.is_none() {
                     watcher = rebuild_watcher(&tx, &watch_dir, cfg.debounce);
                 }
-                if account.changed() {
+                if cfg.fallback.is_some() && account.changed() {
                     sync_once(account.clone()).await;
                 }
             }

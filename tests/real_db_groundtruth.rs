@@ -18,6 +18,7 @@ use std::path::Path;
 use qqflow_server::db::decrypt;
 use qqflow_server::db::mirror::Mirror;
 use qqflow_server::db::scan;
+use qqflow_server::parser::types::{seq_to_time, ChatType};
 
 mod common;
 use common::{FAKE_KEY, FAKE_QQ};
@@ -140,6 +141,62 @@ fn manual_sync_picks_up_new_rows() {
     let _ = std::fs::remove_dir_all(&mirror_dir);
 }
 
+/// Regression: the sync read phase must not mutate the store. When the c2c
+/// read fails AFTER the group read, nothing may be applied (no group rows,
+/// no watermark advance), and the retry after repair must deliver every row
+/// exactly once — the old combined read+apply pass duplicated rows here.
+#[test]
+fn failed_sync_leaves_store_untouched() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let path = build_fake_db();
+    let info = scan::DbInfo { qq: FAKE_QQ.into(), path };
+    let mirror_dir = std::env::temp_dir().join("qqflow_fake_mirror_fail");
+    let mirror = Mirror::new(&info, &mirror_dir).unwrap();
+    let mirror = std::sync::Arc::new(parking_lot::Mutex::new(mirror));
+    let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
+    let (tx, _rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
+    let account = qqflow_server::sync::AccountSync::new(mirror.clone(), FAKE_KEY.into(), store.clone(), tx);
+
+    // Break the c2c read by renaming its table away.
+    {
+        let conn = decrypt::open_decrypted(&mirror.lock().main_path, FAKE_KEY).unwrap();
+        conn.execute_batch("ALTER TABLE c2c_msg_table RENAME TO c2c_broken;")
+            .unwrap();
+    }
+    let err = account.poll_once().unwrap_err();
+    println!("[GT] expected sync failure: {err:#}");
+    {
+        let g = store.read();
+        assert!(g.convs.is_empty(), "failed sync must not apply group rows");
+        assert_eq!((g.watermark_group, g.watermark_c2c), (0, 0), "failed sync must not advance watermarks");
+    }
+
+    // Repair and retry: every row arrives exactly once.
+    {
+        let conn = decrypt::open_decrypted(&mirror.lock().main_path, FAKE_KEY).unwrap();
+        conn.execute_batch("ALTER TABLE c2c_broken RENAME TO c2c_msg_table;")
+            .unwrap();
+    }
+    let records = account.poll_once().unwrap();
+    assert_eq!(records.len(), 8, "retry returns all rows (6 group + 2 c2c)");
+    let g = store.read();
+    // The fake fixture spreads group rows over two groups: 5 in 10001, 1 in 20002.
+    let group = g
+        .conversation(ChatType::Group, "10001")
+        .expect("group conversation exists");
+    assert_eq!(group.msgs.len(), 5, "group rows applied exactly once (10001)");
+    let other = g
+        .conversation(ChatType::Group, "20002")
+        .expect("second group conversation exists");
+    assert_eq!(other.msgs.len(), 1, "group rows applied exactly once (20002)");
+    let c2c = g
+        .conversation(ChatType::C2c, "u_12345")
+        .expect("c2c conversation exists");
+    assert_eq!(c2c.msgs.len(), 2, "c2c rows applied exactly once");
+
+    let _ = std::fs::remove_dir_all(&mirror_dir);
+}
+
 /// Ground truth over a REAL QQ database. Ignored by default; requires
 /// QQFLOW_TEST_DB_ROOT + QQFLOW_TEST_DB_KEY env vars.
 #[test]
@@ -164,6 +221,7 @@ fn real_db_groundtruth() {
     println!("[GT] accounts under {root}: {:?}", accounts.iter().map(|a| &a.qq).collect::<Vec<_>>());
 
     for info in &accounts {
+        let now_ts = chrono::Utc::now().timestamp();
         let t0 = std::time::Instant::now();
         let mirror_dir = std::env::temp_dir().join("qqflow_gt_mirror").join(&info.qq);
         let mirror = Mirror::new(info, &mirror_dir).unwrap();
@@ -176,20 +234,59 @@ fn real_db_groundtruth() {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .unwrap();
-            let (min_ts, max_ts): (i64, i64) = conn
-                .query_row(&format!("SELECT min(\"40001\">>16), max(\"40001\">>16) FROM {table}"), [], |r| {
+            // Timestamps derive from the raw seq via the PRODUCTION
+            // `seq_to_time` (seq >> 32), never an ad-hoc SQL shift — a
+            // hand-written shift here once drifted from the code (>>16) and
+            // silently printed garbage. NULLs (empty table) are skipped.
+            let (min_seq, max_seq): (Option<i64>, Option<i64>) = conn
+                .query_row(&format!("SELECT min(\"40001\"), max(\"40001\") FROM {table}"), [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
                 })
                 .unwrap();
-            let out_of_order: i64 = conn
-                .query_row(
-                    &format!(
-                        "SELECT count(*) FROM (SELECT \"40001\">>16 AS t, LAG(\"40001\">>16) OVER (ORDER BY rowid) AS p FROM {table}) WHERE p IS NOT NULL AND t < p"
-                    ),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
+            let (min_ts, max_ts) = match (min_seq, max_seq) {
+                (Some(lo), Some(hi)) => (seq_to_time(lo), seq_to_time(hi)),
+                _ => {
+                    println!("[GT] {table}: empty (no seq rows), skipping ts checks");
+                    continue;
+                }
+            };
+            // Out-of-order rows: seq_to_time decreasing along rowid order
+            // (backfill etc.), counted in Rust with the same extraction.
+            // future_ts counts rows dated after `now` — a small fraction is
+            // expected (senders with wrong clocks); wholesale future dates
+            // mean the seq layout changed.
+            let mut out_of_order = 0i64;
+            let mut future_ts = 0i64;
+            {
+                let mut prev: Option<i64> = None;
+                let mut stmt = conn
+                    .prepare(&format!("SELECT \"40001\" FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+                for r in rows.flatten() {
+                    let t = seq_to_time(r);
+                    if let Some(p) = prev
+                        && t < p
+                    {
+                        out_of_order += 1;
+                    }
+                    if t > now_ts {
+                        future_ts += 1;
+                    }
+                    prev = Some(t);
+                }
+            }
+            println!(
+                "[GT] {table}: tsRange(seq_to_time)=[{min_ts},{max_ts}] outOfOrder={out_of_order} futureTs={future_ts}"
+            );
+            // Arbitration: a plausible message time is 2000..now+1y (sender
+            // clocks drift well past a day); anything beyond that means the
+            // seq layout changed and seq_to_time must be reworked.
+            assert!(min_ts > 946_684_800, "{table}: min ts implausible: {min_ts}");
+            assert!(
+                max_ts < now_ts + 366 * 86_400,
+                "{table}: max ts implausibly far in the future: {max_ts}"
+            );
             let (b_min, b_max): (i64, i64) = conn
                 .query_row(&format!("SELECT min(length(\"40800\")), max(length(\"40800\")) FROM {table}"), [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
@@ -207,7 +304,7 @@ fn real_db_groundtruth() {
                 .unwrap();
             println!(
                 "[GT] {table}: count={cnt} maxRowid={max_rowid} distinctTalkers={distinct} \
-                 tsRange(seq>>16)=[{min_ts},{max_ts}] outOfOrder={out_of_order} blobLen=[{b_min},{b_max}] >64KB={big}"
+                 tsRange(seq_to_time)=[{min_ts},{max_ts}] outOfOrder={out_of_order} blobLen=[{b_min},{b_max}] >64KB={big}"
             );
             for (label, phrase) in [
                 ("recall", "你猜猜撤回了什么"),

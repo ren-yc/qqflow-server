@@ -79,43 +79,58 @@ impl AccountSync {
         mirror.sync()?;
         let conn = decrypt::open_decrypted(&mirror.main_path, &self.key)?;
 
-        let mut guard = self.store.write();
-        let wm_g = guard.watermark_group;
-        let wm_c = guard.watermark_c2c;
+        // Read phase: parse rows above the watermark without touching the
+        // store. If either table's read fails, nothing has been applied —
+        // the retry re-reads the same rows instead of duplicating them.
+        let (wm_g, wm_c) = {
+            let guard = self.store.read();
+            (guard.watermark_group, guard.watermark_c2c)
+        };
+        let (new_wm_g, new_g) = index::read_new(&conn, ChatType::Group, wm_g)?;
+        let (new_wm_c, new_c) = index::read_new(&conn, ChatType::C2c, wm_c)?;
 
-        let (new_wm_g, new_g) = index::append_new(&conn, ChatType::Group, &mut guard, wm_g)?;
-        let (new_wm_c, new_c) = index::append_new(&conn, ChatType::C2c, &mut guard, wm_c)?;
-
-        for r in new_g.iter().chain(&new_c) {
-            let group_name = guard
-                .conversation(r.chat_type, &r.talker)
-                .map(|c| c.name.clone());
-            let ev = if r.parsed.msg_type == MsgType::Recall {
-                Event::message_revoke(
-                    r.chat_type,
-                    r.talker.clone(),
-                    group_name,
-                    r.rowid,
-                    Some(r.from_nick.clone()),
-                    r.parsed.content.clone(),
-                    r.ts,
-                )
-            } else {
-                Event::message_new(
-                    r.chat_type,
-                    r.talker.clone(),
-                    group_name,
-                    r.rowid,
-                    Some(r.from_nick.clone()),
-                    r.parsed.content.clone(),
-                    r.ts,
-                )
-            };
+        // Apply phase: one write-lock critical section — append both tables,
+        // advance both watermarks, and build the SSE events.
+        let events: Vec<Event> = {
+            let mut guard = self.store.write();
+            index::apply_records(&mut guard, &new_g);
+            index::apply_records(&mut guard, &new_c);
+            guard.watermark_group = new_wm_g;
+            guard.watermark_c2c = new_wm_c;
+            new_g
+                .iter()
+                .chain(&new_c)
+                .map(|r| {
+                    let group_name = guard
+                        .conversation(r.chat_type, &r.talker)
+                        .map(|c| c.name.clone());
+                    if r.parsed.msg_type == MsgType::Recall {
+                        Event::message_revoke(
+                            r.chat_type,
+                            r.talker.clone(),
+                            group_name,
+                            r.rowid,
+                            Some(r.from_nick.clone()),
+                            r.parsed.content.clone(),
+                            r.ts,
+                        )
+                    } else {
+                        Event::message_new(
+                            r.chat_type,
+                            r.talker.clone(),
+                            group_name,
+                            r.rowid,
+                            Some(r.from_nick.clone()),
+                            r.parsed.content.clone(),
+                            r.ts,
+                        )
+                    }
+                })
+                .collect()
+        };
+        for ev in events {
             let _ = self.tx.send(ev);
         }
-
-        guard.watermark_group = new_wm_g;
-        guard.watermark_c2c = new_wm_c;
 
         let mut all = new_g;
         all.extend(new_c);

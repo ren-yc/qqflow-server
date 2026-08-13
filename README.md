@@ -46,9 +46,9 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 }
 ```
 
-可用字段：`port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `watch_debounce_ms` / `watch_fallback_ms` / `data_dir` / `db_path` / `log`。未知字段或类型错误 → 启动失败（提示具体字段）；配置文件缺失 → 全部使用默认值。`watch_debounce_ms`（默认 350）为文件事件防抖；`watch_fallback_ms`（默认 30000）为慢速兜底轮询，0 关闭（不推荐）。
+可用字段：`port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `watch_debounce_ms` / `watch_fallback_ms` / `data_dir` / `db_path` / `log`。未知字段或类型错误 → 启动失败（提示具体字段）；配置文件缺失 → 全部使用默认值。`watch_debounce_ms`（默认 350）为文件事件防抖；`watch_fallback_ms`（默认 30000）为慢速兜底轮询，0 关闭（不推荐；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）。
 
-默认 `http://127.0.0.1:5031`，token 自动生成并持久化到 `<data-dir>/token.txt`（首次启动打印）。
+默认 `http://127.0.0.1:5031`，token 自动生成并持久化到 `<data-dir>/token.txt`（启动日志仅打印文件路径，不打印 token 值）。
 
 ## API（与 WeFlow 契约对齐）
 
@@ -83,6 +83,9 @@ bash scripts/build.sh test                        # Linux/macOS
 - `tests/fs_watch_e2e.rs`：文件系统事件 → 同步 → SSE 广播的端到端测试（假库）
 - `tests/real_db_groundtruth.rs`：真实 QQ 库 ground-truth 查询（默认 `#[ignore]`，需
   `QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY` 环境变量）
+- `tests/downstream_client.rs`：模拟下游客户端的 GET/POST 请求（三种鉴权、错误信封、
+  ChatLab Pull 翻页、群成员、手动同步、SSE），走真实管线读真实 QQ 库（默认 `#[ignore]`，
+  同样的环境变量）
 
 ## 免责声明
 
