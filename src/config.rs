@@ -1,56 +1,33 @@
-//! Runtime configuration: loaded exclusively from `./qqflow-server.json`
-//! in the working directory (no command-line arguments).
+//! Runtime configuration from command-line arguments (no config file).
 //!
-//! Field names mirror the former CLI args (snake_case); `keys` maps
-//! qq -> SQLCipher key directly. Unknown fields are a parse error
-//! (typo guard); a missing default config file falls back to defaults.
+//! `--port` (5031), `--host` (127.0.0.1), `--log` (info), plus the watch
+//! tuning knobs `--watch-debounce-ms` (350) and `--watch-fallback-ms`
+//! (30000). Account database paths and SQLCipher keys are NOT configuration
+//! — downstream clients register them at runtime via `POST /api/v1/accounts`.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use anyhow::{bail, Context, Result};
 
-/// Full server configuration. Every field has a built-in default;
-/// a missing or partial config file fills only what it provides.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// Full server configuration. Every field has a built-in default.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Listen port (same as WeFlow).
     pub port: u16,
     /// Bind address. Keep 127.0.0.1 unless you know what you are doing.
     pub host: String,
-    /// API access token. Auto-generated (32B hex) and persisted if omitted.
-    pub token: Option<String>,
-    /// Direct qq -> key mapping (16 printable ASCII bytes per key).
-    pub keys: HashMap<String, String>,
-    /// Optional external keys file: {"<qq>": "<key>"}. Overrides `keys`
-    /// for the same qq.
-    pub keys_file: Option<PathBuf>,
-    /// Ask for missing keys interactively on stdin at startup.
-    pub ask_key: bool,
-    /// Restrict to these QQ accounts (by default all scanned accounts are used).
-    pub qq: Vec<String>,
+    /// Log level: error | warn | info | debug.
+    pub log: String,
     /// File-watch debounce (ms): how long the watcher waits for an event
     /// burst to quiet down before triggering a sync (WeFlow-aligned; with
     /// batch mode the worst-case delay is about 2x this value).
     pub watch_debounce_ms: u64,
-
     /// Slow fallback poll (ms): `Mirror::changed()` (zero-IO stats) as a
     /// safety net against file-watch events being silently lost (inotify /
     /// ReadDirectoryChangesW buffer overflow). 0 = disabled (not
     /// recommended: missed events would never recover). The watcher
     /// re-attach retry (every 10 s) is independent of this setting.
     pub watch_fallback_ms: u64,
-    /// Data directory (keys, token, mirror cache). Platform default:
-    /// Windows %LOCALAPPDATA%\qqflow-server, Linux ~/.local/share/qqflow-server,
-    /// macOS ~/Library/Application Support/qqflow-server.
-    pub data_dir: Option<PathBuf>,
-    /// Override database discovery: a Tencent Files-style root directory
-    /// (<dir>/<qq>/nt_qq/nt_db/nt_msg.db) or a direct nt_msg.db file.
-    pub db_path: Option<PathBuf>,
-    /// Log level: error | warn | info | debug.
-    pub log: String,
 }
 
 impl Default for Config {
@@ -58,39 +35,81 @@ impl Default for Config {
         Self {
             port: 5031,
             host: "127.0.0.1".into(),
-            token: None,
-            keys: HashMap::new(),
-            keys_file: None,
-            ask_key: false,
-            qq: Vec::new(),
+            log: "info".into(),
             watch_debounce_ms: 350,
             watch_fallback_ms: 30_000,
-            data_dir: None,
-            db_path: None,
-            log: "info".into(),
         }
     }
 }
 
-/// Load `./qqflow-server.json` from the working directory; missing file
-/// falls back to defaults, invalid JSON / unknown fields are errors.
-pub fn load() -> Result<Config> {
-    load_from(Path::new("qqflow-server.json"))
+fn help() -> String {
+    "qqflow-server — 本地 QQ NT 聊天记录 HTTP API + SSE 服务\n\
+     \n\
+     用法: qqflow-server [选项]\n\
+     \n\
+     选项:\n\
+       --port <u16>              监听端口（默认 5031）\n\
+       --host <ip>               绑定地址（默认 127.0.0.1）\n\
+       --log <level>             日志级别: error|warn|info|debug（默认 info）\n\
+       --watch-debounce-ms <ms>  文件事件防抖（默认 350）\n\
+       --watch-fallback-ms <ms>  慢速兜底轮询，0 关闭（默认 30000）\n\
+       -h, --help                显示本帮助\n\
+     \n\
+     账号与密钥不在命令行提供：启动后由客户端 POST /api/v1/accounts\n\
+     传入 {qq, key, db_path} 注册账号。"
+        .to_string()
 }
 
-/// Load a config from an explicit path (used by tests).
-pub fn load_from(path: &Path) -> Result<Config> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(e) => return Err(e).with_context(|| format!("read config {}", path.display())),
-    };
-    let cfg: Config = serde_json::from_str(&text)
-        .with_context(|| format!("parse config {} (未知字段或类型错误?)", path.display()))?;
+/// Parse command-line arguments (skip the program name).
+pub fn load() -> Result<Config> {
+    parse_args(std::env::args().skip(1).collect())
+}
+
+/// Parse `--flag value` pairs (separate from `load` so tests can drive it).
+pub fn parse_args(args: Vec<String>) -> Result<Config> {
+    let mut cfg = Config::default();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].clone();
+        if flag == "-h" || flag == "--help" {
+            println!("{}", help());
+            std::process::exit(0);
+        }
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow::anyhow!("参数 {flag} 缺少值\n{}", help()))?
+            .clone();
+        match flag.as_str() {
+            "--port" => {
+                cfg.port = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--port 需为 0-65535 的整数: {value}"))?
+            }
+            "--host" => cfg.host = value,
+            "--log" => {
+                if !matches!(value.as_str(), "error" | "warn" | "info" | "debug") {
+                    bail!("--log 需为 error|warn|info|debug: {value}");
+                }
+                cfg.log = value;
+            }
+            "--watch-debounce-ms" => {
+                cfg.watch_debounce_ms = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--watch-debounce-ms 需为非负整数: {value}"))?
+            }
+            "--watch-fallback-ms" => {
+                cfg.watch_fallback_ms = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--watch-fallback-ms 需为非负整数: {value}"))?
+            }
+            other => bail!("未知参数: {other}\n{}", help()),
+        }
+        i += 2;
+    }
     Ok(cfg)
 }
 
-/// Resolve the data directory (default per-platform, override via config `data_dir`).
+/// Resolve the data directory (platform default; no config override anymore).
 pub fn data_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some(d) = override_dir {
         std::fs::create_dir_all(d).with_context(|| format!("create data dir {}", d.display()))?;
@@ -145,74 +164,46 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    /// Unique temp dir per test — tests run in parallel and must not share
-    /// the same config file on disk.
-    fn test_dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("qqflow_cfg_{name}_{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    fn write_config(dir: &Path, content: &str) -> PathBuf {
-        let p = dir.join("qqflow-server.json");
-        std::fs::File::create(&p)
-            .unwrap()
-            .write_all(content.as_bytes())
-            .unwrap();
-        p
-    }
 
     #[test]
-    fn missing_file_falls_back_to_defaults() {
-        let dir = test_dir("missing");
-        let cfg = load_from(&dir.join("nope.json")).unwrap();
+    fn defaults_with_no_args() {
+        let cfg = parse_args(vec![]).unwrap();
         assert_eq!(cfg.port, 5031);
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.log, "info");
-        assert!(cfg.keys.is_empty());
+        assert_eq!(cfg.watch_debounce_ms, 350);
+        assert_eq!(cfg.watch_fallback_ms, 30_000);
     }
 
     #[test]
-    fn full_config_applied() {
-        let dir = test_dir("full");
-        let p = write_config(
-            &dir,
-            r#"{"port": 5999, "host": "0.0.0.0", "log": "debug", "watch_debounce_ms": 500,
-                "watch_fallback_ms": 0, "db_path": "D:\\x", "qq": ["123456789"]}"#,
-        );
-        let cfg = load_from(&p).unwrap();
+    fn flags_override_defaults() {
+        let cfg = parse_args(
+            ["--port", "5999", "--host", "0.0.0.0", "--log", "debug", "--watch-debounce-ms", "500", "--watch-fallback-ms", "0"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .unwrap();
         assert_eq!(cfg.port, 5999);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.log, "debug");
         assert_eq!(cfg.watch_debounce_ms, 500);
         assert_eq!(cfg.watch_fallback_ms, 0);
-        assert_eq!(cfg.db_path.as_deref().unwrap(), Path::new("D:\\x"));
-        assert_eq!(cfg.qq, vec!["123456789"]);
     }
 
     #[test]
-    fn keys_object_loaded() {
-        let dir = test_dir("keys");
-        // Fabricated account number (not a real QQ).
-        let p = write_config(&dir, r#"{"keys": {"335663881": "0123456789abcdef"}}"#);
-        let cfg = load_from(&p).unwrap();
-        assert_eq!(cfg.keys.get("335663881").unwrap(), "0123456789abcdef");
-        assert_eq!(cfg.port, 5031, "unspecified fields keep defaults");
-    }
+    fn invalid_values_rejected() {
+        let args: Vec<String> = ["--port", "abc"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(args).is_err());
 
-    #[test]
-    fn unknown_field_rejected() {
-        let dir = test_dir("typo");
-        let p = write_config(&dir, r#"{"porrt": 5999}"#);
-        assert!(load_from(&p).is_err(), "typo'd field must be a hard error");
-    }
+        let args: Vec<String> = ["--log", "verbose"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(args).is_err());
 
-    #[test]
-    fn invalid_json_rejected() {
-        let dir = test_dir("bad");
-        let p = write_config(&dir, r#"{not json"#);
-        assert!(load_from(&p).is_err());
+        let args: Vec<String> = ["--nope", "1"].iter().map(|s| s.to_string()).collect();
+        let err = parse_args(args).unwrap_err();
+        assert!(format!("{err:#}").contains("未知参数"));
+
+        let args: Vec<String> = ["--port"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(args).is_err(), "missing value must be an error");
     }
 }

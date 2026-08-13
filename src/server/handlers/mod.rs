@@ -1,5 +1,6 @@
 //! Endpoint handlers (WeFlow-compatible paths and shapes).
 
+pub mod accounts;
 pub mod chatlab_pull;
 pub mod contacts;
 pub mod group_members;

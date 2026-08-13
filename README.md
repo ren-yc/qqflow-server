@@ -27,26 +27,26 @@ wrapper 透传全部 cargo 参数（`clippy`/`test`/`build --release` 等同理�
 ## 运行
 
 ```powershell
-# 1. 用独立工具提取密钥（问题 1 结论即输入来源）
+# 1. 用独立工具提取密钥
 irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/windows/ntqq/windows_ntqq_get_key.ps1 | iex
 
-# 2. 启动（无命令行参数，配置仅由当前目录 ./qqflow-server.json 提供；文件缺失时使用默认值）
+# 2. 启动（无配置文件；参数全部由命令行指定，均有默认值）
 .\qqflow-server.exe
+.\qqflow-server.exe --port 5031 --host 127.0.0.1 --log info
+.\qqflow-server.exe --help
 ```
 
-配置文件示例（`keys` 直接映射账号→密钥；密钥也可经 `keys_file` 外部文件或 `ask_key` 交互输入）：
+命令行参数：`--port`（默认 5031）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）。
 
-```json
-{
-  "port": 5031, "host": "127.0.0.1", "log": "info",
-  "keys": { "<QQ号>": "<16字节密钥>" },
-  "db_path": "D:\\AppData\\Tencent Files",
-  "watch_debounce_ms": 350,
-  "watch_fallback_ms": 30000
-}
+**账号为客户端驱动**：启动后服务以空账号状态运行（`/health` 列出平台扫描发现的账号，状态 `awaiting_key`）；密钥不由配置提供，由客户端运行时注册（仅内存保存，不持久化）：
+
+```bash
+curl -X POST http://127.0.0.1:5031/api/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d "{\"qq\": \"<QQ号>\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\", \"access_token\": \"<token.txt内容>\"}"
 ```
 
-可用字段：`port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `watch_debounce_ms` / `watch_fallback_ms` / `data_dir` / `db_path` / `log`。未知字段或类型错误 → 启动失败（提示具体字段）；配置文件缺失 → 全部使用默认值。`watch_debounce_ms`（默认 350）为文件事件防抖；`watch_fallback_ms`（默认 30000）为慢速兜底轮询，0 关闭（不推荐；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）。
+`db_path` 可为 `nt_msg.db` 文件路径或 Tencent Files 风格目录（省略则复用扫描到的路径）；密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
 默认 `http://127.0.0.1:5031`，token 自动生成并持久化到 `<data-dir>/token.txt`（启动日志仅打印文件路径，不打印 token 值）。
 
@@ -55,6 +55,7 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 | 端点 | 说明 |
 |---|---|
 | `GET/POST /health`、`/api/v1/health` | 健康检查（免鉴权） |
+| `POST /api/v1/accounts` | 注册账号：`qq` + `key` + 可选 `db_path`（客户端驱动启动） |
 | `GET/POST /api/v1/messages` | `talker` 必填；`limit/offset/start/end/keyword/chatlab/format` |
 | `GET/POST /api/v1/sessions` | 会话列表（`format=chatlab` 输出 ChatLab 形态） |
 | `GET /api/v1/sessions/{id}/messages` | ChatLab Pull 增量同步（`since/end/limit/offset` + `sync` 块） |
@@ -84,11 +85,13 @@ bash scripts/build.sh test                        # Linux/macOS
 - `tests/real_db_groundtruth.rs`：真实 QQ 库 ground-truth 查询（默认 `#[ignore]`，需
   `QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY` 环境变量）
 - `tests/downstream_client.rs`：模拟下游客户端的 GET/POST 请求（三种鉴权、错误信封、
-  ChatLab Pull 翻页、群成员、手动同步、SSE），走真实管线读真实 QQ 库（默认 `#[ignore]`，
-  同样的环境变量）
+  ChatLab Pull 翻页、群成员、手动同步、SSE），走真实管线读真实 QQ 库（默认 `#[ignore]`；
+  输入优先读项目根 `qqflow-server.json` 的 `qq`/`key`/`db_path`，缺失时回退
+  `QQFLOW_TEST_QQ` / `QQFLOW_TEST_DB_KEY` / `QQFLOW_TEST_DB_ROOT` 环境变量）
 
 ## 免责声明
 
-仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥混淆/明文 JSON 仅作便利存储，
-非安全机制；QQ 升级可能导致列名/消息格式解析退化（启发式解析天然容错）。参考实现
-（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，未逐字复制。
+仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存
+（不落盘），鉴权依赖本地 token.txt，均非安全机制；QQ 升级可能导致列名/消息格式解析退化
+（启发式解析天然容错）。参考实现（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，
+未逐字复制。

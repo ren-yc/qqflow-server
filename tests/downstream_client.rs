@@ -1,80 +1,122 @@
 //! Downstream-client simulation: GET/POST against the REAL HTTP layer with a
-//! REAL QQ database (same env-var contract as `real_db_groundtruth`):
-//!   QQFLOW_TEST_DB_ROOT - Tencent Files-style root (<dir>/<qq>/nt_qq/nt_db/nt_msg.db)
-//!   QQFLOW_TEST_DB_KEY  - 16-byte printable ASCII SQLCipher key
+//! REAL QQ database. No secrets are hardcoded here — the registration inputs
+//! resolve in priority order:
+//!
+//!   1. `./qqflow-server.json` in the repo root (gitignored), flat fields:
+//!      `qq` / `key` / `db_path`;
+//!   2. environment variables: QQFLOW_TEST_QQ / QQFLOW_TEST_DB_KEY /
+//!      QQFLOW_TEST_DB_ROOT (Tencent Files-style root or a direct
+//!      nt_msg.db file).
 //!
 //! Run:
 //!   powershell -File scripts\build.ps1 test --test downstream_client -- --ignored --nocapture
 //!
-//! Exercises the exact request shapes a WeFlow-style client sends: auth via
-//! Bearer header / `?access_token=` / POST JSON body, GET+POST parameter
-//! transport, error envelopes, ChatLab Pull pagination (`nextSince` /
-//! `nextOffset`), group members with message counts, manual sync, and the
-//! SSE content-type — all against real QQ chat data.
+//! Startup is CLIENT-DRIVEN: the app boots with zero accounts, and the test
+//! registers the account via `POST /api/v1/accounts` (qq + key + db_path)
+//! exactly like a downstream client would, then waits for the background
+//! index build to reach `ready`. Afterwards it exercises the request shapes
+//! a WeFlow-style client sends: auth via Bearer header / `?access_token=` /
+//! POST JSON body, GET+POST parameter transport, error envelopes, ChatLab
+//! Pull pagination (`nextSince` / `nextOffset`), group members with message
+//! counts, manual sync, and the SSE content-type — all against real QQ chat
+//! data.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use parking_lot::RwLock;
-use qqflow_server::db::{decrypt, mirror::Mirror, scan};
-use qqflow_server::server::{build_router, AccountState};
-use qqflow_server::store::{index, AppState};
-use qqflow_server::sync::{AccountSync, SyncEngine};
+use qqflow_server::keystore::KeyStore;
+use qqflow_server::server::{build_router, AccountRegistry};
+use qqflow_server::store::AppState;
+use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 const TEST_TOKEN: &str = "downstream-client-test-token";
 
-/// Build the real server pipeline (scan + mirror + decrypt + index + router)
-/// for the first scanned account. Returns None when the env vars are absent.
-fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, PathBuf)> {
-    let root = std::env::var("QQFLOW_TEST_DB_ROOT").ok()?;
+/// Resolve the registration inputs `(qq, key, db_path)`. Priority: the
+/// repo-root `./qqflow-server.json` (gitignored — never committed), then the
+/// environment variables. Returns None when neither source provides all
+/// three values.
+fn resolve_inputs() -> Option<(String, String, String)> {
+    // 1. repo-root config file (highest priority; flat qq/key/db_path).
+    if let Ok(text) = std::fs::read_to_string("qqflow-server.json")
+        && let Ok(v) = serde_json::from_str::<Value>(&text)
+    {
+        let qq = v["qq"].as_str().map(String::from);
+        let key = v["key"].as_str().map(String::from);
+        let db_path = v["db_path"].as_str().map(String::from);
+        if let (Some(qq), Some(key), Some(db_path)) = (qq, key, db_path) {
+            println!("[CLIENT] inputs from ./qqflow-server.json");
+            return Some((qq, key, db_path));
+        }
+    }
+    // 2. environment variables.
+    let qq = std::env::var("QQFLOW_TEST_QQ").ok()?;
     let key = std::env::var("QQFLOW_TEST_DB_KEY").ok()?;
+    let db_path = std::env::var("QQFLOW_TEST_DB_ROOT").ok()?;
+    println!("[CLIENT] inputs from environment variables");
+    Some((qq, key, db_path))
+}
 
-    let accounts = scan::scan_accounts(Some(std::path::Path::new(&root)))
-        .expect("scan QQFLOW_TEST_DB_ROOT");
-    assert!(!accounts.is_empty(), "no accounts under {root}");
-    let info = &accounts[0]; // single-account scope
-    println!("[CLIENT] account {} (db: {})", info.qq, info.path.display());
+/// Build an EMPTY app (client-driven startup: zero accounts, not ready)
+/// plus the resolved registration inputs. Returns None when no input
+/// source provides qq + key + db_path.
+fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, String, PathBuf)> {
+    let (qq, key, root) = resolve_inputs()?;
+    println!("[CLIENT] account {qq} (db_path: {root})");
 
     let mirror_dir =
         std::env::temp_dir().join(format!("qqflow_downstream_mirror_{}", std::process::id()));
-    let mirror = Mirror::new(info, &mirror_dir).expect("mirror real db");
-    let mirror = Arc::new(parking_lot::Mutex::new(mirror));
-    let conn = decrypt::open_decrypted(&mirror.lock().main_path, &key).expect("decrypt real db");
-    let store = index::build_index(&conn).expect("index real db");
-    let count: usize = store.convs.values().map(|c| c.msgs.len()).sum();
-    println!(
-        "[CLIENT] indexed {count} messages in {} conversations",
-        store.convs.len()
-    );
-
-    let store = Arc::new(RwLock::new(store));
-    let (tx, _rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(1024);
-    // Register the real per-account sync so POST /api/v1/sync runs a genuine
-    // incremental pass (mirror refresh + decrypt + read_new).
-    let account = Arc::new(AccountSync::new(mirror, key, store.clone(), tx.clone()));
-    let sync = Arc::new(SyncEngine::new());
-    sync.register(account);
     let state = Arc::new(AppState {
-        store,
-        events: tx,
-        accounts: Arc::new(RwLock::new(vec![AccountState {
-            qq: info.qq.clone(),
-            state: "ready".into(),
-            message_count: count,
-            error: None,
-        }])),
-        ready: Arc::new(AtomicBool::new(true)),
+        store: Arc::new(RwLock::new(qqflow_server::store::Store::default())),
+        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(1024).0,
+        accounts: Arc::new(RwLock::new(Vec::new())),
+        ready: Arc::new(AtomicBool::new(false)),
         token: Arc::new(TEST_TOKEN.into()),
-        sync,
+        sync: Arc::new(SyncEngine::new()),
+        init: Arc::new(AccountRegistry {
+            accounts_db: parking_lot::Mutex::new(Vec::new()),
+            key_store: parking_lot::Mutex::new(KeyStore::default()),
+            mirror_root: mirror_dir.clone(),
+            watch_cfg: qqflow_server::sync::watch::WatchConfig {
+                debounce: Duration::from_millis(350),
+                fallback: None,
+            },
+            shutdown: tokio::sync::watch::channel(false).1,
+        }),
     });
     let app = build_router(state.clone());
-    Some((app, state, info.qq.clone(), mirror_dir))
+    Some((app, state, qq, root, key, mirror_dir))
+}
+
+/// Poll /health until the account is ready; returns its indexed message count.
+async fn wait_ready(app: axum::Router, qq: &str) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (s, v) = client_get(app.clone(), "/health", &[]).await;
+        assert_eq!(s, StatusCode::OK);
+        for a in v["accounts"].as_array().unwrap() {
+            if a["qq"] != qq {
+                continue;
+            }
+            match a["state"].as_str().unwrap() {
+                "ready" => return a["message_count"].as_u64().unwrap() as usize,
+                "error" => panic!("[CLIENT] account failed: {:?}", a["error"]),
+                _ => {}
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "[CLIENT] timeout waiting for {qq} to become ready"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// Downstream-client GET (optional extra headers, e.g. Bearer auth).
@@ -123,24 +165,46 @@ async fn client_post(
 #[tokio::test]
 #[ignore]
 async fn downstream_client_real_db() {
-    let Some((app, state, qq, mirror_dir)) = build_real_app() else {
-        println!("[CLIENT] SKIPPED: QQFLOW_TEST_DB_ROOT / QQFLOW_TEST_DB_KEY not set");
+    let Some((app, state, qq, root, key, mirror_dir)) = build_real_app() else {
+        println!(
+            "[CLIENT] SKIPPED: 无 ./qqflow-server.json 且环境变量未设置 \
+             (QQFLOW_TEST_QQ / QQFLOW_TEST_DB_KEY / QQFLOW_TEST_DB_ROOT)"
+        );
         return;
     };
     let token = state.token.as_str();
 
-    // ---- 1. health: no auth, ready state --------------------------------
+    // ---- 0. boot state: zero accounts, not ready ------------------------
+    let (s, v) = client_get(app.clone(), "/health", &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["status"], "starting");
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["accounts"].as_array().unwrap().len(), 0);
+
+    // ---- 0.1 register the account (client-driven startup) ---------------
+    let (s, v) = client_post(
+        app.clone(),
+        "/api/v1/accounts",
+        &[],
+        json!({"access_token": token, "qq": qq, "key": key, "db_path": root}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "accepted", "registration accepted: {v}");
+
+    // ---- 1. health: ready after the background index build --------------
+    let indexed = wait_ready(app.clone(), &qq).await;
+    assert!(indexed > 0, "real db must have messages");
+    println!("[CLIENT] indexed {indexed} messages");
     let (s, v) = client_get(app.clone(), "/health", &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["status"], "ok");
-    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     let accounts = v["accounts"].as_array().unwrap();
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["qq"], qq);
     assert_eq!(accounts[0]["state"], "ready");
     assert!(accounts[0].get("error").is_none());
-    let indexed = accounts[0]["message_count"].as_u64().unwrap() as usize;
-    assert!(indexed > 0, "real db must have messages");
+    assert_eq!(accounts[0]["message_count"].as_u64().unwrap() as usize, indexed);
 
     // ---- 2. auth: business endpoints reject missing tokens --------------
     let (s, v) = client_get(app.clone(), "/api/v1/messages?talker=x", &[]).await;

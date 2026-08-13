@@ -12,7 +12,7 @@ use qqflow_server::sync::Event;
 use qqflow_server::server::build_router;
 use qqflow_server::store::{conv_key, AppState, Conversation, Store};
 use qqflow_server::store::query::{query_messages, MessageQuery};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 fn state_with(store: Store, ready: bool) -> Arc<AppState> {
@@ -24,6 +24,16 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
         ready: Arc::new(AtomicBool::new(ready)),
         token: Arc::new("test-token-123456".into()),
         sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
+        init: Arc::new(qqflow_server::server::AccountRegistry {
+            accounts_db: parking_lot::Mutex::new(Vec::new()),
+            key_store: parking_lot::Mutex::new(qqflow_server::keystore::KeyStore::default()),
+            mirror_root: std::env::temp_dir().join("qqflow_smoke_mirror"),
+            watch_cfg: qqflow_server::sync::watch::WatchConfig {
+                debounce: std::time::Duration::from_millis(350),
+                fallback: None,
+            },
+            shutdown: tokio::sync::watch::channel(false).1,
+        }),
     })
 }
 
@@ -85,6 +95,25 @@ async fn get(uri: &str, token: bool) -> (StatusCode, Value) {
         builder = builder.header("Authorization", "Bearer test-token-123456");
     }
     let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// POST a JSON body through `app`.
+async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
@@ -442,4 +471,83 @@ async fn sse_connects_before_ready() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn accounts_requires_auth() {
+    let app = build_router(test_state());
+    let (s, v) = post_json(
+        app,
+        "/api/v1/accounts",
+        json!({"qq": "10001", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["code"], 401);
+}
+
+#[tokio::test]
+async fn accounts_validation_and_idempotency() {
+    let state = test_state();
+    // Seed a ready account entry so already_ready can be exercised.
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: "ready".into(),
+        message_count: 2,
+        error: None,
+    });
+    // A scanned-style entry for 10002, so key validation is reachable
+    // (resolve succeeds without a db_path).
+    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
+        qq: "10002".into(),
+        path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
+    });
+    let app = build_router(state);
+    let tok = "test-token-123456";
+
+    // Malformed key -> invalid_key (not an HTTP error).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": tok, "qq": "10002", "key": "short"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "invalid_key");
+
+    // Ready account -> idempotent no-op.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": tok, "qq": "10001", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "already_ready");
+
+    // Unknown qq without a db_path -> unknown_qq.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": tok, "qq": "999", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "unknown_qq");
+
+    // Unresolvable db_path -> invalid_db_path.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": tok, "qq": "999", "key": "0123456789abcdef", "db_path": "Z:\\nonexistent"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "invalid_db_path");
+
+    // Missing qq / key -> 400 envelope.
+    let (s, v) = post_json(app, "/api/v1/accounts", json!({"access_token": tok})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["code"], 400);
 }

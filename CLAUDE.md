@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Headless HTTP API + SSE service that reads **local QQ NT chat records** (`nt_msg.db`, SQLCipher-encrypted, 1024-byte custom header, WAL mode). This is an **independent project**; other projects (WeFlow HTTP API, QQBackup tools, etc.) are used only as functional references — e.g. the HTTP interface follows the WeFlow HTTP API contract (paths, params, response envelopes, SSE field names). Docs and 调研 notes are in Chinese; code comments are bilingual.
 
-**Deliberately out of scope:** key extraction (keys come from external tools like `QQBackup/qq-win-db-key`), media export, SNS endpoints.
+**Deliberately out of scope:** key extraction (keys come from external tools like `QQBackup/qq-win-db-key` and are supplied at runtime by clients via `POST /api/v1/accounts`), media export, SNS endpoints.
 
 ## Commands
 
@@ -26,16 +26,20 @@ bash scripts/build.sh test                        # same on Linux/macOS
 
 The toolchain is pinned by `rust-toolchain.toml` (rustc 1.97.1, version-locked for reproducible clippy lints); rustup auto-installs it on first use.
 
-Run against real data — **config-only, no CLI arguments**; configuration comes exclusively from `./qqflow-server.json` in the working directory (a missing file falls back to defaults):
+Run against real data — **no config file**; run parameters come from CLI flags, all optional with the defaults shown:
 
 ```powershell
-.\qqflow-server.exe
+.\qqflow-server.exe                                  # defaults: 127.0.0.1:5031, log info
+.\qqflow-server.exe --port 5999 --host 0.0.0.0 --log debug
+.\qqflow-server.exe --help
 ```
 
-Config fields (snake_case, all optional, serde `deny_unknown_fields` — unknown fields or type errors are fatal): `port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `watch_debounce_ms` / `watch_fallback_ms` / `data_dir` / `db_path` / `log`. See the README for an example.
+CLI flags: `--port` (5031) / `--host` (127.0.0.1) / `--log` (error|warn|info|debug, default info) / `--watch-debounce-ms` (350) / `--watch-fallback-ms` (30000, 0 disables the slow fallback poll; the 10 s watcher re-attach is independent). Unknown flags are fatal.
 
-- `db_path` overrides database discovery: a Tencent Files-style root directory (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`) or a direct `nt_msg.db` file (account name taken from the nearest all-digit ancestor dir, fallback `custom`).
-- Keys (16 printable-ASCII bytes per account): `"keys"` object (`{"<qq>": "<key>"}`), optional `"keys_file"` external file (overrides `keys` for the same qq), or `"ask_key": true` interactive stdin. Invalid entries are skipped with a warning; persisted to `<data-dir>/keys.json` (write-only — not auto-loaded).
+Accounts are **client-driven**: startup only scans platform paths for discovery and lists the accounts as `awaiting_key` in `/health` (zero-account startup is valid). A downstream client registers an account via `POST /api/v1/accounts` with `{qq, key, db_path}`:
+
+- `db_path` (optional) is a direct `nt_msg.db` file or a Tencent Files-style root (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`); omitting it reuses the scanned path.
+- Keys are validated (16 printable-ASCII bytes) and kept **in memory only** — never persisted. A wrong key puts the account in `error` state (recoverable by re-registering); the process never exits over key problems.
 
 Default `127.0.0.1:5031` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`; the startup log prints the file path, not the token value. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
 
@@ -59,7 +63,7 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 
 ### The in-memory index (core design decision)
 
-`nt_msg.db` message columns have no useful indexes — SQL filtering means a 30–60 s full table scan per query on a real (~190 MB) database. So the server scans both tables **once at startup** into a `HashMap`-based `Store` and keeps it incrementally updated: the sync engine appends rows with `rowid > watermark` and the same `Store` is the single source of truth for both HTTP queries and SSE events. All query logic (`store::query`) works against this in-memory structure, never SQL.
+`nt_msg.db` message columns have no useful indexes — SQL filtering means a 30–60 s full table scan per query on a real (~190 MB) database. So the server scans both tables **once per account registration** into a `HashMap`-based `Store` and keeps it incrementally updated: the sync engine appends rows with `rowid > watermark` and the same `Store` is the single source of truth for both HTTP queries and SSE events. All query logic (`store::query`) works against this in-memory structure, never SQL.
 
 - Table shapes (numeric column names are QQ-version-dependent, treat as fragile):
   - `group_msg_table`: `"40021"` group id, `"40001"` seq, `"40020"` sender uid, `"40093"` nickname, `"40800"` message blob
@@ -70,7 +74,7 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 
 ### Poller / real-time path
 
-File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`watch_debounce_ms`, default 350 ms), then runs the full sync (`AccountSync::poll_once`). A slow fallback poll (`watch_fallback_ms`, default 30 s) re-checks `Mirror::changed()` — two metadata stats, no IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated). The full sync:
+File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`--watch-debounce-ms`, default 350 ms), then runs the full sync (`AccountSync::poll_once`). A slow fallback poll (`--watch-fallback-ms`, default 30 s) re-checks `Mirror::changed()` — two metadata stats, no IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated). The full sync:
 1. `Mirror::sync()` — re-copies the source WAL (cheap; if the source main file's size/mtime changed, SQLite checkpointed and the whole mirror is rebuilt).
 2. Reopens the decrypted connection, then reads per table with `index::read_new` (`rowid > watermark`, pure read — a failure in either table leaves the store untouched).
 3. Applies both tables under a single store write-lock (`index::apply_records` + watermark write-back) and emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
@@ -83,7 +87,7 @@ SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect car
 
 ### Startup sequence (`server::run_with`)
 
-Parse args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → load keys (`KeyStore`, validated + persisted to `<data-dir>/keys.json`) → bind listener **early** so `/health` reports "starting" during index build → per-account `spawn_blocking` index build (CPU-bound decrypt + full scan) → start watch tasks → set ready flag → wait for Ctrl-C → signal shutdown watch, abort watch tasks, delete mirror dir.
+Parse CLI args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → bind listener **early** so `/health` reports "starting" → list scanned accounts as `awaiting_key` (no build at startup) → wait for client registrations (`POST /api/v1/accounts`) → per account `server::init_account` (`spawn_blocking` mirror + decrypt + index; `install_index` broadcasts the SSE baseline; `AccountSync` registration + watch task) → recompute the global ready flag → wait for Ctrl-C → signal shutdown watch, remove mirror dir.
 
 ### Heuristic message parser (`parser`)
 
@@ -94,8 +98,8 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 - `parking_lot::RwLock<Store>` shared via `Arc` — single lock for the whole store (sync engine writes, handlers read).
 - notify watcher threads bridge into the tokio watch task via an unbounded channel (`sync::watch`); watch/fallback/manual sync passes serialize on the mirror mutex and the store write lock.
 - tokio `broadcast` for SSE events; `watch` channel for shutdown; CPU-bound decrypt/scan work in `spawn_blocking`.
-- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState`, "indexing"/"ready"/"error"), a global `ready` AtomicBool, and the token.
-- Auth: Bearer header / `?access_token=` (recommended for SSE) / POST JSON body, constant-time comparison (`config::constant_time_eq`).
+- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState`, `awaiting_key`/`indexing`/`ready`/`error`), a global `ready` AtomicBool, the token, and the `AccountRegistry` (scanned/registered `DbInfo`s, in-memory `KeyStore`, mirror root, watch config, shutdown receiver).
+- Auth: Bearer header / `?access_token=` (recommended for SSE) / POST JSON body, constant-time comparison (`config::constant_time_eq`). `/health` and `POST /api/v1/accounts` are the only non-readiness-gated endpoints (accounts is the bootstrap path).
 
 ## Known issues
 
@@ -111,6 +115,9 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 
 - `tests/sqlcipher_roundtrip.rs` — self-built SQLCipher test database with QQ's exact PRAGMA parameters + fake 1024-byte header + WAL. Proves: decryption round-trip, WAL-only writes visible through the mirror (real-time polling path), checkpoint-triggered mirror rebuild, wrong-key failure. **Never touches real QQ data.**
 - `tests/api_smoke.rs` — HTTP layer contract tests via `tower::ServiceExt::oneshot` (no network, no real DB); builds a fake `AppState` with seeded conversations.
+- `tests/fs_watch_e2e.rs` — file-system event → sync → SSE broadcast e2e (fake DB).
+- `tests/real_db_groundtruth.rs` — fake-DB regression tests + client-registration e2e (wrong key → `error` → corrected key → `ready`); the `real_db_groundtruth` probe (`#[ignore]`) runs ground-truth queries against a real QQ DB via `QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY`.
+- `tests/downstream_client.rs` — downstream-client GET/POST simulation against a real QQ DB, including client-driven registration (`#[ignore]`; inputs resolve from the gitignored repo-root `qqflow-server.json` (`qq`/`key`/`db_path`) first, then `QQFLOW_TEST_QQ` / `QQFLOW_TEST_DB_KEY` / `QQFLOW_TEST_DB_ROOT` env vars).
 - Unit tests live inline in modules (`parser`, `keystore`, `decrypt`, `mirror`).
 - Note for `sqlcipher_roundtrip`: the mirror's reader connection must be dropped before the mirror is rebuilt underneath it.
 

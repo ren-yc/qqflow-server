@@ -4,14 +4,15 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 ## 启用方式
 
-配置由当前目录 `./qqflow-server.json` 提供（详见 README），运行 `qqflow-server.exe` 即启动。
+**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5031）/ `--host`（127.0.0.1）/ `--log`（info）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
 
 - 默认监听地址：`127.0.0.1`
 - 默认端口：`5031`
 - 基础地址：`http://127.0.0.1:5031`
-- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到 `<data-dir>/token.txt`（启动日志仅打印保存路径，不打印 token 值）；也可在配置 `token` 字段指定
-- 索引就绪前，业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 不检查就绪状态，可随时连接（此时 `sync` 事件携带的水位线为当前已索引值）；索引构建完成时会向订阅者广播新的 `sync` 事件，索引期间连接的客户端将自动获得正确基线，无需重连
-- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`watch_debounce_ms` 默认 350ms 防抖，辅以 `watch_fallback_ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（镜像刷新 + 增量读取），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
+- **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台完成镜像、解密与索引构建（见 §1.1）
+- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到 `<data-dir>/token.txt`（启动日志仅打印保存路径，不打印 token 值）
+- 索引就绪前（存在 `awaiting_key` / `indexing` / `error` 账号时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts` 不检查就绪状态，可随时调用
+- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（镜像刷新 + 增量读取），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
 ## 鉴权规范
 
@@ -25,6 +26,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 - `GET|POST /health`（免鉴权）
 - `GET|POST /api/v1/health`（免鉴权）
+- `POST /api/v1/accounts`（注册账号：qq + key + db_path）
 - `GET|POST /api/v1/messages`
 - `GET|POST /api/v1/sessions`
 - `GET /api/v1/sessions/{id}/messages`（ChatLab Pull，仅 GET）
@@ -67,14 +69,58 @@ GET /api/v1/health
 
 | 字段 | 说明 |
 | ---- | ---- |
-| `status` | `ok`（全部索引就绪）或 `starting`（索引构建中） |
+| `status` | `ok`（全部账号索引就绪）或 `starting`（存在未就绪账号） |
 | `version` | 服务版本号 |
 | `accounts[].qq` | 账号 |
-| `accounts[].state` | `indexing` / `ready` / `error` |
-| `accounts[].message_count` | 已索引消息数 |
+| `accounts[].state` | `awaiting_key` / `indexing` / `ready` / `error` |
+| `accounts[].message_count` | 已索引消息数（仅 ready 后有效） |
 | `accounts[].error` | 出错时的错误信息（仅 error 状态） |
 
-> v1 说明：`error` 状态当前实现中不会出现——任一账号的索引构建失败都会终止整个服务（不降级继续运行）。
+> 说明：`error` 表示初始化失败（如密钥错误），客户端重新调用 `POST /api/v1/accounts` 传入正确参数即可恢复，进程不会退出。
+
+---
+
+## 1.1 注册账号（POST /api/v1/accounts）
+
+客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台完成镜像 + 解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（三通道）；**不受就绪门控**。
+
+**请求**
+
+```http
+POST /api/v1/accounts
+```
+
+```json
+{
+  "qq": "1234567890",
+  "key": "<16字节ASCII密钥>",
+  "db_path": "C:\\Users\\<用户名>\\Documents\\Tencent Files",
+  "access_token": "YOUR_TOKEN"
+}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `qq` | string | 是 | 账号（数字字符串） |
+| `key` | string | 是 | SQLCipher 密钥（16 字节可打印 ASCII，由外部工具提取） |
+| `db_path` | string | 否 | `nt_msg.db` 文件路径，或 Tencent Files 风格目录（`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`）；省略时使用启动扫描发现的路径 |
+
+**响应**
+
+```json
+{ "success": true, "qq": "1234567890", "state": "accepted" }
+```
+
+| `state` | 说明 |
+| ------- | ---- |
+| `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） |
+| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII） |
+| `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` |
+| `unknown_qq` | 未扫描到该账号且未提供 `db_path` |
+| `already_ready` | 账号已就绪（幂等无操作） |
+| `in_progress` | 账号正在索引 |
+
+密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`/health` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
 
 ---
 
@@ -121,10 +167,10 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=YOUR_TOKEN"
 
 ```text
 event: sync
-data: {"event":"sync","sessionId":"","sessionType":"","rawid":"","content":"","timestamp":1760000000,"lastRowidGroup":7746845930483315306,"lastRowidC2c":7580296796597902190}
+data: {"event":"sync","sessionId":"","sessionType":"","rawid":"","content":"","timestamp":1782864000,"lastRowidGroup":1234567890123,"lastRowidC2c":9876543210987}
 
 event: message.new
-data: {"event":"message.new","sessionId":"881467592","sessionType":"group","groupName":"881467592","rawid":"7746845930483315306","sourceName":"张三","content":"你好","timestamp":1760000123}
+data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupName":"10001","rawid":"1234567890123","sourceName":"张三","content":"你好","timestamp":1782864123}
 ```
 
 ---
@@ -158,8 +204,8 @@ GET /api/v1/messages
 ### 示例
 
 ```bash
-curl "http://127.0.0.1:5031/api/v1/messages?talker=881467592&limit=20&access_token=YOUR_TOKEN"
-curl "http://127.0.0.1:5031/api/v1/messages?talker=881467592&chatlab=1&access_token=YOUR_TOKEN"
+curl "http://127.0.0.1:5031/api/v1/messages?talker=10001&limit=20&access_token=YOUR_TOKEN"
+curl "http://127.0.0.1:5031/api/v1/messages?talker=10001&chatlab=1&access_token=YOUR_TOKEN"
 curl "http://127.0.0.1:5031/api/v1/messages?talker=u_abc123&start=20260101&end=20260131&access_token=YOUR_TOKEN"
 ```
 
@@ -201,16 +247,16 @@ curl "http://127.0.0.1:5031/api/v1/messages?talker=u_abc123&start=20260101&end=2
 ```json
 {
   "success": true,
-  "talker": "881467592",
+  "talker": "10001",
   "count": 2,
   "hasMore": true,
   "media": { "enabled": false, "exportPath": "", "count": 0 },
   "messages": [
     {
-      "localId": 7746845930483315306,
-      "serverId": "7746845930483315306",
+      "localId": 1234567890123,
+      "serverId": "1234567890123",
       "localType": 3,
-      "createTime": 1803703124,
+      "createTime": 1782864000,
       "isSend": 0,
       "senderUsername": "u_a",
       "content": "[image]",
@@ -219,10 +265,10 @@ curl "http://127.0.0.1:5031/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "mediaType": "image"
     },
     {
-      "localId": 7746845930483315299,
-      "serverId": "7746845930483315299",
+      "localId": 1234567890199,
+      "serverId": "1234567890199",
       "localType": 0,
-      "createTime": 1803703100,
+      "createTime": 1782863900,
       "isSend": 0,
       "senderUsername": "u_b",
       "content": "你好",
@@ -280,7 +326,7 @@ GET /api/v1/sessions
   "success": true,
   "count": 2,
   "sessions": [
-    { "username": "881467592", "displayName": "项目群", "type": 2, "lastTimestamp": 1803703124, "unreadCount": 0 },
+    { "username": "10001", "displayName": "项目群", "type": 2, "lastTimestamp": 1782864000, "unreadCount": 0 },
     { "username": "u_abc123", "displayName": "张三", "type": 1, "lastTimestamp": 1803700000, "unreadCount": 0 }
   ]
 }
@@ -291,7 +337,7 @@ GET /api/v1/sessions
 ```json
 {
   "sessions": [
-    { "id": "881467592", "name": "项目群", "platform": "qq", "type": "group", "messageCount": 0, "lastMessageAt": 1803703124 }
+    { "id": "10001", "name": "项目群", "platform": "qq", "type": "group", "messageCount": 0, "lastMessageAt": 1782864000 }
   ]
 }
 ```
@@ -335,7 +381,7 @@ GET /api/v1/sessions/{id}/messages
     "name": "项目群",
     "platform": "qq",
     "type": "group",
-    "groupId": "881467592"
+    "groupId": "10001"
   },
   "members": [
     { "platformId": "u_a", "accountName": "张三", "groupNickname": "张三", "avatar": "" }
@@ -467,12 +513,12 @@ POST /api/v1/sync
   "synced": 3,
   "hasMore": false,
   "messages": [
-    { "localId": 7746845930483315306, "serverId": "7746845930483315306", "localType": 0, "createTime": 1803703124, "isSend": 0, "senderUsername": "u_a", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
+    { "localId": 1234567890123, "serverId": "1234567890123", "localType": 0, "createTime": 1782864000, "isSend": 0, "senderUsername": "u_a", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
   ]
 }
 ```
 
-> 说明：启动时索引已全量构建，之后无新消息时 `synced` 为 `0`；QQ 运行中产生新消息后调用，可立即取回。
+> 说明：账号注册后索引已全量构建，之后无新消息时 `synced` 为 `0`；QQ 运行中产生新消息后调用，可立即取回。
 
 ---
 
@@ -502,12 +548,16 @@ POST /api/v1/sync
 
 ```bash
 TOKEN=$(Get-Content "$env:LOCALAPPDATA\qqflow-server\token.txt")   # PowerShell
+# 注册账号（客户端驱动启动；密钥仅内存保存）
+curl -X POST http://127.0.0.1:5031/api/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d "{\"qq\": \"1234567890\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\", \"access_token\": \"$TOKEN\"}"
 # GET 带 Token Header
-curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5031/api/v1/messages?talker=881467592&limit=20"
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5031/api/v1/messages?talker=10001&limit=20"
 # POST 带 JSON Body（参数走 Body，token 亦可走 Body）
 curl -X POST http://127.0.0.1:5031/api/v1/messages \
   -H "Content-Type: application/json" \
-  -d "{\"access_token\": \"$TOKEN\", \"talker\": \"881467592\", \"limit\": 50}"
+  -d "{\"access_token\": \"$TOKEN\", \"talker\": \"10001\", \"limit\": 50}"
 # SSE
 curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=$TOKEN"
 ```
@@ -522,7 +572,7 @@ headers = {"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/js
 
 messages = requests.post(
     f"{BASE_URL}/api/v1/messages",
-    json={"talker": "881467592", "limit": 50},
+    json={"talker": "10001", "limit": 50},
     headers=headers,
 ).json()
 
@@ -533,9 +583,9 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
 
 ## 10. 注意事项
 
-1. API 仅监听本机 `127.0.0.1`，不对外网开放（`host` 可在配置中修改，需自行承担风险）。
+1. API 仅监听本机 `127.0.0.1`，不对外网开放（`host` 可在命令行参数中修改，需自行承担风险）。
 2. `start` / `end` 支持 `YYYYMMDD` 与秒级时间戳；纯 `YYYYMMDD` 的 `end` 会扩展到当天 `23:59:59`。
-3. 索引在启动时全量构建（消息 → 内存），期间业务接口返回 `503`（SSE 接口 `/api/v1/push/messages` 除外）；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。启动后由文件系统事件驱动增量同步（防抖 `watch_debounce_ms`，兜底 `watch_fallback_ms`），也可用 `POST /api/v1/sync` 手动触发。
+3. 账号注册后全量构建索引（消息 → 内存），就绪前业务接口返回 `503`（SSE 接口与 `/api/v1/accounts` 除外）；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。注册后由文件系统事件驱动增量同步（防抖 `--watch-debounce-ms`，兜底 `--watch-fallback-ms`），也可用 `POST /api/v1/sync` 手动触发。
 4. 会话 ID 判定：全数字 → 群聊；`u_` 前缀或含非数字字符 → 私聊。查询时若按此判定未命中会话，会再尝试另一种类型（支持全数字 UID 的私聊）。
 5. 消息内容为启发式解析结果（QQ 消息体为无固定 schema 的 protobuf 形态），QQ 升级可能导致解析退化；媒体消息输出 `[image]` / `[voice]` / `[video]` 占位。
 6. 撤回消息 `localType=6`，content 保留原文（含"你猜猜撤回了什么"提示行）。
