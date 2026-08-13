@@ -30,12 +30,13 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use parking_lot::RwLock;
-use qqflow_server::keystore::KeyStore;
 use qqflow_server::server::{build_router, AccountRegistry};
 use qqflow_server::store::AppState;
 use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+mod common;
 
 const TEST_TOKEN: &str = "downstream-client-test-token";
 
@@ -80,43 +81,28 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
         ready: Arc::new(AtomicBool::new(false)),
         token: Arc::new(TEST_TOKEN.into()),
         sync: Arc::new(SyncEngine::new()),
-        init: Arc::new(AccountRegistry {
-            accounts_db: parking_lot::Mutex::new(Vec::new()),
-            key_store: parking_lot::Mutex::new(KeyStore::default()),
-            mirror_root: mirror_dir.clone(),
-            watch_cfg: qqflow_server::sync::watch::WatchConfig {
-                debounce: Duration::from_millis(350),
-                fallback: None,
-            },
-            shutdown: tokio::sync::watch::channel(false).1,
-        }),
+        init: AccountRegistry::new(
+            Vec::new(),
+            mirror_dir.clone(),
+            qqflow_server::sync::watch::WatchConfig::default(),
+            tokio::sync::watch::channel(false).1,
+        ),
     });
     let app = build_router(state.clone());
     Some((app, state, qq, root, key, mirror_dir))
 }
 
 /// Poll /health until the account is ready; returns its indexed message count.
-async fn wait_ready(app: axum::Router, qq: &str) -> usize {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        let (s, v) = client_get(app.clone(), "/health", &[]).await;
-        assert_eq!(s, StatusCode::OK);
-        for a in v["accounts"].as_array().unwrap() {
-            if a["qq"] != qq {
-                continue;
-            }
-            match a["state"].as_str().unwrap() {
-                "ready" => return a["message_count"].as_u64().unwrap() as usize,
-                "error" => panic!("[CLIENT] account failed: {:?}", a["error"]),
-                _ => {}
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "[CLIENT] timeout waiting for {qq} to become ready"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+async fn wait_ready(app: &axum::Router, qq: &str) -> usize {
+    let v = common::wait_account_state(app, qq, "ready", Duration::from_secs(120)).await;
+    v["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["qq"] == qq)
+        .unwrap()["message_count"]
+        .as_u64()
+        .unwrap() as usize
 }
 
 /// Downstream-client GET (optional extra headers, e.g. Bearer auth).
@@ -125,15 +111,7 @@ async fn client_get(
     uri: &str,
     headers: &[(&str, &str)],
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().uri(uri).method("GET");
-    for (k, v) in headers {
-        builder = builder.header(*k, *v);
-    }
-    let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20).await.unwrap();
-    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, json)
+    common::get_json(app, uri, headers).await
 }
 
 /// Downstream-client POST with a JSON body (parameters and/or token inside).
@@ -143,23 +121,7 @@ async fn client_post(
     headers: &[(&str, &str)],
     body: Value,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().uri(uri).method("POST");
-    for (k, v) in headers {
-        builder = builder.header(*k, *v);
-    }
-    let resp = app
-        .oneshot(
-            builder
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20).await.unwrap();
-    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, json)
+    common::post_json(app, uri, headers, body).await
 }
 
 #[tokio::test]
@@ -193,7 +155,7 @@ async fn downstream_client_real_db() {
     assert_eq!(v["state"], "accepted", "registration accepted: {v}");
 
     // ---- 1. health: ready after the background index build --------------
-    let indexed = wait_ready(app.clone(), &qq).await;
+    let indexed = wait_ready(&app, &qq).await;
     assert!(indexed > 0, "real db must have messages");
     println!("[CLIENT] indexed {indexed} messages");
     let (s, v) = client_get(app.clone(), "/health", &[]).await;

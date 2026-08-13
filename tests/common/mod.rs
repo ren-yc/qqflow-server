@@ -5,10 +5,19 @@
 //! (6 group rows incl. recall/system/media/miniapp + 2 c2c rows) plus an
 //! optional number of extra plain group rows. Never touches real QQ data.
 
-use std::path::Path;
+//! Not every test binary uses every helper below — that is expected for a
+//! shared support module.
+#![allow(dead_code)]
 
+use std::path::Path;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use qqflow_server::db::scan::CUSTOM_HEADER_LEN;
 use rusqlite::Connection;
+use serde_json::Value;
+use tower::ServiceExt;
 
 /// Fabricated account number (random, not a real QQ).
 pub const FAKE_QQ: &str = "335663881";
@@ -102,4 +111,80 @@ pub fn write_fake_source(nt_db_dir: &Path, extra: u32) -> std::path::PathBuf {
         let _ = std::fs::remove_file(&raw_wal);
     }
     main
+}
+
+// ---- HTTP layer helpers (axum oneshot) ---------------------------------
+
+/// GET through `app` with optional extra headers (e.g. Bearer auth);
+/// returns (status, json).
+pub async fn get_json(
+    app: axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().uri(uri).method("GET");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// POST a JSON body through `app` with optional extra headers; returns
+/// (status, json).
+pub async fn post_json(
+    app: axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().uri(uri).method("POST");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = app
+        .oneshot(
+            builder
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// Poll /health until account `qq` reports state `want`; returns the whole
+/// health JSON. Panics when the account hits `error` (with its reason) or
+/// the deadline passes.
+pub async fn wait_account_state(
+    app: &axum::Router,
+    qq: &str,
+    want: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let (status, v) = get_json(app.clone(), "/health", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        for a in v["accounts"].as_array().unwrap() {
+            if a["qq"] != qq {
+                continue;
+            }
+            if a["state"] == want {
+                return v;
+            }
+            if a["state"] == "error" {
+                panic!("account {qq} failed: {:?}", a["error"]);
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "account {qq} did not reach {want}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

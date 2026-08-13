@@ -61,19 +61,22 @@ fn help() -> String {
 }
 
 /// Parse command-line arguments (skip the program name).
-pub fn load() -> Result<Config> {
+/// `Ok(None)` when `-h`/`--help` was given (help already printed; the
+/// caller should exit 0).
+pub fn load() -> Result<Option<Config>> {
     parse_args(std::env::args().skip(1).collect())
 }
 
 /// Parse `--flag value` pairs (separate from `load` so tests can drive it).
-pub fn parse_args(args: Vec<String>) -> Result<Config> {
+/// `Ok(None)` when `-h`/`--help` was given (help already printed to stdout).
+pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
     let mut cfg = Config::default();
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].clone();
         if flag == "-h" || flag == "--help" {
             println!("{}", help());
-            std::process::exit(0);
+            return Ok(None);
         }
         let value = args
             .get(i + 1)
@@ -106,7 +109,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Config> {
         }
         i += 2;
     }
-    Ok(cfg)
+    Ok(Some(cfg))
 }
 
 /// Resolve the platform data directory.
@@ -157,7 +160,7 @@ mod tests {
 
     #[test]
     fn defaults_with_no_args() {
-        let cfg = parse_args(vec![]).unwrap();
+        let cfg = parse_args(vec![]).unwrap().expect("config");
         assert_eq!(cfg.port, 5031);
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.log, "info");
@@ -173,12 +176,19 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
         )
-        .unwrap();
+        .unwrap()
+        .expect("config");
         assert_eq!(cfg.port, 5999);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.log, "debug");
         assert_eq!(cfg.watch_debounce_ms, 500);
         assert_eq!(cfg.watch_fallback_ms, 0);
+    }
+
+    #[test]
+    fn help_prints_and_returns_none_without_exiting() {
+        let args: Vec<String> = ["--help"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(args).unwrap().is_none(), "--help must not start the server");
     }
 
     #[test]

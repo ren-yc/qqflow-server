@@ -9,11 +9,13 @@ use axum::http::{Request, StatusCode};
 use parking_lot::RwLock;
 use qqflow_server::parser::types::{seq_to_time, ChatType, MessageRecord, MsgType, ParsedMessage};
 use qqflow_server::sync::Event;
-use qqflow_server::server::build_router;
+use qqflow_server::server::{build_router, AccountStatus};
 use qqflow_server::store::{conv_key, AppState, Conversation, Store};
 use qqflow_server::store::query::{query_messages, MessageQuery};
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+mod common;
 
 fn state_with(store: Store, ready: bool) -> Arc<AppState> {
     let (tx, _) = tokio::sync::broadcast::channel(1024);
@@ -24,16 +26,12 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
         ready: Arc::new(AtomicBool::new(ready)),
         token: Arc::new("test-token-123456".into()),
         sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
-        init: Arc::new(qqflow_server::server::AccountRegistry {
-            accounts_db: parking_lot::Mutex::new(Vec::new()),
-            key_store: parking_lot::Mutex::new(qqflow_server::keystore::KeyStore::default()),
-            mirror_root: std::env::temp_dir().join("qqflow_smoke_mirror"),
-            watch_cfg: qqflow_server::sync::watch::WatchConfig {
-                debounce: std::time::Duration::from_millis(350),
-                fallback: None,
-            },
-            shutdown: tokio::sync::watch::channel(false).1,
-        }),
+        init: qqflow_server::server::AccountRegistry::new(
+            Vec::new(),
+            std::env::temp_dir().join("qqflow_smoke_mirror"),
+            qqflow_server::sync::watch::WatchConfig::default(),
+            tokio::sync::watch::channel(false).1,
+        ),
     })
 }
 
@@ -103,21 +101,7 @@ async fn get(uri: &str, token: bool) -> (StatusCode, Value) {
 
 /// POST a JSON body through `app`.
 async fn post_json(app: axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .method("POST")
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, json)
+    common::post_json(app, uri, &[], body).await
 }
 
 #[tokio::test]
@@ -493,7 +477,7 @@ async fn accounts_validation_and_idempotency() {
     // Seed a ready account entry so already_ready can be exercised.
     state.accounts.write().push(qqflow_server::server::AccountState {
         qq: "10001".into(),
-        state: "ready".into(),
+        state: AccountStatus::Ready,
         message_count: 2,
         error: None,
     });

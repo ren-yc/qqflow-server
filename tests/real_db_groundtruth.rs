@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -22,7 +23,7 @@ use qqflow_server::db::decrypt;
 use qqflow_server::db::mirror::Mirror;
 use qqflow_server::db::scan;
 use qqflow_server::parser::types::{seq_to_time, ChatType};
-use qqflow_server::server::{build_router, AccountRegistry, AccountState};
+use qqflow_server::server::{build_router, AccountRegistry, AccountState, AccountStatus};
 use qqflow_server::store::AppState;
 use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
@@ -205,30 +206,6 @@ fn failed_sync_leaves_store_untouched() {
     let _ = std::fs::remove_dir_all(&mirror_dir);
 }
 
-/// Poll /health until `qq` reports `want`; panics on a deadline.
-async fn wait_account_state(app: &axum::Router, qq: &str, want: &str) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let resp = app
-            .clone()
-            .oneshot(Request::builder().uri("/health").method("GET").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        if v["accounts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["qq"] == qq && a["state"] == want)
-        {
-            return v;
-        }
-        assert!(std::time::Instant::now() < deadline, "account {qq} did not reach {want}");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
 /// Client-driven registration e2e: `POST /api/v1/accounts` with qq + key +
 /// db_path initializes the account in the background. A wrong key lands the
 /// account in `error` (recoverable); the corrected key reaches `ready` and
@@ -248,69 +225,52 @@ async fn client_registers_account_with_key_and_db_path() {
         events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(64).0,
         accounts: Arc::new(parking_lot::RwLock::new(vec![AccountState {
             qq: FAKE_QQ.into(),
-            state: "awaiting_key".into(),
+            state: AccountStatus::AwaitingKey,
             message_count: 0,
             error: None,
         }])),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         token: Arc::new("test-token".into()),
         sync: Arc::new(SyncEngine::new()),
-        init: Arc::new(AccountRegistry {
-            accounts_db: parking_lot::Mutex::new(Vec::new()),
-            key_store: parking_lot::Mutex::new(qqflow_server::keystore::KeyStore::default()),
-            mirror_root: mirror_dir.clone(),
-            watch_cfg: qqflow_server::sync::watch::WatchConfig {
-                debounce: std::time::Duration::from_millis(350),
-                fallback: None,
-            },
-            shutdown: tokio::sync::watch::channel(false).1,
-        }),
+        init: AccountRegistry::new(
+            Vec::new(),
+            mirror_dir.clone(),
+            qqflow_server::sync::watch::WatchConfig::default(),
+            tokio::sync::watch::channel(false).1,
+        ),
     });
     let app = build_router(state.clone());
 
-    let post = |app: axum::Router, body: Value| async move {
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/accounts")
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
-        (status, serde_json::from_slice::<Value>(&bytes).unwrap())
-    };
-
     // Boot state: account discovered, awaiting a key.
-    let v = wait_account_state(&app, FAKE_QQ, "awaiting_key").await;
+    let v = common::wait_account_state(&app, FAKE_QQ, "awaiting_key", Duration::from_secs(15)).await;
     assert_eq!(v["status"], "starting");
 
     // Wrong key (valid format, wrong content) -> accepted, then error.
-    let (s, v) = post(
+    let (s, v) = common::post_json(
         app.clone(),
+        "/api/v1/accounts",
+        &[],
         json!({"access_token": "test-token", "qq": FAKE_QQ, "key": "0123456789abcdeX", "db_path": db_path}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "accepted");
-    let v = wait_account_state(&app, FAKE_QQ, "error").await;
+    let v = common::wait_account_state(&app, FAKE_QQ, "error", Duration::from_secs(15)).await;
     let err = v["accounts"].as_array().unwrap()[0]["error"].as_str().unwrap().to_string();
     println!("[GT] expected init failure: {err}");
     assert!(err.contains("解密") || err.contains("密钥"), "error must explain: {err}");
 
     // Corrected key -> accepted, then ready and serving.
-    let (s, v) = post(
+    let (s, v) = common::post_json(
         app.clone(),
+        "/api/v1/accounts",
+        &[],
         json!({"access_token": "test-token", "qq": FAKE_QQ, "key": FAKE_KEY, "db_path": db_path}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "accepted");
-    let v = wait_account_state(&app, FAKE_QQ, "ready").await;
+    let v = common::wait_account_state(&app, FAKE_QQ, "ready", Duration::from_secs(15)).await;
     assert_eq!(v["status"], "ok");
     assert_eq!(v["accounts"].as_array().unwrap()[0]["message_count"], 8);
 

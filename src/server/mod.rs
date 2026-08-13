@@ -20,19 +20,36 @@ use crate::config;
 use crate::db;
 use crate::db::mirror::Mirror;
 use crate::db::scan::DbInfo;
-use crate::keystore::KeyStore;
 use crate::sync;
 use crate::sync::Event;
 use crate::store::index;
 use crate::store::{AppState, Store};
 
+/// Per-account readiness state (serialized as-is into /health).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    /// Scanned at startup, no key registered yet.
+    AwaitingKey,
+    /// Background build running (mirror + decrypt + index).
+    Indexing,
+    /// Index built, incremental sync active.
+    Ready,
+    /// Initialization failed — a corrected registration recovers.
+    Error,
+}
+
+impl AccountStatus {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 /// Per-account readiness (exposed via /health and used for startup gating).
-/// States: `awaiting_key` (scanned, no key yet) | `indexing` | `ready` |
-/// `error` (initialization failed — a corrected registration recovers).
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountState {
     pub qq: String,
-    pub state: String,
+    pub state: AccountStatus,
     pub message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -42,14 +59,39 @@ pub struct AccountState {
 pub struct AccountRegistry {
     /// All known accounts: platform-scan results plus client registrations.
     pub accounts_db: Mutex<Vec<DbInfo>>,
-    /// Client-supplied SQLCipher keys (memory only, never persisted).
-    pub key_store: Mutex<KeyStore>,
     /// Mirror workspace root (`<data-dir>/mirror`).
     pub mirror_root: PathBuf,
     /// Watch behavior handed to deferred watch tasks.
     pub watch_cfg: crate::sync::watch::WatchConfig,
     /// Shutdown signal receiver (cloned per deferred watch task).
     pub shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+impl AccountRegistry {
+    /// `accounts` seeds the registry with the startup scan results; clients
+    /// add or override entries via `upsert_db` at registration time.
+    pub fn new(
+        accounts: Vec<DbInfo>,
+        mirror_root: PathBuf,
+        watch_cfg: crate::sync::watch::WatchConfig,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        Self { accounts_db: Mutex::new(accounts), mirror_root, watch_cfg, shutdown }
+    }
+
+    /// Account location known for `qq` (startup scan or earlier registration).
+    pub fn find_db(&self, qq: &str) -> Option<DbInfo> {
+        self.accounts_db.lock().iter().find(|a| a.qq == qq).cloned()
+    }
+
+    /// Register or override one account's database location.
+    pub fn upsert_db(&self, info: DbInfo) {
+        let mut reg = self.accounts_db.lock();
+        match reg.iter_mut().find(|a| a.qq == info.qq) {
+            Some(a) => *a = info,
+            None => reg.push(info),
+        }
+    }
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -81,27 +123,54 @@ fn install_index(store: &Arc<RwLock<Store>>, tx: &broadcast::Sender<Event>, st: 
 }
 
 /// Insert or update one account's health state entry.
-fn set_account_state(state: &AppState, qq: &str, status: &str, count: usize, error: Option<String>) {
+fn set_account_state(state: &AppState, qq: &str, status: AccountStatus, count: usize, error: Option<String>) {
     let mut accs = state.accounts.write();
     match accs.iter_mut().find(|a| a.qq == qq) {
         Some(a) => {
-            a.state = status.into();
+            a.state = status;
             a.message_count = count;
             a.error = error;
         }
         None => accs.push(AccountState {
             qq: qq.into(),
-            state: status.into(),
+            state: status,
             message_count: count,
             error,
         }),
     }
 }
 
+/// Flip an account to `indexing` atomically with the idempotency guard: a
+/// concurrent duplicate registration serializes here and observes the new
+/// state instead of spawning a second initialization. Returns the status
+/// that blocked (already ready / already indexing).
+fn begin_indexing(state: &AppState, qq: &str) -> Option<AccountStatus> {
+    let mut accs = state.accounts.write();
+    match accs.iter_mut().find(|a| a.qq == qq) {
+        Some(a) if a.state.is_ready() => Some(AccountStatus::Ready),
+        Some(a) if matches!(a.state, AccountStatus::Indexing) => Some(AccountStatus::Indexing),
+        Some(a) => {
+            a.state = AccountStatus::Indexing;
+            a.message_count = 0;
+            a.error = None;
+            None
+        }
+        None => {
+            accs.push(AccountState {
+                qq: qq.to_string(),
+                state: AccountStatus::Indexing,
+                message_count: 0,
+                error: None,
+            });
+            None
+        }
+    }
+}
+
 /// Global readiness = at least one account and every account `ready`.
 pub fn update_ready(state: &AppState) {
     let accs = state.accounts.read();
-    let all_ready = !accs.is_empty() && accs.iter().all(|a| a.state == "ready");
+    let all_ready = !accs.is_empty() && accs.iter().all(|a| a.state.is_ready());
     state.ready.store(all_ready, Ordering::SeqCst);
 }
 
@@ -109,9 +178,10 @@ pub fn update_ready(state: &AppState) {
 /// pool), SSE baseline broadcast, `AccountSync` registration, watch task.
 /// On failure the account enters the `error` state with the reason —
 /// recoverable by posting a corrected registration to /api/v1/accounts.
+/// The caller (the registration handler) has already flipped the account
+/// to `indexing` synchronously so /health shows it immediately.
 pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
     let qq = info.qq.clone();
-    set_account_state(state, &qq, "indexing", 0, None);
 
     let store = state.store.clone();
     let tx = state.events.clone();
@@ -148,15 +218,15 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
                 state.init.watch_cfg.clone(),
                 state.init.shutdown.clone(),
             ));
-            set_account_state(state, &qq, "ready", count, None);
+            set_account_state(state, &qq, AccountStatus::Ready, count, None);
             tracing::info!("[init] QQ {qq} 索引完成: {count} 条消息");
         }
         Ok(Err(e)) => {
-            set_account_state(state, &qq, "error", 0, Some(format!("{e:#}")));
+            set_account_state(state, &qq, AccountStatus::Error, 0, Some(format!("{e:#}")));
             tracing::warn!("[init] QQ {qq} 初始化失败（重新注册可恢复）: {e:#}");
         }
         Err(e) => {
-            set_account_state(state, &qq, "error", 0, Some(format!("index task panicked: {e}")));
+            set_account_state(state, &qq, AccountStatus::Error, 0, Some(format!("index task panicked: {e}")));
             tracing::error!("[init] QQ {qq} 初始化任务异常: {e}");
         }
     }
@@ -166,7 +236,9 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
 /// Full startup: parse CLI args, load token, scan accounts (discovery only),
 /// bind the server and wait for client-driven registrations. Runs until Ctrl-C.
 pub async fn serve() -> Result<()> {
-    let cfg = config::load()?;
+    let Some(cfg) = config::load()? else {
+        return Ok(()); // help printed
+    };
     crate::logging::init(&cfg.log);
     run_with(cfg).await
 }
@@ -183,7 +255,19 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
     // ---- state -----------------------------------------------------------
     let store = Arc::new(RwLock::new(Store::default()));
     let (tx, _) = broadcast::channel::<Event>(1024);
-    let accounts_state = Arc::new(RwLock::new(Vec::<AccountState>::new()));
+    // Scanned accounts are listed as awaiting keys; initialization is
+    // entirely client-driven via POST /api/v1/accounts.
+    let accounts_state = Arc::new(RwLock::new(
+        accounts
+            .iter()
+            .map(|a| AccountState {
+                qq: a.qq.clone(),
+                state: AccountStatus::AwaitingKey,
+                message_count: 0,
+                error: None,
+            })
+            .collect::<Vec<_>>(),
+    ));
     let ready = Arc::new(AtomicBool::new(false));
     let sync_engine = Arc::new(sync::SyncEngine::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -192,13 +276,6 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         fallback: (cfg.watch_fallback_ms > 0)
             .then(|| std::time::Duration::from_millis(cfg.watch_fallback_ms)),
     };
-    let init_registry = Arc::new(AccountRegistry {
-        accounts_db: Mutex::new(accounts),
-        key_store: Mutex::new(KeyStore::default()),
-        mirror_root: data_dir.join("mirror"),
-        watch_cfg,
-        shutdown: shutdown_rx.clone(),
-    });
     let state = Arc::new(AppState {
         store: store.clone(),
         events: tx.clone(),
@@ -206,19 +283,13 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         ready: ready.clone(),
         token: Arc::new(token.clone()),
         sync: sync_engine.clone(),
-        init: init_registry.clone(),
+        init: AccountRegistry::new(
+            accounts,
+            data_dir.join("mirror"),
+            watch_cfg,
+            shutdown_rx.clone(),
+        ),
     });
-
-    // Scanned accounts are listed as awaiting keys; initialization is
-    // entirely client-driven via POST /api/v1/accounts.
-    for a in init_registry.accounts_db.lock().iter() {
-        accounts_state.write().push(AccountState {
-            qq: a.qq.clone(),
-            state: "awaiting_key".into(),
-            message_count: 0,
-            error: None,
-        });
-    }
     update_ready(&state);
 
     // ---- server (bind early; /health reports "starting") ------------------
@@ -249,6 +320,30 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `AppState` with one `10001` account in the given status.
+    fn state_with_account(status: AccountStatus) -> Arc<AppState> {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        Arc::new(AppState {
+            store: Arc::new(RwLock::new(Store::default())),
+            events: broadcast::channel::<Event>(16).0,
+            accounts: Arc::new(RwLock::new(vec![AccountState {
+                qq: "10001".into(),
+                state: status,
+                message_count: 0,
+                error: None,
+            }])),
+            ready: Arc::new(AtomicBool::new(false)),
+            token: Arc::new("t".into()),
+            sync: Arc::new(sync::SyncEngine::new()),
+            init: AccountRegistry::new(
+                Vec::new(),
+                std::env::temp_dir().join("qqflow_server_test_mirror"),
+                crate::sync::watch::WatchConfig::default(),
+                shutdown_rx,
+            ),
+        })
+    }
+
     #[tokio::test]
     async fn install_index_rebaselines_subscribers() {
         let store = Arc::new(RwLock::new(Store::default()));
@@ -264,37 +359,27 @@ mod tests {
 
     #[test]
     fn update_ready_requires_all_accounts_ready() {
-        let store = Arc::new(RwLock::new(Store::default()));
-        let (tx, _) = broadcast::channel::<Event>(16);
-        let accounts = Arc::new(RwLock::new(vec![AccountState {
-            qq: "10001".into(),
-            state: "awaiting_key".into(),
-            message_count: 0,
-            error: None,
-        }]));
-        let ready = Arc::new(AtomicBool::new(false));
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = AppState {
-            store: store.clone(),
-            events: tx.clone(),
-            accounts: accounts.clone(),
-            ready: ready.clone(),
-            token: Arc::new("t".into()),
-            sync: Arc::new(sync::SyncEngine::new()),
-            init: Arc::new(AccountRegistry {
-                accounts_db: Mutex::new(Vec::new()),
-                key_store: Mutex::new(KeyStore::default()),
-                mirror_root: std::env::temp_dir().join("qqflow_server_test_mirror"),
-                watch_cfg: crate::sync::watch::WatchConfig {
-                    debounce: std::time::Duration::from_millis(350),
-                    fallback: None,
-                },
-                shutdown: shutdown_rx,
-            }),
-        };
-        assert!(!ready.load(Ordering::SeqCst), "awaiting_key is not ready");
-        set_account_state(&state, "10001", "ready", 7, None);
+        let state = state_with_account(AccountStatus::AwaitingKey);
+        assert!(!state.ready.load(Ordering::SeqCst), "awaiting_key is not ready");
+        set_account_state(&state, "10001", AccountStatus::Ready, 7, None);
         update_ready(&state);
-        assert!(ready.load(Ordering::SeqCst), "all ready flips the flag");
+        assert!(state.ready.load(Ordering::SeqCst), "all ready flips the flag");
+    }
+
+    #[test]
+    fn begin_indexing_flips_once_and_guards_duplicates() {
+        let state = state_with_account(AccountStatus::AwaitingKey);
+        assert_eq!(begin_indexing(&state, "10001"), None, "first registration proceeds");
+        assert_eq!(
+            begin_indexing(&state, "10001"),
+            Some(AccountStatus::Indexing),
+            "duplicate registration observes indexing"
+        );
+        set_account_state(&state, "10001", AccountStatus::Ready, 7, None);
+        assert_eq!(
+            begin_indexing(&state, "10001"),
+            Some(AccountStatus::Ready),
+            "ready accounts stay ready"
+        );
     }
 }

@@ -32,9 +32,9 @@ fn documents_dir() -> PathBuf {
 /// `~/Library/Application Support/QQ/nt_qq_*/nt_db/` (macOS) for files matching
 /// `*msg*.db` and pick the largest as the chat database (v1 heuristic).
 ///
-/// `override_root` (from `--db-path`) bypasses platform discovery: a directory
-/// is treated as a Tencent Files-style root (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`),
-/// a file is used directly as the chat database.
+/// `override_root` bypasses platform discovery (used by the ground-truth
+/// probe and by client-driven registration): a directory is treated as a
+/// Tencent Files-style root, a file is used directly as the chat database.
 pub fn scan_accounts(override_root: Option<&Path>) -> Result<Vec<DbInfo>> {
     if let Some(p) = override_root {
         return scan_custom(p);
@@ -68,6 +68,26 @@ fn scan_windows() -> Result<Vec<DbInfo>> {
     scan_root(&documents_dir().join("Tencent Files"))
 }
 
+/// One account's chat database under a Tencent Files-style root:
+/// `<root>/<qq>/nt_qq/nt_db/nt_msg.db`. The layout is version-fragile —
+/// keep the join in this one place.
+fn qq_db_path(root: &Path, qq: &str) -> PathBuf {
+    root.join(qq).join("nt_qq").join("nt_db").join(NT_MSG_DB)
+}
+
+/// Resolve one client-supplied account location: an `nt_msg.db` file is
+/// used directly, a directory is treated as a Tencent Files-style root.
+/// The caller's `qq` is authoritative (it need not match anything
+/// derivable from the path). `None` when nothing resolves to an existing
+/// database (including a nonexistent path).
+pub fn resolve_account(qq: &str, path: &Path) -> Option<DbInfo> {
+    if path.is_file() {
+        return Some(DbInfo { qq: qq.to_string(), path: path.to_path_buf() });
+    }
+    let db = qq_db_path(path, qq);
+    db.is_file().then(|| DbInfo { qq: qq.to_string(), path: db })
+}
+
 /// Walk a Tencent Files-style root: `<root>/<digits>/nt_qq/nt_db/nt_msg.db`.
 fn scan_root(base: &Path) -> Result<Vec<DbInfo>> {
     let mut out = Vec::new();
@@ -80,7 +100,7 @@ fn scan_root(base: &Path) -> Result<Vec<DbInfo>> {
         if !name.chars().all(|c| c.is_ascii_digit()) {
             continue; // skip non-account dirs
         }
-        let db = e.path().join("nt_qq").join("nt_db").join(NT_MSG_DB);
+        let db = qq_db_path(&e.path(), &name);
         if db.is_file() {
             out.push(DbInfo { qq: name, path: db });
         }
@@ -89,7 +109,7 @@ fn scan_root(base: &Path) -> Result<Vec<DbInfo>> {
     Ok(out)
 }
 
-/// `--db-path` override: direct file, or Tencent Files-style root directory.
+/// Custom-root override: direct file, or Tencent Files-style root directory.
 fn scan_custom(path: &Path) -> Result<Vec<DbInfo>> {
     if path.is_file() {
         let qq = nearest_digit_dir(path).unwrap_or_else(|| "custom".to_string());
@@ -98,11 +118,11 @@ fn scan_custom(path: &Path) -> Result<Vec<DbInfo>> {
     if path.is_dir() {
         let out = scan_root(path)?;
         if out.is_empty() {
-            anyhow::bail!("--db-path 目录下未找到 nt_msg.db: {}", path.display());
+            anyhow::bail!("目录下未找到 nt_msg.db: {}", path.display());
         }
         return Ok(out);
     }
-    anyhow::bail!("--db-path 不存在: {}", path.display())
+    anyhow::bail!("路径不存在: {}", path.display())
 }
 
 /// Best-effort account number from a direct db path: the nearest ancestor

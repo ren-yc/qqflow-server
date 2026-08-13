@@ -36,6 +36,14 @@ pub struct WatchConfig {
     pub fallback: Option<Duration>,
 }
 
+impl Default for WatchConfig {
+    /// CLI defaults without the fallback poll (test fixtures; production
+    /// derives this from `config::Config`, which enables the fallback).
+    fn default() -> Self {
+        Self { debounce: Duration::from_millis(350), fallback: None }
+    }
+}
+
 /// Source files whose changes trigger a sync (everything else in `nt_db`,
 /// e.g. `nt_uid_mapping.db`, is ignored).
 const WATCH_FILES: [&str; 3] = ["nt_msg.db", "nt_msg.db-wal", "nt_msg.db-shm"];

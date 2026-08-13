@@ -98,7 +98,7 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 - `parking_lot::RwLock<Store>` shared via `Arc` — single lock for the whole store (sync engine writes, handlers read).
 - notify watcher threads bridge into the tokio watch task via an unbounded channel (`sync::watch`); watch/fallback/manual sync passes serialize on the mirror mutex and the store write lock.
 - tokio `broadcast` for SSE events; `watch` channel for shutdown; CPU-bound decrypt/scan work in `spawn_blocking`.
-- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState`, `awaiting_key`/`indexing`/`ready`/`error`), a global `ready` AtomicBool, the token, and the `AccountRegistry` (scanned/registered `DbInfo`s, in-memory `KeyStore`, mirror root, watch config, shutdown receiver).
+- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState` with the `AccountStatus` enum, `awaiting_key`/`indexing`/`ready`/`error`), a global `ready` AtomicBool, the token, and the `AccountRegistry` (scanned/registered `DbInfo`s, mirror root, watch config, shutdown receiver).
 - Auth: Bearer header / `?access_token=` (recommended for SSE) / POST JSON body, constant-time comparison (`config::constant_time_eq`). `/health` and `POST /api/v1/accounts` are the only non-readiness-gated endpoints (accounts is the bootstrap path).
 
 ## Known issues

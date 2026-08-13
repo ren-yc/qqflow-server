@@ -7,6 +7,7 @@
 //! account the server would never become ready, so this is the bootstrap
 //! endpoint. Keys live in memory only.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -15,9 +16,10 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::db::scan::{DbInfo, NT_MSG_DB};
+use crate::db::scan::{self, DbInfo};
+use crate::keystore::validate_key;
 use crate::server::error::ApiError;
-use crate::server::{init_account, set_account_state};
+use crate::server::{begin_indexing, init_account, AccountStatus};
 use crate::store::AppState;
 
 use super::{authorized, merge_body};
@@ -35,29 +37,14 @@ pub struct Params {
 /// or Tencent Files-style root dir) registers or overrides the account in
 /// the registry; without one, the startup scan must have found it.
 fn resolve_db_path(state: &AppState, qq: &str, db_path: Option<&str>) -> Option<DbInfo> {
-    let mut registry = state.init.accounts_db.lock();
-    match db_path.filter(|p| !p.is_empty()) {
-        Some(p) => {
-            let path = std::path::Path::new(p);
-            let resolved = if path.is_file() {
-                Some(DbInfo { qq: qq.to_string(), path: path.to_path_buf() })
-            } else if path.is_dir() {
-                let db = path.join(qq).join("nt_qq").join("nt_db").join(NT_MSG_DB);
-                db.is_file().then(|| DbInfo { qq: qq.to_string(), path: db })
-            } else {
-                None
-            };
-            if let Some(info) = &resolved {
-                // Register (or override) the account location.
-                match registry.iter_mut().find(|a| a.qq == qq) {
-                    Some(a) => *a = info.clone(),
-                    None => registry.push(info.clone()),
-                }
-            }
-            resolved
-        }
-        None => registry.iter().find(|a| a.qq == qq).cloned(),
-    }
+    let Some(p) = db_path.filter(|p| !p.is_empty()) else {
+        return state.init.find_db(qq);
+    };
+    // Resolve outside the registry lock (the stat calls are syscalls);
+    // only the find-or-insert needs the lock.
+    let info = scan::resolve_account(qq, Path::new(p))?;
+    state.init.upsert_db(info.clone());
+    Some(info)
 }
 
 pub async fn handler(
@@ -79,14 +66,16 @@ pub async fn handler(
 
     let reply = |state_name: &str| Json(json!({ "success": true, "qq": qq, "state": state_name }));
 
-    // Idempotent guards for accounts already past the waiting stage.
+    // Idempotent guards for accounts already past the waiting stage. Check
+    // before resolving the path so a ready account's reply wins over
+    // unknown-qq / invalid-db-path.
     let current = {
         let accs = state.accounts.read();
-        accs.iter().find(|a| a.qq == qq).map(|a| a.state.clone())
+        accs.iter().find(|a| a.qq == qq).map(|a| a.state)
     };
-    match current.as_deref() {
-        Some("ready") => return Ok(reply("already_ready")),
-        Some("indexing") => return Ok(reply("in_progress")),
+    match current {
+        Some(AccountStatus::Ready) => return Ok(reply("already_ready")),
+        Some(AccountStatus::Indexing) => return Ok(reply("in_progress")),
         _ => {} // awaiting_key / error / unknown -> accept
     }
 
@@ -100,12 +89,20 @@ pub async fn handler(
         return Ok(reply(state_name));
     };
 
-    if !state.init.key_store.lock().insert_validated(qq, key) {
+    if validate_key(key).is_err() {
         return Ok(reply("invalid_key"));
     }
 
-    // Mark indexing and kick off the background build.
-    set_account_state(&state, qq, "indexing", 0, None);
+    // Flip to indexing atomically with the guard: a concurrent duplicate
+    // registration serializes here and observes the new state instead of
+    // spawning a second initialization.
+    match begin_indexing(&state, qq) {
+        Some(AccountStatus::Ready) => return Ok(reply("already_ready")),
+        Some(AccountStatus::Indexing) => return Ok(reply("in_progress")),
+        _ => {}
+    }
+
+    // Kick off the background build.
     let state_for_init = state.clone();
     let key_owned = key.to_string();
     tokio::spawn(async move { init_account(&state_for_init, info, key_owned).await });
