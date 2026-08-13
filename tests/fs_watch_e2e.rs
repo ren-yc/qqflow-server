@@ -27,9 +27,9 @@ async fn watch_event_drives_sse_push() {
 
     let store = Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, mut rx) = tokio::sync::broadcast::channel::<Event>(64);
-    let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src, FAKE_KEY.into())));
+    let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
-    let account = Arc::new(AccountSync::new(reader, store, tx));
+    let account = Arc::new(AccountSync::new(reader, store, tx, src.clone()));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(watch::spawn(
@@ -62,6 +62,46 @@ async fn watch_event_drives_sse_push() {
 
     shutdown_tx.send(true).ok();
     task.await.unwrap().unwrap();
+    drop(writer);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fallback poll regression (review finding #1): `changed()` must detect
+/// WAL-only writes even when no watch event arrives — the 30 s fallback is
+/// the insurance against silently dropped watch events. It stats the WAL
+/// (metadata only), so a write that is never observed by the watcher still
+/// triggers the next fallback sync.
+#[test]
+fn fallback_changed_detects_wal_writes() {
+    // Distinct temp dir from watch_event_drives_sse_push: tests in the same
+    // binary run in parallel and share the PID-named directory.
+    let dir = std::env::temp_dir().join(format!("qqflow_fallback_{}", std::process::id()));
+    let nt_db = dir.join("nt_db");
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let src = nt_db.join("nt_msg.db");
+
+    let store = Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
+    let (tx, _rx) = tokio::sync::broadcast::channel::<Event>(64);
+    let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
+    reader.lock().open().unwrap();
+    let account = Arc::new(AccountSync::new(reader, store, tx, src));
+
+    // Baseline: the first check initializes the snapshot (reports a change);
+    // the second, with nothing new on disk, reports none.
+    assert!(account.changed(), "first check initializes the WAL snapshot");
+    assert!(!account.changed(), "no change after baseline");
+    assert_eq!(account.poll_once().unwrap().len(), 8);
+
+    // A WAL-only write (new row in the writer's WAL, never watched by any
+    // watcher) must flip changed() to true, exactly once per write.
+    common::append_group_row(&writer, 8, "兜底轮询新增");
+    common::materialize_source(&nt_db);
+    assert!(account.changed(), "fallback must see WAL-only writes");
+    assert!(!account.changed(), "snapshot advances after the check");
+    let rows = account.poll_once().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].parsed.content, "兜底轮询新增");
+
     drop(writer);
     let _ = std::fs::remove_dir_all(&dir);
 }

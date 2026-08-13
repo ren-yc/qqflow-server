@@ -24,7 +24,7 @@
 use std::alloc::Layout;
 use std::ffi::{c_int, c_void, CStr};
 use std::ptr;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use anyhow::Result;
 use libsqlite3_sys as ffi;
@@ -46,10 +46,19 @@ struct OffsetFile {
 }
 
 static INSTALLED: Once = Once::new();
-static mut VFS_STORAGE: Option<Box<ffi::sqlite3_vfs>> = None;
+
 /// The default VFS we cloned (our own struct's xOpen is replaced with
-/// `x_open`, so callbacks recover the parent's pointers from here).
-static mut PARENT_VFS: *mut ffi::sqlite3_vfs = ptr::null_mut();
+/// `x_open`, so callbacks recover the parent's pointers from here). Written
+/// once inside `ensure_installed` BEFORE the VFS is registered; every x_open
+/// on any thread reads a fully-initialized pointer, so sharing it across
+/// threads is sound. (Raw pointers are not `Sync` — hence the newtype.)
+static PARENT_VFS: OnceLock<SyncVfsPtr> = OnceLock::new();
+
+/// Marker that the parent-VFS pointer is immutable after installation.
+struct SyncVfsPtr(*mut ffi::sqlite3_vfs);
+unsafe impl Sync for SyncVfsPtr {}
+unsafe impl Send for SyncVfsPtr {}
+
 static REGISTER_RC: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(ffi::SQLITE_OK);
 
@@ -66,7 +75,7 @@ pub fn ensure_installed() -> Result<()> {
                 REGISTER_RC.store(ffi::SQLITE_ERROR, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
-            PARENT_VFS = parent;
+            let _ = PARENT_VFS.set(SyncVfsPtr(parent));
             let mut vfs = *parent; // Copy: clone the default VFS struct
             vfs.zName = c"qqflow-offset".as_ptr();
             vfs.pNext = ptr::null_mut();
@@ -76,7 +85,11 @@ pub fn ensure_installed() -> Result<()> {
                 ffi::sqlite3_vfs_register(raw, 0), // makeDefault = 0
                 std::sync::atomic::Ordering::SeqCst,
             );
-            VFS_STORAGE = Some(Box::from_raw(raw)); // keep alive for the process lifetime
+            // Deliberately leak the registration struct: SQLite's global VFS
+            // list references it for the process lifetime and open files
+            // point into it (the old `static mut VFS_STORAGE` box kept it
+            // alive the same way).
+            std::mem::forget(Box::from_raw(raw));
         });
         if REGISTER_RC.load(std::sync::atomic::Ordering::SeqCst) != ffi::SQLITE_OK {
             anyhow::bail!("sqlite3_vfs_register({VFS_NAME}) failed");
@@ -112,7 +125,10 @@ unsafe extern "C" fn x_open(
     unsafe {
         // The parent's xOpen — never `(*vfs).xOpen`, which is OUR own
         // (replaced at clone time); that would recurse forever.
-        let parent_vfs = PARENT_VFS;
+        let Some(parent_vfs) = PARENT_VFS.get() else {
+            return ffi::SQLITE_ERROR; // never installed
+        };
+        let parent_vfs = parent_vfs.0;
         let parent_open = match (*parent_vfs).xOpen {
             Some(f) => f,
             None => return ffi::SQLITE_ERROR,

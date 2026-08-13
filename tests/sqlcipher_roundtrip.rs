@@ -90,8 +90,12 @@ fn live_read_wal_and_checkpoint() {
         "same reader survives the checkpoint"
     );
 
-    // Phase (e): cold reopen sees the final state.
-    reader.force_reopen();
+    // Phase (e): cold reopen sees the final state. A fresh LiveReader
+    // exercises the same reopen path (the old force_reopen() drop-and-open
+    // helper was removed together with the reopen-cooldown machinery).
+    drop(reader);
+    let mut reader = LiveReader::new(real.clone(), KEY.into());
+    reader.open().unwrap();
     assert_eq!(count_rows(reader.acquire().unwrap()), 2, "cold reopen works");
     drop(reader);
     drop(writer);

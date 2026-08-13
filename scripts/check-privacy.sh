@@ -38,16 +38,42 @@ report() {
   fi
 }
 
+# JSON field reader for the config: tries the interpreters that may exist
+# on a dev machine (python / python3 / the Windows `py` launcher). Returns 1
+# when none of them works — callers must NOT treat that as "nothing to
+# check" while the config exists (see the loud error below).
+read_json_field() {
+  local field="$1" py v
+  for py in python python3 "py -3"; do
+    v=$($py -c "import json;print(json.load(open('qqflow-server.json')).get('$field',''))" 2>/dev/null) \
+      || continue
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 1
+}
+
 # 1. Real machine-specific values from the gitignored local config.
 if [ -f "$CONFIG" ]; then
-  QQ=$(python -c "import json;print(json.load(open('qqflow-server.json'))['qq'])" 2>/dev/null || true)
-  KEY=$(python -c "import json;print(json.load(open('qqflow-server.json'))['key'])" 2>/dev/null || true)
+  QQ=$(read_json_field qq) || true
+  KEY=$(read_json_field key) || true
+  if [ -z "$QQ" ] && [ -z "$KEY" ]; then
+    # A machine that holds qqflow-server.json must actually run the two most
+    # sensitive checks. Failing silently (no python, the Windows Store stub,
+    # broken JSON) would print 通过 while real qq/key leaks go unchecked —
+    # block until the environment can read the config.
+    echo "[隐私检查] 错误：存在 qqflow-server.json 但无法读取 qq/key（python/python3/py 不可用？）。最敏感的泄露检查无法运行，拒绝放行；请安装 Python 后重试。" >&2
+    exit 2
+  fi
   [ -n "$QQ" ] && report "真实 QQ 号 $QQ" "$QQ"
   [ -n "$KEY" ] && report "真实数据库密钥（qqflow-server.json 中的 key）" "$KEY"
 fi
 
 # 2. Machine-specific paths / usernames.
-USER_NAME="$(whoami 2>/dev/null || true)"
+# MSYS bash's `whoami` prints the bare username (`ryc`); Windows'
+# `whoami.exe` prints `HOSTNAME\user` (`laptop-ku4u72es\ryc`), and the UPN
+# form is `user@domain`. Normalize to the bare name: `C:\Users\$USER_NAME`
+# needs it, and the bare name is a substring of every other form.
+USER_NAME="$(whoami 2>/dev/null | sed 's/.*[\\/@]//' || true)"
 [ -n "$USER_NAME" ] && report "本机用户名 $USER_NAME" "$USER_NAME"
 # Real QQ NT data roots carry the "Tencent Files" marker; scanning the bare
 # prefix would false-positive on docs that mention the pattern generically.

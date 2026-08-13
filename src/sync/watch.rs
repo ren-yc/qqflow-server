@@ -8,9 +8,9 @@
 //!
 //! Reliability: file-watch backends can silently drop events on buffer
 //! overflow, so a slow fallback poll (default 30 s) re-runs the sync when
-//! the live connection is closed (zero IO — `AccountSync::changed`) and
-//! also re-attaches a dead watcher (directory deleted/recreated by a QQ
-//! reinstall).
+//! `AccountSync::changed()` says so — retry flag, closed connection, or a
+//! fresh WAL metadata stat (cheap, no data IO) — and also re-attaches a
+//! dead watcher (directory deleted/recreated by a QQ reinstall).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -107,10 +107,6 @@ pub async fn spawn(
             _ = iv.tick() => {
                 if watcher.is_none() {
                     watcher = rebuild_watcher(&tx, &watch_dir, cfg.debounce);
-                    // The source db may have been replaced under a dead
-                    // watcher (QQ reinstall): force a fresh handle so the
-                    // next poll skips the stale-handle CORRUPT cooldown.
-                    account.reader.lock().force_reopen();
                 }
                 if cfg.fallback.is_some() && account.changed() {
                     sync_once(account.clone()).await;

@@ -118,7 +118,7 @@ fn manual_sync_picks_up_new_rows() {
     reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
-    let account = qqflow_server::sync::AccountSync::new(reader, store, tx);
+    let account = qqflow_server::sync::AccountSync::new(reader, store, tx, fake_db_path());
 
     let first = account.poll_once().unwrap();
     assert_eq!(first.len(), 8, "initial poll returns all rows (6 group + 2 c2c)");
@@ -158,7 +158,7 @@ fn failed_sync_leaves_store_untouched() {
     reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, _rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
-    let account = qqflow_server::sync::AccountSync::new(reader, store.clone(), tx);
+    let account = qqflow_server::sync::AccountSync::new(reader, store.clone(), tx, fake_db_path());
 
     // Break the c2c read by renaming its table away (via the live writer,
     // then materialize so the reader's next query hits the broken schema).

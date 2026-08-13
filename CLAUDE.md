@@ -93,8 +93,8 @@ VFS.
 
 ### Poller / real-time path
 
-File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`--watch-debounce-ms`, default 350 ms), then runs the sync (`AccountSync::poll_once`). A slow fallback poll (`--watch-fallback-ms`, default 30 s) re-checks `AccountSync::changed()` — live-connection state, zero IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated; the source db may have been replaced under a dead watcher, so the reader is force-reopened). The sync pass is **zero file IO**:
-1. `LiveReader::acquire()` — the long-lived read-only connection to the LIVE source (via the offset VFS); reopens automatically when closed, cooldown-aware after fatal SQLite errors (`db::live`, WeFlow's forceReopen pattern).
+File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`--watch-debounce-ms`, default 350 ms), then runs the sync (`AccountSync::poll_once`). A slow fallback poll (`--watch-fallback-ms`, default 30 s) re-checks `AccountSync::changed()` — retry flag, connection state, plus one WAL metadata stat (no data IO) — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated, e.g. QQ reinstall). No drop/reopen machinery: a failing read simply retries on the next trigger (WeFlow's forceReopen pattern deliberately dropped). The sync pass is **zero file IO**:
+1. `LiveReader::acquire()` — the long-lived read-only connection to the LIVE source (via the offset VFS); reopens automatically when closed (`db::live`).
 2. Reads per table with `index::read_new` (`rowid > watermark`, pure read — a failure in either table leaves the store untouched).
 3. Applies both tables under a single store write-lock (`index::apply_records` + watermark write-back) and emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
 
@@ -123,6 +123,7 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 ## Known issues
 
 - **c2c (private-chat) messages were silently dropped** — FIXED: `store/index.rs` now uses per-table column mapping (group 6 cols / c2c 5 cols, peer = sender). Guarded by the `fake_db_indexes_c2c_rows` regression test in `tests/real_db_groundtruth.rs`.
+- **运行中替换源库不自动感知**（已按设计取舍）：QQ 更新 / 迁移数据目录把 `nt_msg.db` 替换掉时，运行中的服务不会自动重开句柄——watcher 存活时读旧文件、watermark 永不前进；检测与重开机制（WeFlow forceReopen 模式）已舍去，**重启服务（重新注册）可恢复**。Windows 上源文件被服务器持有（无 FILE_SHARE_DELETE），替换本身也会失败直到服务退出。
 
 ## Version-fragility notes
 

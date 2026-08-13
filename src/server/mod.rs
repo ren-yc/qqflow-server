@@ -201,6 +201,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
                 reader,
                 state.store.clone(),
                 state.events.clone(),
+                info.path.clone(),
             ));
             state.sync.register(account.clone());
             let watch_dir = info

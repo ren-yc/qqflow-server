@@ -17,6 +17,7 @@
 pub mod events;
 pub mod watch;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,6 +42,11 @@ pub struct AccountSync {
     /// Set when a sync failed; the poll loop then retries even though the
     /// reader state is unchanged.
     retry: AtomicBool,
+    /// Source main db path — derives the `-wal` path the fallback stats.
+    db_path: PathBuf,
+    /// Last observed (mtime-millis, size) of the source WAL; the fallback
+    /// poll compares against it to detect changes the watcher missed.
+    last_wal: Mutex<Option<(u64, u64)>>,
 }
 
 impl AccountSync {
@@ -48,15 +54,53 @@ impl AccountSync {
         reader: Arc<Mutex<LiveReader>>,
         store: Arc<RwLock<Store>>,
         tx: broadcast::Sender<Event>,
+        db_path: PathBuf,
     ) -> Self {
-        Self { reader, store, tx, retry: AtomicBool::new(false) }
+        Self {
+            reader,
+            store,
+            tx,
+            retry: AtomicBool::new(false),
+            db_path,
+            last_wal: Mutex::new(None),
+        }
     }
 
-    /// Cheap change detection (no file IO): true right after a failed sync
-    /// (retry flag) or while the live connection is closed (QQ not running
-    /// yet — reopen on the next poll).
+    /// Cheap change detection (no data IO — at most one metadata stat):
+    /// true right after a failed sync (retry flag), while the live
+    /// connection is closed (QQ not running yet — reopen on the next
+    /// poll), or when the source WAL changed since the last check
+    /// (insurance against silently dropped watch events: QQ appends new
+    /// rows into the WAL).
     pub fn changed(&self) -> bool {
-        self.retry.swap(false, Ordering::SeqCst) || !self.reader.lock().is_open()
+        if self.retry.swap(false, Ordering::SeqCst) || !self.reader.lock().is_open() {
+            return true;
+        }
+        let Some(snap) = self.wal_snapshot() else {
+            return false; // no WAL yet — the watcher stays the only trigger
+        };
+        let mut last = self.last_wal.lock();
+        if *last != Some(snap) {
+            *last = Some(snap);
+            return true;
+        }
+        false
+    }
+
+    /// (mtime-millis, size) of the source WAL, falling back to the main
+    /// file when the WAL is absent (fully checkpointed, QQ closed).
+    /// Metadata only — never reads page data.
+    fn wal_snapshot(&self) -> Option<(u64, u64)> {
+        let mut wal = self.db_path.as_os_str().to_owned();
+        wal.push("-wal");
+        [PathBuf::from(wal), self.db_path.clone()]
+            .iter()
+            .find_map(|p| {
+                let m = std::fs::metadata(p).ok()?;
+                let ms = m.modified().ok()?;
+                let d = ms.duration_since(std::time::UNIX_EPOCH).ok()?;
+                Some((d.as_millis() as u64, m.len()))
+            })
     }
 
     /// One sync pass: read rows above the watermark from the LIVE source,
@@ -66,8 +110,9 @@ impl AccountSync {
     pub fn poll_once(&self) -> Result<Vec<MessageRecord>> {
         let mut reader = self.reader.lock();
         let result = self.poll_locked(&mut reader);
-        if let Err(e) = &result {
-            classify(&mut reader, e);
+        if result.is_err() {
+            // The read phase left the store untouched — retry the same rows
+            // on the next trigger instead of duplicating them.
             self.retry.store(true, Ordering::SeqCst);
         }
         result
@@ -132,28 +177,6 @@ impl AccountSync {
         let mut all = new_g;
         all.extend(new_c);
         Ok(all)
-    }
-}
-
-/// Classify a poll error: fatal SQLite codes (CORRUPT / NOTADB / IOERR —
-/// e.g. the source db was recreated underneath us) drop the connection and
-/// arm the reopen cooldown; transient errors (BUSY, CANTOPEN) are left to
-/// the retry flag and the next event/fallback tick.
-fn classify(reader: &mut LiveReader, err: &anyhow::Error) {
-    let fatal = err.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<rusqlite::Error>(),
-            Some(rusqlite::Error::SqliteFailure(ffi_err, _))
-                if matches!(
-                    ffi_err.code,
-                    rusqlite::ffi::ErrorCode::DatabaseCorrupt
-                        | rusqlite::ffi::ErrorCode::NotADatabase
-                        | rusqlite::ffi::ErrorCode::SystemIoFailure
-                )
-        )
-    });
-    if fatal {
-        reader.mark_fatal(err);
     }
 }
 
