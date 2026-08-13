@@ -9,8 +9,8 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - 默认监听地址：`127.0.0.1`
 - 默认端口：`5031`
 - 基础地址：`http://127.0.0.1:5031`
-- API Token：首次启动自动生成（32 位十六进制）并持久化到 `<data-dir>/token.txt`，启动日志会打印；也可在配置 `token` 字段指定
-- 索引就绪前，业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态
+- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到 `<data-dir>/token.txt`，启动日志会打印；也可在配置 `token` 字段指定
+- 索引就绪前，业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 不检查就绪状态，可随时连接（此时 `sync` 事件携带的水位线为当前已索引值）
 - 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`watch_debounce_ms` 默认 350ms 防抖，辅以 `watch_fallback_ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（镜像刷新 + 增量读取），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
 ## 鉴权规范
@@ -104,9 +104,9 @@ GET /api/v1/push/messages
 | `sessionId` | 会话 ID：群聊为群号，私聊为对方 UID（`u_` 前缀） |
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
-| `avatarUrl` | v1 恒为 `null` |
-| `sourceName` | 发送者昵称 |
-| `groupName` | 群显示名（仅群聊；未知时为 null） |
+| `avatarUrl` | v1 恒省略（序列化时跳过该字段） |
+| `sourceName` | 发送者昵称（无昵称时为空串） |
+| `groupName` | 会话显示名：群聊为群名，私聊为对方昵称；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
 | `lastRowidGroup` / `lastRowidC2c` | 仅 `sync` 事件：群/私聊表当前水位线（rowid 最大值） |
@@ -162,6 +162,8 @@ curl "http://127.0.0.1:5031/api/v1/messages?talker=u_abc123&start=20260101&end=2
 ```
 
 ### JSON 响应字段
+
+> v1 说明：`talker` 对应的会话不存在时不报错，返回 `success=true`、`messages=[]`、`count=0`（与 §4.1 的 404 行为不同）。
 
 顶层字段：`success`、`talker`、`count`、`hasMore`、`media.enabled`、`media.exportPath`、`media.count`、`messages`
 
@@ -234,7 +236,7 @@ curl "http://127.0.0.1:5031/api/v1/messages?talker=u_abc123&start=20260101&end=2
 当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）：
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
-- `meta.name`（会话显示名）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`
+- `meta.name`（会话显示名）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
 - `members[].platformId`、`members[].accountName`、`members[].groupNickname`、`members[].avatar`（恒空）
 - `messages[].sender`、`messages[].accountName`、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
@@ -311,7 +313,7 @@ GET /api/v1/sessions/{id}/messages
 | 参数     | 类型   | 必填 | 说明                                     |
 | -------- | ------ | ---- | ---------------------------------------- |
 | `:id`    | string | 是   | 会话 ID（Path 参数）                     |
-| `since`  | string | 否   | 秒级时间戳或 `YYYYMMDD`，仅返回此时间之后的消息 |
+| `since`  | string | 否   | 秒级时间戳或 `YYYYMMDD`，仅返回该时间（含）及之后的消息 |
 | `end`    | string | 否   | 秒级时间戳或 `YYYYMMDD`，时间上界        |
 | `limit`  | number | 否   | 单次返回上限，默认且最大 `5000`          |
 | `offset` | number | 否   | 分页偏移，默认 `0`                       |
@@ -482,11 +484,13 @@ POST /api/v1/sync
 
 | HTTP 状态码 | 场景 |
 | ----------- | ---- |
-| `400` | 缺少必填参数、参数无效、POST Body 非 JSON |
+| `400` | 缺少必填参数、Body 参数类型无效（报错 `body 参数无效`） |
 | `401` | 未携带有效 Token |
 | `404` | 会话/群不存在（业务 404 走信封；**未知路径为 axum 默认空响应**） |
 | `503` | 索引构建中（"服务正在建立索引，请稍后重试"） |
 | `500` | 内部错误 |
+
+> 说明：非 JSON 的 POST Body 会被忽略（仅记录日志），请求沿用 Query 参数，不会报 400；`start`/`end` 无法解析时该过滤条件被忽略。Query 参数类型错误（如 `limit=abc`）由框架直接拒绝，返回 `400` 空响应体，不走本信封。
 
 ---
 
@@ -529,7 +533,7 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
 
 1. API 仅监听本机 `127.0.0.1`，不对外网开放（`host` 可在配置中修改，需自行承担风险）。
 2. `start` / `end` 支持 `YYYYMMDD` 与秒级时间戳；纯 `YYYYMMDD` 的 `end` 会扩展到当天 `23:59:59`。
-3. 索引在启动时全量构建（消息 → 内存），期间业务接口返回 `503`；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。启动后由文件系统事件驱动增量同步（防抖 `watch_debounce_ms`，兜底 `watch_fallback_ms`），也可用 `POST /api/v1/sync` 手动触发。
+3. 索引在启动时全量构建（消息 → 内存），期间业务接口返回 `503`（SSE 接口 `/api/v1/push/messages` 除外）；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。启动后由文件系统事件驱动增量同步（防抖 `watch_debounce_ms`，兜底 `watch_fallback_ms`），也可用 `POST /api/v1/sync` 手动触发。
 4. 会话 ID 判定：全数字 → 群聊；`u_` 前缀或含非数字字符 → 私聊。
 5. 消息内容为启发式解析结果（QQ 消息体为无固定 schema 的 protobuf 形态），QQ 升级可能导致解析退化；媒体消息输出 `[image]` / `[voice]` / `[video]` 占位。
 6. 撤回消息 `localType=6`，content 保留原文（含"你猜猜撤回了什么"提示行）。

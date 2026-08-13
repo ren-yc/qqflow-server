@@ -64,9 +64,9 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 - Table shapes (numeric column names are QQ-version-dependent, treat as fragile):
   - `group_msg_table`: `"40021"` group id, `"40001"` seq, `"40020"` sender uid, `"40093"` nickname, `"40800"` message blob
   - `c2c_msg_table`: `"40020"` peer uid, `"40001"` seq, `"40093"` nickname, `"40800"` blob
-- Message timestamp is packed in the high 32 bits of seq: `seq_to_time(seq) = seq >> 16` (`parser::types`).
+- Message timestamp is packed in the high 32 bits of seq: `seq_to_time(seq) = seq >> 32` (`parser::types`).
 - Conversation map key: `g:<groupId>` / `c:<peerUid>` (`store::conv_key`). `classify_talker` disambiguates: all-digit → group, `u_`-prefixed → c2c.
-- Conversations have a `dirty` flag; append-only changes trigger a lazy re-sort by `(ts, rowid)` on next query (`Conversation::ensure_sorted`).
+- Conversations carry a `dirty` flag set by appends; `build_index` sorts each conversation once via `Conversation::ensure_sorted`, while query paths (`query_messages`, chatlab pull) sort their own index snapshots by `(ts, rowid)` per query.
 
 ### Poller / real-time path
 

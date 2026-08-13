@@ -6,7 +6,7 @@
 ## 范围（v1）
 
 - ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头
-- ✅ 数据读取：全量扫描建内存索引 + rowid 水位线增量轮询（WAL 通过镜像目录同步，支持 QQ 运行中实时读取）
+- ✅ 数据读取：全量扫描建内存索引 + 文件系统事件驱动的增量同步（notify watch + 慢速兜底轮询；WAL 通过镜像目录同步，支持 QQ 运行中实时读取）
 - ✅ 服务封装：axum HTTP + SSE，WeFlow 参考端点与字段
 - ✅ 三平台：Windows / Linux / macOS（仅路径探测不同，代码已按平台门控）
 - ❌ **不做密钥提取**：密钥由外部工具提供（`QQBackup/qq-win-db-key` 等），输入方式见运行节
@@ -61,6 +61,7 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 | `GET/POST /api/v1/contacts` | 联系人（消息中出现过的 UID→昵称） |
 | `GET/POST /api/v1/group-members` | 群成员（`chatroomId`，`includeMessageCounts`） |
 | `GET/POST /api/v1/push/messages` | SSE：`sync`（基线，含水位线）→ `message.new` / `message.revoke` |
+| `GET/POST /api/v1/sync` | 手动同步（镜像刷新 + 增量读取，返回新增消息） |
 
 鉴权三方式：`Authorization: Bearer <token>` / `?access_token=`（SSE 推荐）/ POST JSON Body。
 
@@ -77,16 +78,14 @@ bash scripts/build.sh test                        # Linux/macOS
 ```
 
 - `tests/sqlcipher_roundtrip.rs`：自建 SQLCipher 测试库（QQ 同参数 + 1024B 头 + WAL）验证
-  解密 round-trip、WAL 实时轮询路径、checkpoint 重建 —— **不触碰真实 QQ 数据**
+  解密 round-trip、WAL 实时路径、checkpoint 重建 —— **不触碰真实 QQ 数据**
 - `tests/api_smoke.rs`：HTTP 层（tower oneshot，无网络）契约测试
+- `tests/fs_watch_e2e.rs`：文件系统事件 → 同步 → SSE 广播的端到端测试（假库）
+- `tests/real_db_groundtruth.rs`：真实 QQ 库 ground-truth 查询（默认 `#[ignore]`，需
+  `QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY` 环境变量）
 
 ## 免责声明
 
 仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥混淆/明文 JSON 仅作便利存储，
 非安全机制；QQ 升级可能导致列名/消息格式解析退化（启发式解析天然容错）。参考实现
 （yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，未逐字复制。
-
-## 下一步（未在本轮范围）
-
-- 使用真实密钥对真实 QQ 数据库做端到端验证（本轮明确不做）
-- 媒体文件导出端点、`/status`、`/refresh`、Windows 服务化
