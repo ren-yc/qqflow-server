@@ -157,11 +157,6 @@ impl Mirror {
         Ok(false)
     }
 
-    /// Wipe the mirror directory (call on shutdown to remove decrypted
-    /// page-cache residue; files themselves are SQLCipher ciphertext).
-    pub fn cleanup(&self) {
-        let _ = std::fs::remove_dir_all(&self.mirror_dir);
-    }
 }
 
 /// Helper used by tests and index builder: read `path` skipping `skip` bytes.

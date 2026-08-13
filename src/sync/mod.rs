@@ -17,7 +17,6 @@ pub mod watch;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
@@ -179,28 +178,3 @@ impl Default for SyncEngine {
     }
 }
 
-/// Spawn one change-driven poll task per account. Runs until `shutdown`
-/// turns true: stat the source files at `interval`, run a full sync only
-/// when `AccountSync::changed()` says so.
-pub async fn spawn(
-    account: Arc<AccountSync>,
-    interval: Duration,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        loop {
-            if *shutdown.borrow() {
-                break;
-            }
-            if account.changed()
-                && let Err(e) = account.poll_once()
-            {
-                tracing::warn!("poll error: {e:#}");
-            }
-            std::thread::sleep(interval);
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("poll task panicked: {e}"))?
-}

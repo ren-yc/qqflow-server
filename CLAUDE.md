@@ -108,7 +108,7 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 ## Version-fragility notes
 
 - Numeric column names (`"40021"`, `"40800"`, …), table layouts, and the uid→QQ mapping table all vary with QQ versions; code degrades gracefully (best-effort queries, heuristic parsing).
-- `store::mapping::load_uid_map` is currently **dead code** — defined for future UID→QQ-number resolution but never called.
+- UID→QQ-number resolution is not implemented (the real DB does contain `nt_uid_mapping_table`; the ground-truth probe reports which candidate tables exist).
 - `MessageOut::is_send` is hardcoded `0` — v1 limitation: message direction is not reliably derivable from the available columns.
 
 ## Tests

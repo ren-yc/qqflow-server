@@ -7,7 +7,6 @@
 //! poller — a single source of truth for both HTTP queries and SSE events.
 
 pub mod index;
-pub mod mapping;
 pub mod query;
 
 use std::collections::HashMap;
@@ -39,9 +38,6 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    pub fn message_count(&self) -> usize {
-        self.msgs.len()
-    }
     pub fn ensure_sorted(&mut self) {
         if self.dirty {
             self.msgs.sort_by_key(|m| (m.ts, m.rowid));
@@ -63,9 +59,6 @@ pub struct Store {
 impl Store {
     pub fn conversation(&self, chat_type: ChatType, talker: &str) -> Option<&Conversation> {
         self.convs.get(&conv_key(chat_type, talker))
-    }
-    pub fn conversation_mut(&mut self, chat_type: ChatType, talker: &str) -> Option<&mut Conversation> {
-        self.convs.get_mut(&conv_key(chat_type, talker))
     }
 
     /// Look up a conversation by talker string, falling back to the other

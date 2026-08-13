@@ -109,12 +109,8 @@ pub fn parse_args(args: Vec<String>) -> Result<Config> {
     Ok(cfg)
 }
 
-/// Resolve the data directory (platform default; no config override anymore).
-pub fn data_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
-    if let Some(d) = override_dir {
-        std::fs::create_dir_all(d).with_context(|| format!("create data dir {}", d.display()))?;
-        return Ok(d.to_path_buf());
-    }
+/// Resolve the platform data directory.
+pub fn data_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     #[cfg(target_os = "linux")]
@@ -127,13 +123,7 @@ pub fn data_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Load the persisted token, or generate + persist a new one.
-pub fn load_or_create_token(data_dir: &std::path::Path, explicit: Option<&str>) -> Result<String> {
-    if let Some(t) = explicit {
-        if t.len() < 16 {
-            anyhow::bail!("token too short (min 16 chars)");
-        }
-        return Ok(t.to_string());
-    }
+pub fn load_or_create_token(data_dir: &Path) -> Result<String> {
     let path = data_dir.join("token.txt");
     if let Ok(t) = std::fs::read_to_string(&path) {
         let t = t.trim();

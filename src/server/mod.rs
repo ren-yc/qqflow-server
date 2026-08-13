@@ -172,8 +172,8 @@ pub async fn serve() -> Result<()> {
 }
 
 pub async fn run_with(cfg: config::Config) -> Result<()> {
-    let data_dir = config::data_dir(None)?;
-    let token = config::load_or_create_token(&data_dir, None)?;
+    let data_dir = config::data_dir()?;
+    let token = config::load_or_create_token(&data_dir)?;
 
     // ---- accounts: platform scan for discovery only ----------------------
     // Zero accounts is a valid start state — a client will register them
