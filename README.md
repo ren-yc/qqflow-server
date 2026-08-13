@@ -41,11 +41,12 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
   "port": 5031, "host": "127.0.0.1", "log": "info",
   "keys": { "<QQ号>": "<16字节密钥>" },
   "db_path": "D:\\AppData\\Tencent Files",
-  "poll_interval": 200
+  "watch_debounce_ms": 350,
+  "watch_fallback_ms": 30000
 }
 ```
 
-可用字段：`port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `poll_interval` / `data_dir` / `db_path` / `log`。未知字段或类型错误 → 启动失败（提示具体字段）；配置文件缺失 → 全部使用默认值。
+可用字段：`port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `watch_debounce_ms` / `watch_fallback_ms` / `data_dir` / `db_path` / `log`。未知字段或类型错误 → 启动失败（提示具体字段）；配置文件缺失 → 全部使用默认值。`watch_debounce_ms`（默认 350）为文件事件防抖；`watch_fallback_ms`（默认 30000）为慢速兜底轮询，0 关闭（不推荐）。
 
 默认 `http://127.0.0.1:5031`，token 自动生成并持久化到 `<data-dir>/token.txt`（首次启动打印）。
 

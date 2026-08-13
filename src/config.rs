@@ -31,10 +31,16 @@ pub struct Config {
     pub ask_key: bool,
     /// Restrict to these QQ accounts (by default all scanned accounts are used).
     pub qq: Vec<String>,
-    /// Change-detection cadence: how often the poll loop stats the source
-    /// WAL/main files for new messages, in milliseconds. A full sync only
-    /// runs when the files changed, so this can be fast at idle.
-    pub poll_interval: u64,
+    /// File-watch debounce (ms): how long the watcher waits for an event
+    /// burst to quiet down before triggering a sync (WeFlow-aligned; with
+    /// batch mode the worst-case delay is about 2x this value).
+    pub watch_debounce_ms: u64,
+
+    /// Slow fallback poll (ms): `Mirror::changed()` (zero-IO stats) as a
+    /// safety net against file-watch events being silently lost (inotify /
+    /// ReadDirectoryChangesW buffer overflow). 0 = disabled (not
+    /// recommended: missed events would never recover).
+    pub watch_fallback_ms: u64,
     /// Data directory (keys, token, mirror cache). Platform default:
     /// Windows %LOCALAPPDATA%\qqflow-server, Linux ~/.local/share/qqflow-server,
     /// macOS ~/Library/Application Support/qqflow-server.
@@ -56,7 +62,8 @@ impl Default for Config {
             keys_file: None,
             ask_key: false,
             qq: Vec::new(),
-            poll_interval: 200,
+            watch_debounce_ms: 350,
+            watch_fallback_ms: 30_000,
             data_dir: None,
             db_path: None,
             log: "info".into(),
@@ -171,14 +178,15 @@ mod tests {
         let dir = test_dir("full");
         let p = write_config(
             &dir,
-            r#"{"port": 5999, "host": "0.0.0.0", "log": "debug", "poll_interval": 500,
-                "db_path": "D:\\x", "qq": ["123456789"]}"#,
+            r#"{"port": 5999, "host": "0.0.0.0", "log": "debug", "watch_debounce_ms": 500,
+                "watch_fallback_ms": 0, "db_path": "D:\\x", "qq": ["123456789"]}"#,
         );
         let cfg = load_from(&p).unwrap();
         assert_eq!(cfg.port, 5999);
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.log, "debug");
-        assert_eq!(cfg.poll_interval, 500);
+        assert_eq!(cfg.watch_debounce_ms, 500);
+        assert_eq!(cfg.watch_fallback_ms, 0);
         assert_eq!(cfg.db_path.as_deref().unwrap(), Path::new("D:\\x"));
         assert_eq!(cfg.qq, vec!["123456789"]);
     }

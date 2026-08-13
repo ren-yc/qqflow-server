@@ -11,7 +11,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - 基础地址：`http://127.0.0.1:5031`
 - API Token：首次启动自动生成（32 位十六进制）并持久化到 `<data-dir>/token.txt`，启动日志会打印；也可在配置 `token` 字段指定
 - 索引就绪前，业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态
-- 新消息检测：后台以 `poll_interval`（默认 200ms）stat 源数据库文件，**仅当文件变化时**才执行完整同步（镜像刷新 + 增量读取），检测到后经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
+- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`watch_debounce_ms` 默认 350ms 防抖，辅以 `watch_fallback_ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（镜像刷新 + 增量读取），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
 ## 鉴权规范
 
@@ -529,7 +529,7 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
 
 1. API 仅监听本机 `127.0.0.1`，不对外网开放（`host` 可在配置中修改，需自行承担风险）。
 2. `start` / `end` 支持 `YYYYMMDD` 与秒级时间戳；纯 `YYYYMMDD` 的 `end` 会扩展到当天 `23:59:59`。
-3. 索引在启动时全量构建（消息 → 内存），期间业务接口返回 `503`；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。启动后由后台 stat 检测（`poll_interval`，默认 200ms）增量同步，也可用 `POST /api/v1/sync` 手动触发。
+3. 索引在启动时全量构建（消息 → 内存），期间业务接口返回 `503`；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。启动后由文件系统事件驱动增量同步（防抖 `watch_debounce_ms`，兜底 `watch_fallback_ms`），也可用 `POST /api/v1/sync` 手动触发。
 4. 会话 ID 判定：全数字 → 群聊；`u_` 前缀或含非数字字符 → 私聊。
 5. 消息内容为启发式解析结果（QQ 消息体为无固定 schema 的 protobuf 形态），QQ 升级可能导致解析退化；媒体消息输出 `[image]` / `[voice]` / `[video]` 占位。
 6. 撤回消息 `localType=6`，content 保留原文（含"你猜猜撤回了什么"提示行）。

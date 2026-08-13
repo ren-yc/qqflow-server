@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use parking_lot::RwLock;
 use qqflow_server::parser::types::{seq_to_time, ChatType, MessageRecord, MsgType, ParsedMessage};
-use qqflow_server::poller::Event;
+use qqflow_server::sync::Event;
 use qqflow_server::server::build_router;
 use qqflow_server::store::{conv_key, AppState, Conversation, Store};
 use qqflow_server::store::query::{query_messages, MessageQuery};
@@ -58,7 +58,7 @@ fn test_state() -> Arc<AppState> {
         accounts: Arc::new(RwLock::new(Vec::new())),
         ready: Arc::new(AtomicBool::new(true)),
         token: Arc::new("test-token-123456".into()),
-        sync: Arc::new(qqflow_server::poller::SyncEngine::new()),
+        sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
     })
 }
 

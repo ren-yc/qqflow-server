@@ -32,7 +32,7 @@ Run against real data — **config-only, no CLI arguments**; configuration comes
 .\qqflow-server.exe
 ```
 
-Config fields (snake_case, all optional, serde `deny_unknown_fields` — unknown fields or type errors are fatal): `port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `poll_interval` / `data_dir` / `db_path` / `log`. See the README for an example.
+Config fields (snake_case, all optional, serde `deny_unknown_fields` — unknown fields or type errors are fatal): `port` / `host` / `token` / `keys` / `keys_file` / `ask_key` / `qq` / `watch_debounce_ms` / `watch_fallback_ms` / `data_dir` / `db_path` / `log`. See the README for an example.
 
 - `db_path` overrides database discovery: a Tencent Files-style root directory (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`) or a direct `nt_msg.db` file (account name taken from the nearest all-digit ancestor dir, fallback `custom`).
 - Keys (16 printable-ASCII bytes per account): `"keys"` object (`{"<qq>": "<key>"}`), optional `"keys_file"` external file (overrides `keys` for the same qq), or `"ask_key": true` interactive stdin. Invalid entries are skipped with a warning; persisted to `<data-dir>/keys.json` (write-only — not auto-loaded).
@@ -54,12 +54,12 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
   → store::index::build_index / append_new
                          full-table scan → in-memory Store; incremental rowid
                          appends afterwards
-  → server (axum) + poller (tokio broadcast)
+  → server (axum) + sync engine (watch task + tokio broadcast)
 ```
 
 ### The in-memory index (core design decision)
 
-`nt_msg.db` message columns have no useful indexes — SQL filtering means a 30–60 s full table scan per query on a real (~190 MB) database. So the server scans both tables **once at startup** into a `HashMap`-based `Store` and keeps it incrementally updated: the poller appends rows with `rowid > watermark` and the same `Store` is the single source of truth for both HTTP queries and SSE events. All query logic (`store::query`) works against this in-memory structure, never SQL.
+`nt_msg.db` message columns have no useful indexes — SQL filtering means a 30–60 s full table scan per query on a real (~190 MB) database. So the server scans both tables **once at startup** into a `HashMap`-based `Store` and keeps it incrementally updated: the sync engine appends rows with `rowid > watermark` and the same `Store` is the single source of truth for both HTTP queries and SSE events. All query logic (`store::query`) works against this in-memory structure, never SQL.
 
 - Table shapes (numeric column names are QQ-version-dependent, treat as fragile):
   - `group_msg_table`: `"40021"` group id, `"40001"` seq, `"40020"` sender uid, `"40093"` nickname, `"40800"` message blob
@@ -70,7 +70,7 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 
 ### Poller / real-time path
 
-One change-driven poll task per account (`poller::spawn`, runs in `spawn_blocking`). Every `poll_interval` (default 200 ms) it runs `Mirror::changed()` — two metadata stats on the source WAL/main files, no IO — and only when something changed runs the full sync (`AccountSync::poll_once`):
+File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`watch_debounce_ms`, default 350 ms), then runs the full sync (`AccountSync::poll_once`). A slow fallback poll (`watch_fallback_ms`, default 30 s) re-checks `Mirror::changed()` — two metadata stats, no IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated). The full sync:
 1. `Mirror::sync()` — re-copies the source WAL (cheap; if the source main file's size/mtime changed, SQLite checkpointed and the whole mirror is rebuilt).
 2. Reopens the decrypted connection, then `index::append_new` per table for `rowid > watermark`.
 3. Emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
@@ -83,7 +83,7 @@ SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect car
 
 ### Startup sequence (`server::run_with`)
 
-Parse args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → load keys (`KeyStore`, validated + persisted to `<data-dir>/keys.json`) → bind listener **early** so `/health` reports "starting" during index build → per-account `spawn_blocking` index build (CPU-bound decrypt + full scan) → start pollers → set ready flag → wait for Ctrl-C → signal shutdown watch, abort poll tasks, delete mirror dir.
+Parse args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → load keys (`KeyStore`, validated + persisted to `<data-dir>/keys.json`) → bind listener **early** so `/health` reports "starting" during index build → per-account `spawn_blocking` index build (CPU-bound decrypt + full scan) → start watch tasks → set ready flag → wait for Ctrl-C → signal shutdown watch, abort watch tasks, delete mirror dir.
 
 ### Heuristic message parser (`parser`)
 
@@ -91,7 +91,8 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 
 ### Concurrency
 
-- `parking_lot::RwLock<Store>` shared via `Arc` — single lock for the whole store (poller writes, handlers read).
+- `parking_lot::RwLock<Store>` shared via `Arc` — single lock for the whole store (sync engine writes, handlers read).
+- notify watcher threads bridge into the tokio watch task via an unbounded channel (`sync::watch`); watch/fallback/manual sync passes serialize on the mirror mutex and the store write lock.
 - tokio `broadcast` for SSE events; `watch` channel for shutdown; CPU-bound decrypt/scan work in `spawn_blocking`.
 - `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState`, "indexing"/"ready"/"error"), a global `ready` AtomicBool, and the token.
 - Auth: Bearer header / `?access_token=` (recommended for SSE) / POST JSON body, constant-time comparison (`config::constant_time_eq`).

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use crate::poller::events::Event;
+use crate::sync::events::Event;
 use crate::server::error::ApiError;
 use crate::store::AppState;
 

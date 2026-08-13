@@ -1,9 +1,10 @@
-//! Change-driven poll loop + manual sync engine.
+//! Sync engine: file-system-event-driven push + passive manual sync.
 //!
-//! A fast stat loop (default 200 ms) checks the source WAL/main files for
-//! changes — two metadata calls, no IO — and only runs the full sync
-//! (mirror refresh + decrypt + incremental append + SSE broadcast) when
-//! something changed. Idle periods cost nothing beyond the stat.
+//! New messages are detected by watching the source `nt_db` directory with
+//! notify (see `watch`): ReadDirectoryChangesW / inotify / FSEvents events
+//! are debounced and trigger a full sync (mirror refresh + decrypt +
+//! incremental append + SSE broadcast). A slow fallback poll guards against
+//! silently dropped watch events and re-attaches a dead watcher.
 //!
 //! The same per-account `AccountSync` is shared with the manual sync
 //! endpoint (`POST /api/v1/sync`): callers trigger `poll_once` on demand
@@ -12,6 +13,7 @@
 //! the parser and emitted as `message.revoke`.
 
 pub mod events;
+pub mod watch;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

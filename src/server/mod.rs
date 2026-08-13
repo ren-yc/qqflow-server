@@ -18,8 +18,8 @@ use crate::config;
 use crate::db;
 use crate::db::mirror::Mirror;
 use crate::keystore::KeyStore;
-use crate::poller;
-use crate::poller::Event;
+use crate::sync;
+use crate::sync::Event;
 use crate::store::index;
 use crate::store::{AppState, Store};
 
@@ -85,7 +85,7 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
     let (tx, _) = broadcast::channel::<Event>(1024);
     let accounts_state = Arc::new(RwLock::new(Vec::<AccountState>::new()));
     let ready = Arc::new(AtomicBool::new(false));
-    let sync_engine = Arc::new(poller::SyncEngine::new());
+    let sync_engine = Arc::new(sync::SyncEngine::new());
     let state = Arc::new(AppState {
         store: store.clone(),
         events: tx.clone(),
@@ -117,8 +117,12 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         let tx = tx.clone();
         let accounts_state = accounts_state.clone();
         let mirror_root = data_dir.join("mirror");
-        let poll_ms = cfg.poll_interval;
         let qq = info.qq.clone();
+        let watch_dir = info
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
 
         // Index build is CPU-bound (decrypt + full scan): run in blocking pool.
         let key_for_index = key.clone();
@@ -155,16 +159,24 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
 
         // Share the mirror between the change-driven poll task and the
         // manual-sync endpoint (both call AccountSync::poll_once).
-        let account = Arc::new(poller::AccountSync::new(
+        let account = Arc::new(sync::AccountSync::new(
             Arc::new(parking_lot::Mutex::new(mirror)),
             key.clone(),
             store.clone(),
             tx.clone(),
         ));
         sync_engine.register(account.clone());
-        let task = tokio::spawn(crate::poller::spawn(
+
+        // File-system-event-driven trigger (notify) + slow fallback poll.
+        let watch_cfg = crate::sync::watch::WatchConfig {
+            debounce: std::time::Duration::from_millis(cfg.watch_debounce_ms),
+            fallback: (cfg.watch_fallback_ms > 0)
+                .then(|| std::time::Duration::from_millis(cfg.watch_fallback_ms)),
+        };
+        let task = tokio::spawn(crate::sync::watch::spawn(
             account,
-            std::time::Duration::from_millis(poll_ms),
+            watch_dir,
+            watch_cfg,
             shutdown_rx.clone(),
         ));
         poll_tasks.push(task);

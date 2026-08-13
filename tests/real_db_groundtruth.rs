@@ -18,11 +18,9 @@ use std::path::Path;
 use qqflow_server::db::decrypt;
 use qqflow_server::db::mirror::Mirror;
 use qqflow_server::db::scan;
-use rusqlite::Connection;
 
-/// Fabricated account number (random, not a real QQ).
-const FAKE_QQ: &str = "335663881";
-const FAKE_KEY: &str = "0123456789abcdef";
+mod common;
+use common::{FAKE_KEY, FAKE_QQ};
 
 /// Fake DB location (also used by the behavioral-repro runbook).
 pub fn fake_db_path() -> std::path::PathBuf {
@@ -34,88 +32,16 @@ pub fn fake_db_path() -> std::path::PathBuf {
         .join("nt_msg.db")
 }
 
+/// Rebuild the shared fake DB fixture (serialized against parallel tests).
+fn build_fake_db() -> std::path::PathBuf {
+    let fake_root = std::env::temp_dir().join("qqflow_fake");
+    let _ = std::fs::remove_dir_all(&fake_root);
+    common::write_fake_source(fake_db_path().parent().unwrap(), 0)
+}
+
 /// Both fake-db tests rebuild the same fixture directory — serialize them
 /// (integration tests run in parallel threads of one process).
 static FAKE_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn pragma_suite(key: &str) -> String {
-    format!(
-        "PRAGMA cipher_page_size = 4096;\n\
-         PRAGMA key = '{key}';\n\
-         PRAGMA kdf_iter = 4000;\n\
-         PRAGMA cipher_hmac_algorithm = HMAC_SHA1;\n\
-         PRAGMA cipher_default_kdf_algorithm = PBKDF2_HMAC_SHA512;\n\
-         PRAGMA cipher = 'aes-256-cbc';\n"
-    )
-}
-
-fn make_schema(conn: &Connection) {
-    conn.execute_batch(
-        "CREATE TABLE group_msg_table (\"40021\" TEXT, \"40001\" INTEGER, \"40020\" TEXT, \"40093\" TEXT, \"40800\" BLOB);\
-         CREATE TABLE c2c_msg_table (\"40020\" TEXT, \"40001\" INTEGER, \"40093\" TEXT, \"40800\" BLOB);",
-    )
-    .unwrap();
-}
-
-/// Build a fake QQ-style database (SQLCipher + 1024B header) at
-/// `fake_db_path()`. Regenerates from scratch on every run so the
-/// behavioral-repro server always sees a known dataset.
-fn build_fake_db() -> std::path::PathBuf {
-    let path = fake_db_path();
-    let fake_root = std::env::temp_dir().join("qqflow_fake");
-    let _ = std::fs::remove_dir_all(&fake_root);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-    let raw = std::env::temp_dir().join("qqflow_fake_raw.db");
-    {
-        let conn = Connection::open(&raw).unwrap();
-        conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
-        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
-        make_schema(&conn);
-
-        // Groups: normal text, recall, system (群名修改), large media blob, miniapp JSON.
-        let g = |rowid: i64, group: &str, seq: i64, uid: &str, nick: &str, blob: &[u8]| {
-            conn.execute(
-                "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![group, seq, uid, nick, blob],
-            )
-            .unwrap();
-            assert_eq!(rowid, conn.last_insert_rowid());
-        };
-        // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 1782864000)
-        let ts: i64 = 1782864000;
-        g(1, "10001", (ts << 32) |1, "u_a", "张三", "你好，欢迎加入".as_bytes());
-        g(2, "10001", (ts << 32) |2, "u_b", "李四", "收到".as_bytes());
-        g(3, "10001", (ts << 32) |3, "u_a", "张三", "李四撤回了一条消息\n你猜猜撤回了什么".as_bytes());
-        g(4, "10001", (ts << 32) |4, "u_b", "李四", "群主已将群名修改为「测试群」".as_bytes());
-        let mut media = vec![0u8; 70_000];
-        media[5000..5008].copy_from_slice(b".jpg.exe");
-        g(5, "10001", (ts << 32) |5, "u_c", "王五", &media);
-        g(6, "20002", (ts << 32) |1, "u_a", "张三",
-            "{\"appID\":\"x\",\"prompt\":\"分享一个链接\",\"desc\":\"有趣内容\",\"title\":\"标题\"}".as_bytes());
-        conn.execute(
-            "INSERT INTO c2c_msg_table VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["u_12345", (ts << 32) |1, "王五", "在吗？".as_bytes()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO c2c_msg_table VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["u_12345", (ts << 32) |2, "王五", "明天见".as_bytes()],
-        )
-        .unwrap();
-    }
-
-    // Prepend the 1024-byte custom header (QQ's nt_msg.db layout).
-    let mut bytes = std::fs::read(&raw).unwrap();
-    let mut all = vec![0u8; scan::CUSTOM_HEADER_LEN as usize];
-    all[0..8].copy_from_slice(b"QQNTDB!1");
-    all.append(&mut bytes);
-    std::fs::write(&path, all).unwrap();
-    let _ = std::fs::remove_file(&raw);
-
-    // Verify the server's own pipeline can read it back (mirror + decrypt).
-    path
-}
 
 /// Verify the fake DB is readable through the server's pipeline (mirror +
 /// decrypt + direct row counts). The behavioral-repro runbook depends on it.
@@ -181,8 +107,8 @@ fn manual_sync_picks_up_new_rows() {
     let mirror = Mirror::new(&info, &mirror_dir).unwrap();
     let mirror = std::sync::Arc::new(parking_lot::Mutex::new(mirror));
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::poller::Event>(16);
-    let account = qqflow_server::poller::AccountSync::new(mirror.clone(), FAKE_KEY.into(), store, tx);
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
+    let account = qqflow_server::sync::AccountSync::new(mirror.clone(), FAKE_KEY.into(), store, tx);
 
     let first = account.poll_once().unwrap();
     assert_eq!(first.len(), 8, "initial poll returns all rows (6 group + 2 c2c)");

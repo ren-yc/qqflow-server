@@ -16,7 +16,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::parser::types::{ChatType, MessageRecord};
-use crate::poller;
+use crate::sync;
 
 /// Key for the conversation map: "g:<groupId>" or "c:<peerUid>".
 pub fn conv_key(chat_type: ChatType, talker: &str) -> String {
@@ -75,7 +75,7 @@ impl Store {
 /// Shared application state handed to the HTTP layer and poller tasks.
 pub struct AppState {
     pub store: Arc<RwLock<Store>>,
-    pub events: tokio::sync::broadcast::Sender<poller::Event>,
+    pub events: tokio::sync::broadcast::Sender<sync::Event>,
     /// One entry per loaded account: qq number -> readiness state.
     pub accounts: Arc<RwLock<Vec<crate::server::AccountState>>>,
     /// True once all account indexes are built.
@@ -84,5 +84,5 @@ pub struct AppState {
     pub token: Arc<String>,
     /// Per-account sync engines; powers the manual-sync endpoint and the
     /// change-driven poll tasks.
-    pub sync: Arc<poller::SyncEngine>,
+    pub sync: Arc<sync::SyncEngine>,
 }
