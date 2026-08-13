@@ -1,9 +1,10 @@
 //! GET|POST /api/v1/sync — manual sync.
 //!
-//! Immediately runs a full sync pass on every account (mirror refresh +
-//! incremental append, bypassing the change-detection poll loop) and
-//! returns the newly appended messages, newest first. Use this at client
-//! initialization or for a manual refresh to pull the most recent rows.
+//! Immediately runs a full sync pass on every account (incremental append
+//! against the live connection, bypassing the change-detection poll loop)
+//! and returns the newly appended messages, newest first. Use this at
+//! client initialization or for a manual refresh to pull the most recent
+//! rows.
 
 use std::sync::Arc;
 
@@ -46,8 +47,8 @@ pub async fn handler(
     }
     let limit = params.limit.clamp(1, 10000);
 
-    // The sync does blocking DB work (mirror copy, decrypt, query) — run it
-    // off the async runtime.
+    // The sync does blocking DB work (SQLCipher open on reconnect, query) —
+    // run it off the async runtime.
     let engine = state.sync.clone();
     let records = tokio::task::spawn_blocking(move || engine.sync_all())
         .await

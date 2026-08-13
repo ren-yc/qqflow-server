@@ -22,7 +22,6 @@
 //! data.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,12 +67,10 @@ fn resolve_inputs() -> Option<(String, String, String)> {
 /// Build an EMPTY app (client-driven startup: zero accounts, not ready)
 /// plus the resolved registration inputs. Returns None when no input
 /// source provides qq + key + db_path.
-fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, String, PathBuf)> {
+fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, String)> {
     let (qq, key, root) = resolve_inputs()?;
     println!("[CLIENT] account {qq} (db_path: {root})");
 
-    let mirror_dir =
-        std::env::temp_dir().join(format!("qqflow_downstream_mirror_{}", std::process::id()));
     let state = Arc::new(AppState {
         store: Arc::new(RwLock::new(qqflow_server::store::Store::default())),
         events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(1024).0,
@@ -83,13 +80,12 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
         sync: Arc::new(SyncEngine::new()),
         init: AccountRegistry::new(
             Vec::new(),
-            mirror_dir.clone(),
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
     });
     let app = build_router(state.clone());
-    Some((app, state, qq, root, key, mirror_dir))
+    Some((app, state, qq, root, key))
 }
 
 /// Poll /health until the account is ready; returns its indexed message count.
@@ -127,7 +123,7 @@ async fn client_post(
 #[tokio::test]
 #[ignore]
 async fn downstream_client_real_db() {
-    let Some((app, state, qq, root, key, mirror_dir)) = build_real_app() else {
+    let Some((app, state, qq, root, key)) = build_real_app() else {
         println!(
             "[CLIENT] SKIPPED: 无 ./qqflow-server.json 且环境变量未设置 \
              (QQFLOW_TEST_QQ / QQFLOW_TEST_DB_KEY / QQFLOW_TEST_DB_ROOT)"
@@ -417,6 +413,6 @@ async fn downstream_client_real_db() {
     );
     println!("[CLIENT] SSE connect: 200 text/event-stream");
 
-    let _ = std::fs::remove_dir_all(&mirror_dir);
+    // NOTE: nothing to clean up — the server no longer creates a mirror.
     println!("[CLIENT] all downstream-client checks passed");
 }

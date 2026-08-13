@@ -4,10 +4,9 @@
 # Build logs
 *.log
 
-# Local data (keys/token/mirror cache created at runtime)
+# Local data (keys/token created at runtime)
 keys.json
 token.txt
-/mirror
 
 # IDE / editor
 .idea/

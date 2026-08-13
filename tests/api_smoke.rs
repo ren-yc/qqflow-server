@@ -28,7 +28,6 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
         sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
         init: qqflow_server::server::AccountRegistry::new(
             Vec::new(),
-            std::env::temp_dir().join("qqflow_smoke_mirror"),
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),

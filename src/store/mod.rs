@@ -88,7 +88,7 @@ pub struct AppState {
     /// Per-account sync engines; powers the manual-sync endpoint and the
     /// change-driven poll tasks.
     pub sync: Arc<sync::SyncEngine>,
-    /// Client-driven account registry (paths, mirror root, watch config).
+    /// Client-driven account registry (paths, watch config, shutdown).
     pub init: crate::server::AccountRegistry,
 }
 

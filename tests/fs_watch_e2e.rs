@@ -1,14 +1,15 @@
 //! E2E: file-system events (notify) drive sync -> SSE broadcast.
 //!
-//! Rewrites the fake source `nt_msg.db` (simulating QQ writing new
-//! messages) and asserts the watch task triggers a sync whose SSE events
-//! arrive on the broadcast channel within a timeout window.
+//! A persistent fake-QQ writer appends a new message (into its WAL, like a
+//! running QQ client); the source pair is materialized in place and the
+//! watch task triggers a sync whose SSE events arrive on the broadcast
+//! channel within a timeout window. The reader is the production LIVE
+//! connection — no mirror, no copies.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use qqflow_server::db::mirror::Mirror;
-use qqflow_server::db::scan::DbInfo;
+use qqflow_server::db::live::LiveReader;
 use qqflow_server::sync::watch::{self, WatchConfig};
 use qqflow_server::sync::{AccountSync, Event};
 
@@ -19,15 +20,16 @@ use common::{FAKE_KEY, FAKE_QQ, write_fake_source};
 async fn watch_event_drives_sse_push() {
     let dir = std::env::temp_dir().join(format!("qqflow_watch_{}", std::process::id()));
     let nt_db = dir.join("nt_db");
-    let src = write_fake_source(&nt_db, 0); // standard 8-row dataset
+    // Persistent writer: new rows land in its WAL; materialize_source makes
+    // them visible to the live reader (in-place, like QQ's appends).
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0); // standard 8-row dataset
+    let src = nt_db.join("nt_msg.db");
 
-    let info = DbInfo { qq: FAKE_QQ.into(), path: src };
-    let mirror = Arc::new(parking_lot::Mutex::new(
-        Mirror::new(&info, &dir.join("mirror")).unwrap(),
-    ));
     let store = Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, mut rx) = tokio::sync::broadcast::channel::<Event>(64);
-    let account = Arc::new(AccountSync::new(mirror, FAKE_KEY.into(), store, tx));
+    let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src, FAKE_KEY.into())));
+    reader.lock().open().unwrap();
+    let account = Arc::new(AccountSync::new(reader, store, tx));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(watch::spawn(
@@ -43,9 +45,10 @@ async fn watch_event_drives_sse_push() {
     assert_eq!(account.poll_once().unwrap().len(), 8);
     while rx.try_recv().is_ok() {}
 
-    // Simulate QQ writing a new message: rewrite the source main file with
-    // one extra row (size change -> file event -> rebuild + append).
-    write_fake_source(&nt_db, 1);
+    // Simulate QQ writing a new message: append via the live writer, then
+    // refresh the source pair (WAL snapshot -> file event -> sync).
+    common::append_group_row(&writer, 7, "事件驱动新增-7");
+    common::materialize_source(&nt_db);
 
     let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -59,6 +62,7 @@ async fn watch_event_drives_sse_push() {
 
     shutdown_tx.send(true).ok();
     task.await.unwrap().unwrap();
+    drop(writer);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

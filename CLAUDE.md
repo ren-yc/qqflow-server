@@ -8,6 +8,16 @@ Headless HTTP API + SSE service that reads **local QQ NT chat records** (`nt_msg
 
 **Deliberately out of scope:** key extraction (keys come from external tools like `QQBackup/qq-win-db-key` and are supplied at runtime by clients via `POST /api/v1/accounts`), media export, SNS endpoints.
 
+## Privacy (隐私检查)
+
+**每次修改源代码或文档后必须检查隐私数据**：项目 hook（`.claude/settings.json` → `scripts/check-privacy.sh`）会在每次文件编辑后自动扫描，也可手动运行 `bash scripts/check-privacy.sh`。检查内容：gitignored 本地配置 `qqflow-server.json` 中的**真实 QQ 号与 SQLCipher 密钥**、本机路径（`D:\AppData`、`C:\Users\*`）与本机用户名是否泄露进仓库文件；任何命中必须修复后才能继续。
+
+**规则：**
+- 严禁把 `qqflow-server.json` 的真实值（qq / key / db_path）写入任何仓库文件——它们只存在于内存（`keystore`）与 gitignored 的本地配置
+- 代码、测试、文档一律使用虚构数据或占位符（`FAKE_QQ=335663881`、`FAKE_KEY=0123456789abcdef`、`<QQ号>`、`<16字节密钥>`）
+- 测试中的文件路径用虚构路径（如 `C:\SomeUser\nt_qq\nt_db\nt_msg.db`），绝不复制本机真实路径
+- 真实 token 只存在于 `<data-dir>/token.txt`（仓库外），启动日志只打印路径不打印值
+
 ## Commands
 
 All cargo invocations on Windows must go through the wrapper — the vendored OpenSSL build (openssl-src, via `rusqlite`'s `bundled-sqlcipher-vendored-openssl`) calls cl/link directly and needs the vcvars environment plus native Windows Perl. The wrapper locates `vcvars64.bat` via vswhere (`QQFLOW_VCVARS` env var overrides), prepends Strawberry Perl/nasm to PATH, and **rejects Git's MSYS perl** (it mangles paths in openssl Configure). Linux/macOS use `scripts/build.sh` (system perl + gcc/clang, no vcvars). Both pass through cargo args:
@@ -48,10 +58,12 @@ Default `127.0.0.1:5032` (same port as WeFlow). API token is auto-generated (32B
 ### Data pipeline
 
 ```
-nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
-  → db::mirror::Mirror   copies per-account into <data-dir>/mirror/<qq>/
-                         (header stripped from main.db; WAL copied verbatim)
-  → db::decrypt::open_decrypted
+nt_msg.db (QQ, SQLCipher + 1024B plaintext custom header + WAL)
+  → db::vfs::VFS_NAME ("qqflow-offset")
+                         custom SQLite VFS: reads the LIVE source file with
+                         every offset +1024 (header virtually stripped);
+                         WAL/-shm pass through unshifted (no prefix there)
+  → db::decrypt::open_live  READONLY long-lived connection to the source
                          SQLCipher PRAGMA suite (page_size=4096, kdf_iter=4000,
                          HMAC-SHA1, PBKDF2-SHA512, aes-256-cbc); retries with
                          HMAC-SHA512; verifies via sqlite_master
@@ -60,6 +72,13 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
                          reads + apply afterwards (two-phase, see below)
   → server (axum) + sync engine (watch task + tokio broadcast)
 ```
+
+WeFlow-style zero-copy: no mirror, no copies ever (the old `db::mirror` copied
+the whole ~1.2 GB main file on every SQLite checkpoint and the WAL on every
+poll). `cipher_plaintext_header_size` cannot do the offset — the btree magic
+check compares the decoded page-1 buffer while the codec copies the plaintext
+header in verbatim, and the KDF salt is always read at offset 0 — hence the
+VFS.
 
 ### The in-memory index (core design decision)
 
@@ -74,20 +93,20 @@ nt_msg.db (QQ, SQLCipher + 1024B header + WAL)
 
 ### Poller / real-time path
 
-File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`--watch-debounce-ms`, default 350 ms), then runs the full sync (`AccountSync::poll_once`). A slow fallback poll (`--watch-fallback-ms`, default 30 s) re-checks `Mirror::changed()` — two metadata stats, no IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated). The full sync:
-1. `Mirror::sync()` — re-copies the source WAL (cheap; if the source main file's size/mtime changed, SQLite checkpointed and the whole mirror is rebuilt).
-2. Reopens the decrypted connection, then reads per table with `index::read_new` (`rowid > watermark`, pure read — a failure in either table leaves the store untouched).
+File-system-event-driven (WeFlow-style): one watch task per account (`sync::watch::spawn`, tokio) watches the source `nt_db` directory via notify — ReadDirectoryChangesW on Windows, inotify on Linux, FSEvents on macOS — filters to `nt_msg.db`/`-wal`/`-shm`, debounces bursts (`--watch-debounce-ms`, default 350 ms), then runs the sync (`AccountSync::poll_once`). A slow fallback poll (`--watch-fallback-ms`, default 30 s) re-checks `AccountSync::changed()` — live-connection state, zero IO — as insurance against silently dropped watch events, and re-attaches a dead watcher (directory deleted/recreated; the source db may have been replaced under a dead watcher, so the reader is force-reopened). The sync pass is **zero file IO**:
+1. `LiveReader::acquire()` — the long-lived read-only connection to the LIVE source (via the offset VFS); reopens automatically when closed, cooldown-aware after fatal SQLite errors (`db::live`, WeFlow's forceReopen pattern).
+2. Reads per table with `index::read_new` (`rowid > watermark`, pure read — a failure in either table leaves the store untouched).
 3. Applies both tables under a single store write-lock (`index::apply_records` + watermark write-back) and emits `message.new` / `message.revoke` events on a tokio broadcast channel (capacity 1024); recall messages are detected by the parser (`MsgType::Recall`).
 
-Idle periods cost only the stat; a failed sync sets a retry flag so the next tick retries even with unchanged stats.
+Idle periods cost nothing; a failed sync sets a retry flag so the next tick retries; SQLite handles checkpoints transparently (the reader shares QQ's wal-index via `-shm`).
 
-**Manual sync**: the same per-account `AccountSync` (mirror behind `Arc<Mutex>`) is shared with `GET|POST /api/v1/sync`, which runs `SyncEngine::sync_all()` on demand and returns the newly appended records (newest first) — for client init / manual refresh. Concurrent poll/sync passes serialize on the mirror mutex and the store write lock.
+**Manual sync**: the same per-account `AccountSync` (live reader behind `Arc<Mutex>`) is shared with `GET|POST /api/v1/sync`, which runs `SyncEngine::sync_all()` on demand and returns the newly appended records (newest first) — for client init / manual refresh. Concurrent poll/sync passes serialize on the reader mutex and the store write lock.
 
 SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events; a fresh `sync` is also broadcast when an account's index build completes (clients connected during indexing start with a `(0,0)` baseline and are re-baselined by it), and broadcast lag re-syncs the client the same way. KeepAlive ping every 15 s. SSE has no ready gate — it serves 200 even while indexing.
 
 ### Startup sequence (`server::run_with`)
 
-Parse CLI args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → bind listener **early** so `/health` reports "starting" → list scanned accounts as `awaiting_key` (no build at startup) → wait for client registrations (`POST /api/v1/accounts`) → per account `server::init_account` (`spawn_blocking` mirror + decrypt + index; `install_index` broadcasts the SSE baseline; `AccountSync` registration + watch task) → recompute the global ready flag → wait for Ctrl-C → signal shutdown watch, remove mirror dir.
+Parse CLI args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → bind listener **early** so `/health` reports "starting" → list scanned accounts as `awaiting_key` (no build at startup) → wait for client registrations (`POST /api/v1/accounts`) → per account `server::init_account` (`spawn_blocking` live open + key verify + index; `install_index` broadcasts the SSE baseline; `AccountSync` registration + watch task) → recompute the global ready flag → wait for Ctrl-C → signal shutdown watch.
 
 ### Heuristic message parser (`parser`)
 
@@ -96,9 +115,9 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 ### Concurrency
 
 - `parking_lot::RwLock<Store>` shared via `Arc` — single lock for the whole store (sync engine writes, handlers read).
-- notify watcher threads bridge into the tokio watch task via an unbounded channel (`sync::watch`); watch/fallback/manual sync passes serialize on the mirror mutex and the store write lock.
-- tokio `broadcast` for SSE events; `watch` channel for shutdown; CPU-bound decrypt/scan work in `spawn_blocking`.
-- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState` with the `AccountStatus` enum, `awaiting_key`/`indexing`/`ready`/`error`), a global `ready` AtomicBool, the token, and the `AccountRegistry` (scanned/registered `DbInfo`s, mirror root, watch config, shutdown receiver).
+- notify watcher threads bridge into the tokio watch task via an unbounded channel (`sync::watch`); watch/fallback/manual sync passes serialize on the reader mutex and the store write lock.
+- tokio `broadcast` for SSE events; `watch` channel for shutdown; CPU-bound decrypt/scan work in `spawn_blocking`; `rusqlite::Connection` is `Send + !Sync` — owned by `LiveReader` behind `Arc<Mutex<LiveReader>>`, used only inside the lock.
+- `AppState` (in `store`) holds: store, broadcast sender, per-account readiness (`server::AccountState` with the `AccountStatus` enum, `awaiting_key`/`indexing`/`ready`/`error`), a global `ready` AtomicBool, the token, and the `AccountRegistry` (scanned/registered `DbInfo`s, watch config, shutdown receiver).
 - Auth: Bearer header / `?access_token=` (recommended for SSE) / POST JSON body, constant-time comparison (`config::constant_time_eq`). `/health` and `POST /api/v1/accounts` are the only non-readiness-gated endpoints (accounts is the bootstrap path).
 
 ## Known issues
@@ -113,13 +132,12 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 
 ## Tests
 
-- `tests/sqlcipher_roundtrip.rs` — self-built SQLCipher test database with QQ's exact PRAGMA parameters + fake 1024-byte header + WAL. Proves: decryption round-trip, WAL-only writes visible through the mirror (real-time polling path), checkpoint-triggered mirror rebuild, wrong-key failure. **Never touches real QQ data.**
+- `tests/sqlcipher_roundtrip.rs` — self-built SQLCipher test database with QQ's exact PRAGMA parameters + fake 1024-byte header + WAL. Proves: **direct live read of the header-prefixed file through the offset VFS** (the arbitration test), WAL-only writes visible to the still-open reader, checkpoint survived by the same reader without reopening, cold reopen, wrong-key failure. **Never touches real QQ data.** (The fake writer's WAL and wal-index are hard-linked to the `nt_msg.*` names the reader opens — production shares QQ's live files the same way.)
 - `tests/api_smoke.rs` — HTTP layer contract tests via `tower::ServiceExt::oneshot` (no network, no real DB); builds a fake `AppState` with seeded conversations.
-- `tests/fs_watch_e2e.rs` — file-system event → sync → SSE broadcast e2e (fake DB).
-- `tests/real_db_groundtruth.rs` — fake-DB regression tests + client-registration e2e (wrong key → `error` → corrected key → `ready`); the `real_db_groundtruth` probe (`#[ignore]`) runs ground-truth queries against a real QQ DB via `QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY`.
+- `tests/fs_watch_e2e.rs` — file-system event → sync → SSE broadcast e2e (fake DB with a persistent writer).
+- `tests/real_db_groundtruth.rs` — fake-DB regression tests + client-registration e2e (wrong key → `error` → corrected key → `ready`); the `real_db_groundtruth` probe (`#[ignore]`) runs ground-truth queries against a REAL QQ DB via the live reader (`QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY`) — it arbitrates the offset VFS against the real on-disk layout.
 - `tests/downstream_client.rs` — downstream-client GET/POST simulation against a real QQ DB, including client-driven registration (`#[ignore]`; inputs resolve from the gitignored repo-root `qqflow-server.json` (`qq`/`key`/`db_path`) first, then `QQFLOW_TEST_QQ` / `QQFLOW_TEST_DB_KEY` / `QQFLOW_TEST_DB_ROOT` env vars).
-- Unit tests live inline in modules (`parser`, `keystore`, `decrypt`, `mirror`).
-- Note for `sqlcipher_roundtrip`: the mirror's reader connection must be dropped before the mirror is rebuilt underneath it.
+- Unit tests live inline in modules (`parser`, `keystore`, `decrypt`, `vfs`, `live`).
 
 ## External references
 

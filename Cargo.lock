@@ -733,6 +733,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures-util",
+ "libsqlite3-sys",
  "notify",
  "notify-debouncer-mini",
  "parking_lot",

@@ -2,8 +2,10 @@
 //!
 //! New messages are detected by watching the source `nt_db` directory with
 //! notify (see `watch`): ReadDirectoryChangesW / inotify / FSEvents events
-//! are debounced and trigger a full sync (mirror refresh + decrypt +
-//! incremental append + SSE broadcast). A slow fallback poll guards against
+//! are debounced and trigger a sync pass (incremental append + SSE
+//! broadcast). The pass is a zero-file-IO indexed query against the
+//! long-lived read-only connection to the LIVE source database (WeFlow
+//! style — no mirror, no copies). A slow fallback poll guards against
 //! silently dropped watch events and re-attaches a dead watcher.
 //!
 //! The same per-account `AccountSync` is shared with the manual sync
@@ -22,61 +24,57 @@ use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 
-use crate::db::decrypt;
-use crate::db::mirror::Mirror;
+use crate::db::live::LiveReader;
 use crate::parser::types::{ChatType, MessageRecord, MsgType};
 use crate::store::index;
 use crate::store::Store;
 
 pub use events::Event;
 
-/// One account's sync machinery: the mirror (mutex-guarded so the manual
-/// sync endpoint and the poll loop can share it) plus everything needed to
-/// run a full sync pass.
+/// One account's sync machinery: the live reader (mutex-guarded so the
+/// manual sync endpoint and the poll loop can share it) plus everything
+/// needed to run a sync pass.
 pub struct AccountSync {
-    pub mirror: Arc<Mutex<Mirror>>,
-    pub key: String,
+    pub reader: Arc<Mutex<LiveReader>>,
     pub store: Arc<RwLock<Store>>,
     pub tx: broadcast::Sender<Event>,
     /// Set when a sync failed; the poll loop then retries even though the
-    /// file stats are unchanged.
+    /// reader state is unchanged.
     retry: AtomicBool,
 }
 
 impl AccountSync {
     pub fn new(
-        mirror: Arc<Mutex<Mirror>>,
-        key: String,
+        reader: Arc<Mutex<LiveReader>>,
         store: Arc<RwLock<Store>>,
         tx: broadcast::Sender<Event>,
     ) -> Self {
-        Self { mirror, key, store, tx, retry: AtomicBool::new(false) }
+        Self { reader, store, tx, retry: AtomicBool::new(false) }
     }
 
-    /// Cheap change detection (two stats). Always true right after a
-    /// failed sync (retry flag).
+    /// Cheap change detection (no file IO): true right after a failed sync
+    /// (retry flag) or while the live connection is closed (QQ not running
+    /// yet — reopen on the next poll).
     pub fn changed(&self) -> bool {
-        self.retry.swap(false, Ordering::SeqCst) || self.mirror.lock().changed()
+        self.retry.swap(false, Ordering::SeqCst) || !self.reader.lock().is_open()
     }
 
-    /// One full sync pass: refresh the mirror, append rows above the
-    /// watermark, broadcast SSE events, and return the appended records.
-    /// Safe to call concurrently — the mirror mutex and the store write
+    /// One sync pass: read rows above the watermark from the LIVE source,
+    /// append them, broadcast SSE events, and return the appended records.
+    /// Safe to call concurrently — the reader mutex and the store write
     /// lock serialize overlapping passes (the second one finds nothing new).
     pub fn poll_once(&self) -> Result<Vec<MessageRecord>> {
-        let mut mirror = self.mirror.lock();
-        match self.poll_locked(&mut mirror) {
-            Ok(records) => Ok(records),
-            Err(e) => {
-                self.retry.store(true, Ordering::SeqCst);
-                Err(e)
-            }
+        let mut reader = self.reader.lock();
+        let result = self.poll_locked(&mut reader);
+        if let Err(e) = &result {
+            classify(&mut reader, e);
+            self.retry.store(true, Ordering::SeqCst);
         }
+        result
     }
 
-    fn poll_locked(&self, mirror: &mut Mirror) -> Result<Vec<MessageRecord>> {
-        mirror.sync()?;
-        let conn = decrypt::open_decrypted(&mirror.main_path, &self.key)?;
+    fn poll_locked(&self, reader: &mut LiveReader) -> Result<Vec<MessageRecord>> {
+        let conn = reader.acquire()?;
 
         // Read phase: parse rows above the watermark without touching the
         // store. If either table's read fails, nothing has been applied —
@@ -85,8 +83,8 @@ impl AccountSync {
             let guard = self.store.read();
             (guard.watermark_group, guard.watermark_c2c)
         };
-        let (new_wm_g, new_g) = index::read_new(&conn, ChatType::Group, wm_g)?;
-        let (new_wm_c, new_c) = index::read_new(&conn, ChatType::C2c, wm_c)?;
+        let (new_wm_g, new_g) = index::read_new(conn, ChatType::Group, wm_g)?;
+        let (new_wm_c, new_c) = index::read_new(conn, ChatType::C2c, wm_c)?;
 
         // Apply phase: one write-lock critical section — append both tables,
         // advance both watermarks, and build the SSE events.
@@ -134,6 +132,28 @@ impl AccountSync {
         let mut all = new_g;
         all.extend(new_c);
         Ok(all)
+    }
+}
+
+/// Classify a poll error: fatal SQLite codes (CORRUPT / NOTADB / IOERR —
+/// e.g. the source db was recreated underneath us) drop the connection and
+/// arm the reopen cooldown; transient errors (BUSY, CANTOPEN) are left to
+/// the retry flag and the next event/fallback tick.
+fn classify(reader: &mut LiveReader, err: &anyhow::Error) {
+    let fatal = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(ffi_err, _))
+                if matches!(
+                    ffi_err.code,
+                    rusqlite::ffi::ErrorCode::DatabaseCorrupt
+                        | rusqlite::ffi::ErrorCode::NotADatabase
+                        | rusqlite::ffi::ErrorCode::SystemIoFailure
+                )
+        )
+    });
+    if fatal {
+        reader.mark_fatal(err);
     }
 }
 

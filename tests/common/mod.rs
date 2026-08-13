@@ -42,75 +42,141 @@ pub fn make_schema(conn: &Connection) {
     .unwrap();
 }
 
-/// Write a fresh fake source DB into `nt_db_dir` (created if needed) and
-/// return the path to `nt_msg.db`. The DB is regenerated from scratch on
-/// every call, so re-running with a different `extra` simulates QQ writing
-/// new messages (file size changes -> watcher/checkpoint detection).
-pub fn write_fake_source(nt_db_dir: &Path, extra: u32) -> std::path::PathBuf {
+/// Open a persistent fake-QQ writer on `raw.db` (headerless SQLCipher,
+/// WAL mode, schema seeded). Keep the connection alive — rows then land in
+/// `raw.db-wal` only, exactly like a running QQ client writing live.
+pub fn open_fake_writer(nt_db_dir: &Path) -> (Connection, std::path::PathBuf) {
     std::fs::create_dir_all(nt_db_dir).unwrap();
     let raw = nt_db_dir.join("raw.db");
-    let _ = std::fs::remove_file(&raw);
-    {
-        let conn = Connection::open(&raw).unwrap();
-        conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
-        conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
-        make_schema(&conn);
+    // Clean slate: also drop any nt_msg.* leftovers (stale hard links to
+    // dead WAL/shm inodes from a previous test run would break the salt
+    // check). No reader is alive when a fixture is (re)built.
+    for name in [
+        "raw.db",
+        "raw.db-wal",
+        "raw.db-shm",
+        "nt_msg.db",
+        "nt_msg.db-wal",
+        "nt_msg.db-shm",
+    ] {
+        let _ = std::fs::remove_file(nt_db_dir.join(name));
+    }
+    let conn = Connection::open(&raw).unwrap();
+    conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
+    conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+    make_schema(&conn);
+    (conn, raw)
+}
 
-        // Groups: normal text, recall, system (群名修改), large media blob, miniapp JSON.
-        let g = |rowid: i64, group: &str, seq: i64, uid: &str, nick: &str, blob: &[u8]| {
-            conn.execute(
-                "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![group, seq, uid, nick, blob],
-            )
-            .unwrap();
-            assert_eq!(rowid, conn.last_insert_rowid());
-        };
-        // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 1782864000)
-        let ts: i64 = 1782864000;
-        g(1, "10001", (ts << 32) | 1, "u_a", "张三", "你好，欢迎加入".as_bytes());
-        g(2, "10001", (ts << 32) | 2, "u_b", "李四", "收到".as_bytes());
-        g(3, "10001", (ts << 32) | 3, "u_a", "张三", "李四撤回了一条消息\n你猜猜撤回了什么".as_bytes());
-        g(4, "10001", (ts << 32) | 4, "u_b", "李四", "群主已将群名修改为「测试群」".as_bytes());
-        let mut media = vec![0u8; 70_000];
-        media[5000..5008].copy_from_slice(b".jpg.exe");
-        g(5, "10001", (ts << 32) | 5, "u_c", "王五", &media);
-        g(6, "20002", (ts << 32) | 1, "u_a", "张三",
-            "{\"appID\":\"x\",\"prompt\":\"分享一个链接\",\"desc\":\"有趣内容\",\"title\":\"标题\"}".as_bytes());
+/// Seed the standard dataset: 6 group rows (normal text, recall, system
+/// 群名修改, large media blob, miniapp JSON) + 2 c2c rows, plus `extra`
+/// plain group rows.
+pub fn seed_dataset(conn: &Connection, extra: u32) {
+    // Groups: normal text, recall, system (群名修改), large media blob, miniapp JSON.
+    let g = |rowid: i64, group: &str, seq: i64, uid: &str, nick: &str, blob: &[u8]| {
         conn.execute(
-            "INSERT INTO c2c_msg_table VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["u_12345", (ts << 32) | 1, "王五", "在吗？".as_bytes()],
+            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![group, seq, uid, nick, blob],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO c2c_msg_table VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["u_12345", (ts << 32) | 2, "王五", "明天见".as_bytes()],
-        )
-        .unwrap();
+        assert_eq!(rowid, conn.last_insert_rowid());
+    };
+    // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 1782864000)
+    let ts: i64 = 1782864000;
+    g(1, "10001", (ts << 32) | 1, "u_a", "张三", "你好，欢迎加入".as_bytes());
+    g(2, "10001", (ts << 32) | 2, "u_b", "李四", "收到".as_bytes());
+    g(3, "10001", (ts << 32) | 3, "u_a", "张三", "李四撤回了一条消息\n你猜猜撤回了什么".as_bytes());
+    g(4, "10001", (ts << 32) | 4, "u_b", "李四", "群主已将群名修改为「测试群」".as_bytes());
+    let mut media = vec![0u8; 70_000];
+    media[5000..5008].copy_from_slice(b".jpg.exe");
+    g(5, "10001", (ts << 32) | 5, "u_c", "王五", &media);
+    g(6, "20002", (ts << 32) | 1, "u_a", "张三",
+        "{\"appID\":\"x\",\"prompt\":\"分享一个链接\",\"desc\":\"有趣内容\",\"title\":\"标题\"}".as_bytes());
+    conn.execute(
+        "INSERT INTO c2c_msg_table VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["u_12345", (ts << 32) | 1, "王五", "在吗？".as_bytes()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO c2c_msg_table VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params!["u_12345", (ts << 32) | 2, "王五", "明天见".as_bytes()],
+    )
+    .unwrap();
 
-        for i in 0..extra {
-            let n = 7 + i as i64;
-            conn.execute(
-                "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params!["10001", (ts << 32) | n, "u_a", "张三", format!("事件驱动新增-{n}").as_bytes()],
-            )
-            .unwrap();
-        }
-    } // writer dropped -> WAL auto-checkpointed
+    for i in 0..extra {
+        append_group_row(conn, 7 + i as i64, &format!("事件驱动新增-{}", 7 + i));
+    }
+}
 
+/// Append one group row into group 10001 (simulating a new QQ message
+/// written by the live client).
+pub fn append_group_row(conn: &Connection, n: i64, text: &str) {
+    let ts: i64 = 1782864000;
+    conn.execute(
+        "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params!["10001", (ts << 32) | n, "u_a", "张三", text.as_bytes()],
+    )
+    .unwrap();
+}
+
+/// Materialize the writer's current state as a real QQ-style file pair:
+/// `nt_msg.db` = raw.db + 1024-byte fake header (snapshot, rewritten in
+/// place); `nt_msg.db-wal` and `nt_msg.db-shm` = HARD LINKS to the writer's
+/// LIVE files. Sharing the live WAL + wal-index is exactly what production
+/// does (our reader shares QQ's files), so a still-open reader sees appended
+/// frames and checkpoint resets without reopening.
+///
+/// A copied -shm would not work: it would be a stale index (the reader
+/// caches mxFrame) and, on Windows, a mapped section (the writer's -shm)
+/// cannot be re-opened by a second handle anyway (ERROR_USER_MAPPED_FILE).
+/// Returns the `nt_msg.db` path.
+pub fn materialize_source(nt_db_dir: &Path) -> std::path::PathBuf {
+    let raw = nt_db_dir.join("raw.db");
     let main = nt_db_dir.join("nt_msg.db");
     let mut bytes = std::fs::read(&raw).unwrap();
     let mut all = vec![0u8; CUSTOM_HEADER_LEN as usize];
     all[0..8].copy_from_slice(b"QQNTDB!1");
     all.append(&mut bytes);
     std::fs::write(&main, all).unwrap();
-    let _ = std::fs::remove_file(&raw);
-    // Copy the WAL if the writer left one behind.
-    let raw_wal = nt_db_dir.join("raw.db-wal");
-    if raw_wal.exists() {
-        std::fs::copy(&raw_wal, nt_db_dir.join("nt_msg.db-wal")).unwrap();
-        let _ = std::fs::remove_file(&raw_wal);
+
+    for ext in ["db-wal", "db-shm"] {
+        let raw_side = raw.with_extension(ext);
+        let side = nt_db_dir.join(format!("nt_msg.{ext}"));
+        if side.exists() {
+            // Already hard-linked: while the writer stays alive its WAL and
+            // wal-index keep the same inode (appends/checkpoints are in
+            // place), so the existing link stays valid — and a reader may
+            // have it open/mapped, so removing it would fail on Windows
+            // (ERROR_USER_MAPPED_FILE).
+            continue;
+        }
+        if raw_side.exists() {
+            std::fs::hard_link(&raw_side, &side).unwrap();
+        }
     }
     main
+}
+
+/// Write a fresh fake source DB into `nt_db_dir` (created if needed) and
+/// return the path to `nt_msg.db`. The DB is regenerated from scratch on
+/// every call (writer dropped -> WAL auto-checkpointed into the main file),
+/// so re-running with a different `extra` simulates QQ writing new
+/// messages (file size changes -> watcher/checkpoint detection).
+pub fn write_fake_source(nt_db_dir: &Path, extra: u32) -> std::path::PathBuf {
+    let (conn, _raw) = open_fake_writer(nt_db_dir);
+    seed_dataset(&conn, extra);
+    drop(conn); // writer dropped -> WAL auto-checkpointed
+    materialize_source(nt_db_dir)
+}
+
+/// Persistent-writer variant: the writer stays alive (rows land in its WAL)
+/// and the source pair is materialized. Call `materialize_source` after
+/// each writer op so a live reader sees the change.
+pub fn open_fake_source(nt_db_dir: &Path, extra: u32) -> (Connection, std::path::PathBuf) {
+    let (conn, _raw) = open_fake_writer(nt_db_dir);
+    seed_dataset(&conn, extra);
+    let main = materialize_source(nt_db_dir);
+    (conn, main)
 }
 
 // ---- HTTP layer helpers (axum oneshot) ---------------------------------

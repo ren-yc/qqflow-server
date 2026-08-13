@@ -9,10 +9,10 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - 默认监听地址：`127.0.0.1`
 - 默认端口：`5032`
 - 基础地址：`http://127.0.0.1:5032`
-- **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台完成镜像、解密与索引构建（见 §1.1）
+- **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台以只读直连方式打开源库（偏移 VFS 虚拟剥离自定义头）、解密并构建索引（见 §1.1）
 - API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到 `<data-dir>/token.txt`（启动日志仅打印保存路径，不打印 token 值）
 - 索引就绪前（存在 `awaiting_key` / `indexing` / `error` 账号时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts` 不检查就绪状态，可随时调用
-- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（镜像刷新 + 增量读取），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
+- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
 ## 鉴权规范
 
@@ -82,7 +82,7 @@ GET /api/v1/health
 
 ## 1.1 注册账号（POST /api/v1/accounts）
 
-客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台完成镜像 + 解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（三通道）；**不受就绪门控**。
+客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（三通道）；**不受就绪门控**。
 
 **请求**
 
@@ -482,7 +482,7 @@ GET /api/v1/group-members
 
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
-立即对所有账号执行一次完整同步（镜像刷新 + 增量读取，**绕过后台 stat 检测循环**），并返回本次新增的最近若干条消息。客户端初始化或手动刷新时调用，用于主动拉取最新消息；新增消息同时也会广播给 SSE 订阅端。
+立即对所有账号执行一次完整同步（直连活库的增量读取，**绕过后台变化检测循环**），并返回本次新增的最近若干条消息。客户端初始化或手动刷新时调用，用于主动拉取最新消息；新增消息同时也会广播给 SSE 订阅端。
 
 **请求**
 

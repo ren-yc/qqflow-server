@@ -22,11 +22,12 @@ pub struct Config {
     /// burst to quiet down before triggering a sync (WeFlow-aligned; with
     /// batch mode the worst-case delay is about 2x this value).
     pub watch_debounce_ms: u64,
-    /// Slow fallback poll (ms): `Mirror::changed()` (zero-IO stats) as a
-    /// safety net against file-watch events being silently lost (inotify /
-    /// ReadDirectoryChangesW buffer overflow). 0 = disabled (not
-    /// recommended: missed events would never recover). The watcher
-    /// re-attach retry (every 10 s) is independent of this setting.
+    /// Slow fallback poll (ms): `AccountSync::changed()` (live-connection
+    /// state, zero IO) as a safety net against file-watch events being
+    /// silently lost (inotify / ReadDirectoryChangesW buffer overflow).
+    /// 0 = disabled (not recommended: missed events would never recover).
+    /// The watcher re-attach retry (every 10 s) is independent of this
+    /// setting.
     pub watch_fallback_ms: u64,
 }
 

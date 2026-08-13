@@ -8,9 +8,10 @@
 //!
 //! Run: powershell -File scripts\build.ps1 test --test real_db_groundtruth -- --ignored --nocapture
 //!
-//! Everything goes through the SAME pipeline the server uses (Mirror +
-//! decrypt::open_decrypted), so "opens at all" doubles as the arbitration
-//! experiment for the PRAGMA-order question vs the reference implementation.
+//! Everything goes through the SAME pipeline the server uses
+//! (`db::live::LiveReader` — the offset VFS + read-only live connection),
+//! so "opens at all" doubles as the arbitration experiment for the offset
+//! VFS against the real file layout.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -19,8 +20,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use qqflow_server::db::decrypt;
-use qqflow_server::db::mirror::Mirror;
+use qqflow_server::db::live::LiveReader;
 use qqflow_server::db::scan;
 use qqflow_server::parser::types::{seq_to_time, ChatType};
 use qqflow_server::server::{build_router, AccountRegistry, AccountState, AccountStatus};
@@ -53,25 +53,24 @@ fn build_fake_db() -> std::path::PathBuf {
 /// (integration tests run in parallel threads of one process).
 static FAKE_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Verify the fake DB is readable through the server's pipeline (mirror +
-/// decrypt + direct row counts). The behavioral-repro runbook depends on it.
+/// Verify the fake DB is readable through the server's pipeline (live
+/// reader + direct row counts). The behavioral-repro runbook depends on it.
 #[test]
 fn fake_db_for_behavioral_repro() {
     let _guard = FAKE_DB_LOCK.lock().unwrap();
     let path = build_fake_db();
-    let info = scan::DbInfo { qq: FAKE_QQ.into(), path: path.clone() };
-    let mirror_dir = std::env::temp_dir().join("qqflow_fake_mirror");
-    let mirror = Mirror::new(&info, &mirror_dir).unwrap();
-    let conn = decrypt::open_decrypted(&mirror.main_path, FAKE_KEY).unwrap();
+    let mut reader = LiveReader::new(path.clone(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM group_msg_table", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n, 6, "fake group rows readable through the real pipeline");
+    assert_eq!(n, 6, "fake group rows readable through the live pipeline");
     let n: i64 = conn
         .query_row("SELECT count(*) FROM c2c_msg_table", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(n, 2, "fake c2c rows readable through the real pipeline");
-    let _ = std::fs::remove_dir_all(&mirror_dir);
+    assert_eq!(n, 2, "fake c2c rows readable through the live pipeline");
+    drop(reader);
 
     println!("[GT] fake db ready at {} (key={FAKE_KEY}, qq={FAKE_QQ})", path.display());
 }
@@ -84,12 +83,11 @@ fn fake_db_for_behavioral_repro() {
 fn fake_db_indexes_c2c_rows() {
     let _guard = FAKE_DB_LOCK.lock().unwrap();
     let path = build_fake_db();
-    let info = scan::DbInfo { qq: FAKE_QQ.into(), path };
-    let mirror_dir = std::env::temp_dir().join("qqflow_fake_mirror");
-    let mirror = Mirror::new(&info, &mirror_dir).unwrap();
-    let conn = decrypt::open_decrypted(&mirror.main_path, FAKE_KEY).unwrap();
-    let store = qqflow_server::store::index::build_index(&conn).unwrap();
-    let _ = std::fs::remove_dir_all(&mirror_dir);
+    let mut reader = LiveReader::new(path, FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    drop(reader);
 
     println!(
         "[GT] build_index: groupWatermark={} c2cWatermark={} convs={}",
@@ -111,14 +109,16 @@ fn fake_db_indexes_c2c_rows() {
 #[test]
 fn manual_sync_picks_up_new_rows() {
     let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let path = build_fake_db();
-    let info = scan::DbInfo { qq: FAKE_QQ.into(), path };
-    let mirror_dir = std::env::temp_dir().join("qqflow_fake_mirror");
-    let mirror = Mirror::new(&info, &mirror_dir).unwrap();
-    let mirror = std::sync::Arc::new(parking_lot::Mutex::new(mirror));
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let path = fake_db_path();
+    let reader = std::sync::Arc::new(parking_lot::Mutex::new(
+        LiveReader::new(path, FAKE_KEY.into()),
+    ));
+    reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
-    let account = qqflow_server::sync::AccountSync::new(mirror.clone(), FAKE_KEY.into(), store, tx);
+    let account = qqflow_server::sync::AccountSync::new(reader, store, tx);
 
     let first = account.poll_once().unwrap();
     assert_eq!(first.len(), 8, "initial poll returns all rows (6 group + 2 c2c)");
@@ -126,17 +126,10 @@ fn manual_sync_picks_up_new_rows() {
     // batch of events so try_recv below sees only the new row's event.
     while rx.try_recv().is_ok() {}
 
-    // Append a new group row directly into the mirror DB (simulates QQ
-    // writing a new message between polls).
-    {
-        let conn = decrypt::open_decrypted(&mirror.lock().main_path, FAKE_KEY).unwrap();
-        let ts: i64 = 1782864000;
-        conn.execute(
-            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["10001", (ts << 32) | 7, "u_a", "张三", "手动同步新增".as_bytes()],
-        )
-        .unwrap();
-    }
+    // Append a new group row via the live writer (simulates QQ writing a
+    // new message between polls) and materialize the source pair.
+    common::append_group_row(&writer, 7, "手动同步新增");
+    common::materialize_source(&nt_db);
 
     let second = account.poll_once().unwrap();
     assert_eq!(second.len(), 1, "second poll returns only the new row");
@@ -147,7 +140,7 @@ fn manual_sync_picks_up_new_rows() {
     assert_eq!(ev.event, "message.new");
     assert_eq!(ev.content, "手动同步新增");
 
-    let _ = std::fs::remove_dir_all(&mirror_dir);
+    drop(writer);
 }
 
 /// Regression: the sync read phase must not mutate the store. When the c2c
@@ -157,21 +150,21 @@ fn manual_sync_picks_up_new_rows() {
 #[test]
 fn failed_sync_leaves_store_untouched() {
     let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let path = build_fake_db();
-    let info = scan::DbInfo { qq: FAKE_QQ.into(), path };
-    let mirror_dir = std::env::temp_dir().join("qqflow_fake_mirror_fail");
-    let mirror = Mirror::new(&info, &mirror_dir).unwrap();
-    let mirror = std::sync::Arc::new(parking_lot::Mutex::new(mirror));
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let reader = std::sync::Arc::new(parking_lot::Mutex::new(
+        LiveReader::new(fake_db_path(), FAKE_KEY.into()),
+    ));
+    reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, _rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
-    let account = qqflow_server::sync::AccountSync::new(mirror.clone(), FAKE_KEY.into(), store.clone(), tx);
+    let account = qqflow_server::sync::AccountSync::new(reader, store.clone(), tx);
 
-    // Break the c2c read by renaming its table away.
-    {
-        let conn = decrypt::open_decrypted(&mirror.lock().main_path, FAKE_KEY).unwrap();
-        conn.execute_batch("ALTER TABLE c2c_msg_table RENAME TO c2c_broken;")
-            .unwrap();
-    }
+    // Break the c2c read by renaming its table away (via the live writer,
+    // then materialize so the reader's next query hits the broken schema).
+    writer.execute_batch("ALTER TABLE c2c_msg_table RENAME TO c2c_broken;")
+        .unwrap();
+    common::materialize_source(&nt_db);
     let err = account.poll_once().unwrap_err();
     println!("[GT] expected sync failure: {err:#}");
     {
@@ -181,11 +174,9 @@ fn failed_sync_leaves_store_untouched() {
     }
 
     // Repair and retry: every row arrives exactly once.
-    {
-        let conn = decrypt::open_decrypted(&mirror.lock().main_path, FAKE_KEY).unwrap();
-        conn.execute_batch("ALTER TABLE c2c_broken RENAME TO c2c_msg_table;")
-            .unwrap();
-    }
+    writer.execute_batch("ALTER TABLE c2c_broken RENAME TO c2c_msg_table;")
+        .unwrap();
+    common::materialize_source(&nt_db);
     let records = account.poll_once().unwrap();
     assert_eq!(records.len(), 8, "retry returns all rows (6 group + 2 c2c)");
     let g = store.read();
@@ -203,7 +194,7 @@ fn failed_sync_leaves_store_untouched() {
         .expect("c2c conversation exists");
     assert_eq!(c2c.msgs.len(), 2, "c2c rows applied exactly once");
 
-    let _ = std::fs::remove_dir_all(&mirror_dir);
+    drop(writer);
 }
 
 /// Client-driven registration e2e: `POST /api/v1/accounts` with qq + key +
@@ -219,7 +210,6 @@ async fn client_registers_account_with_key_and_db_path() {
     let path = build_fake_db();
     let db_path = path.to_string_lossy().to_string();
 
-    let mirror_dir = std::env::temp_dir().join("qqflow_registry_mirror");
     let state = Arc::new(AppState {
         store: Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default())),
         events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(64).0,
@@ -234,7 +224,6 @@ async fn client_registers_account_with_key_and_db_path() {
         sync: Arc::new(SyncEngine::new()),
         init: AccountRegistry::new(
             Vec::new(),
-            mirror_dir.clone(),
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
@@ -290,8 +279,6 @@ async fn client_registers_account_with_key_and_db_path() {
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["success"], true);
     assert_eq!(v["messages"].as_array().unwrap().len(), 5, "group 10001 has 5 rows");
-
-    let _ = std::fs::remove_dir_all(&mirror_dir);
 }
 
 /// Ground truth over a REAL QQ database. Ignored by default; requires
@@ -320,10 +307,14 @@ fn real_db_groundtruth() {
     for info in &accounts {
         let now_ts = chrono::Utc::now().timestamp();
         let t0 = std::time::Instant::now();
-        let mirror_dir = std::env::temp_dir().join("qqflow_gt_mirror").join(&info.qq);
-        let mirror = Mirror::new(info, &mirror_dir).unwrap();
-        let conn = decrypt::open_decrypted(&mirror.main_path, &key)
-            .expect("real DB must open with the PRAGMA suite (arbitrates PRAGMA order)");
+        // The LIVE read-only open through the offset VFS — arbitrates the
+        // whole no-copy design against the real on-disk layout while a
+        // real QQ client may hold the database.
+        let mut reader = LiveReader::new(info.path.clone(), key.clone());
+        reader
+            .open()
+            .expect("real DB must open read-only through the offset VFS (arbitrates the VFS)");
+        let conn = reader.acquire().unwrap();
 
         for (table, id_col) in [("group_msg_table", "40021"), ("c2c_msg_table", "40020")] {
             let (cnt, max_rowid): (i64, i64) = conn
@@ -457,8 +448,7 @@ fn real_db_groundtruth() {
         }
         println!("[GT] totalTables={}", tables.len());
 
-        drop(conn);
-        let _ = std::fs::remove_dir_all(&mirror_dir);
-        println!("[GT] qq {} done: mirror+open+queries {:.1}s", info.qq, t0.elapsed().as_secs_f64());
+        drop(reader);
+        println!("[GT] qq {} done: live open+queries {:.1}s", info.qq, t0.elapsed().as_secs_f64());
     }
 }

@@ -7,9 +7,10 @@
 //! `POST /api/v1/sync` endpoint) so new messages flow to SSE subscribers.
 //!
 //! Reliability: file-watch backends can silently drop events on buffer
-//! overflow, so a slow fallback poll (default 30 s) re-checks the source
-//! files with zero-IO stats and also re-attaches a dead watcher (directory
-//! deleted/recreated by a QQ reinstall).
+//! overflow, so a slow fallback poll (default 30 s) re-runs the sync when
+//! the live connection is closed (zero IO — `AccountSync::changed`) and
+//! also re-attaches a dead watcher (directory deleted/recreated by a QQ
+//! reinstall).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -106,6 +107,10 @@ pub async fn spawn(
             _ = iv.tick() => {
                 if watcher.is_none() {
                     watcher = rebuild_watcher(&tx, &watch_dir, cfg.debounce);
+                    // The source db may have been replaced under a dead
+                    // watcher (QQ reinstall): force a fresh handle so the
+                    // next poll skips the stale-handle CORRUPT cooldown.
+                    account.reader.lock().force_reopen();
                 }
                 if cfg.fallback.is_some() && account.changed() {
                     sync_once(account.clone()).await;
@@ -117,8 +122,8 @@ pub async fn spawn(
 }
 
 async fn sync_once(account: Arc<AccountSync>) {
-    // poll_once does blocking IO (WAL copy + SQLCipher open) — run it on
-    // the blocking pool; the mirror mutex + store write lock serialize
+    // poll_once may do blocking IO (SQLCipher open on reconnect) — run it
+    // on the blocking pool; the reader mutex + store write lock serialize
     // overlapping passes.
     match tokio::task::spawn_blocking(move || account.poll_once()).await {
         Ok(Ok(_)) => {}

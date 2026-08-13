@@ -5,7 +5,6 @@ pub mod auth;
 pub mod error;
 pub mod handlers;
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -18,7 +17,7 @@ use tokio::sync::broadcast;
 
 use crate::config;
 use crate::db;
-use crate::db::mirror::Mirror;
+use crate::db::live::LiveReader;
 use crate::db::scan::DbInfo;
 use crate::sync;
 use crate::sync::Event;
@@ -31,7 +30,7 @@ use crate::store::{AppState, Store};
 pub enum AccountStatus {
     /// Scanned at startup, no key registered yet.
     AwaitingKey,
-    /// Background build running (mirror + decrypt + index).
+    /// Background build running (live open + decrypt + index).
     Indexing,
     /// Index built, incremental sync active.
     Ready,
@@ -59,8 +58,6 @@ pub struct AccountState {
 pub struct AccountRegistry {
     /// All known accounts: platform-scan results plus client registrations.
     pub accounts_db: Mutex<Vec<DbInfo>>,
-    /// Mirror workspace root (`<data-dir>/mirror`).
-    pub mirror_root: PathBuf,
     /// Watch behavior handed to deferred watch tasks.
     pub watch_cfg: crate::sync::watch::WatchConfig,
     /// Shutdown signal receiver (cloned per deferred watch task).
@@ -72,11 +69,10 @@ impl AccountRegistry {
     /// add or override entries via `upsert_db` at registration time.
     pub fn new(
         accounts: Vec<DbInfo>,
-        mirror_root: PathBuf,
         watch_cfg: crate::sync::watch::WatchConfig,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
-        Self { accounts_db: Mutex::new(accounts), mirror_root, watch_cfg, shutdown }
+        Self { accounts_db: Mutex::new(accounts), watch_cfg, shutdown }
     }
 
     /// Account location known for `qq` (startup scan or earlier registration).
@@ -174,8 +170,9 @@ pub fn update_ready(state: &AppState) {
     state.ready.store(all_ready, Ordering::SeqCst);
 }
 
-/// Full per-account initialization: mirror + decrypt + index build (blocking
-/// pool), SSE baseline broadcast, `AccountSync` registration, watch task.
+/// Full per-account initialization: open the LIVE source read-only, verify
+/// the key, build the index (blocking pool), SSE baseline broadcast,
+/// `AccountSync` registration, watch task. No copies, no mirror dir.
 /// On failure the account enters the `error` state with the reason —
 /// recoverable by posting a corrected registration to /api/v1/accounts.
 /// The caller (the registration handler) has already flipped the account
@@ -185,24 +182,23 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
 
     let store = state.store.clone();
     let tx = state.events.clone();
-    let mirror_root = state.init.mirror_root.clone();
     let info_for_build = info.clone();
     let key_for_build = key.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(Mirror, usize)> {
-        let mirror = Mirror::new(&info_for_build, &mirror_root)?;
-        let conn = db::decrypt::open_decrypted(&mirror.main_path, &key_for_build)?;
-        let st = index::build_index(&conn)?;
+    let result = tokio::task::spawn_blocking(move || -> Result<(Arc<Mutex<LiveReader>>, usize)> {
+        let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build);
+        reader.open()?; // verify the key now — bad key → error state (unchanged UX)
+        let conn = reader.acquire()?;
+        let st = index::build_index(conn)?;
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         install_index(&store, &tx, st);
-        Ok((mirror, count))
+        Ok((Arc::new(Mutex::new(reader)), count))
     })
     .await;
 
     match result {
-        Ok(Ok((mirror, count))) => {
+        Ok(Ok((reader, count))) => {
             let account = Arc::new(sync::AccountSync::new(
-                Arc::new(Mutex::new(mirror)),
-                key,
+                reader,
                 state.store.clone(),
                 state.events.clone(),
             ));
@@ -283,12 +279,7 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         ready: ready.clone(),
         token: Arc::new(token.clone()),
         sync: sync_engine.clone(),
-        init: AccountRegistry::new(
-            accounts,
-            data_dir.join("mirror"),
-            watch_cfg,
-            shutdown_rx.clone(),
-        ),
+        init: AccountRegistry::new(accounts, watch_cfg, shutdown_rx.clone()),
     });
     update_ready(&state);
 
@@ -310,9 +301,6 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
     tokio::signal::ctrl_c().await.ok();
     tracing::info!("收到退出信号，清理中…");
     shutdown_tx.send(true).ok();
-    // Remove mirror dirs (they only hold SQLCipher ciphertext, but keep
-    // the workspace tidy).
-    let _ = std::fs::remove_dir_all(data_dir.join("mirror"));
     Ok(())
 }
 
@@ -337,7 +325,6 @@ mod tests {
             sync: Arc::new(sync::SyncEngine::new()),
             init: AccountRegistry::new(
                 Vec::new(),
-                std::env::temp_dir().join("qqflow_server_test_mirror"),
                 crate::sync::watch::WatchConfig::default(),
                 shutdown_rx,
             ),

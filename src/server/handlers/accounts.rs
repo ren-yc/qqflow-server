@@ -2,7 +2,7 @@
 //!
 //! A downstream client supplies the account (qq), the SQLCipher key, and
 //! optionally the database path; the server then initializes the account
-//! in the background (mirror + decrypt + index + SSE baseline + watch).
+//! in the background (live open + decrypt + index + SSE baseline + watch).
 //! Token-protected; deliberately NOT gated on readiness — without an
 //! account the server would never become ready, so this is the bootstrap
 //! endpoint. Keys live in memory only.
