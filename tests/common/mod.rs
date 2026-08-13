@@ -37,7 +37,11 @@ pub fn pragma_suite(key: &str) -> String {
 pub fn make_schema(conn: &Connection) {
     conn.execute_batch(
         "CREATE TABLE group_msg_table (\"40021\" TEXT, \"40001\" INTEGER, \"40020\" TEXT, \"40093\" TEXT, \"40800\" BLOB);\
-         CREATE TABLE c2c_msg_table (\"40020\" TEXT, \"40001\" INTEGER, \"40093\" TEXT, \"40800\" BLOB);",
+         CREATE TABLE c2c_msg_table (\"40020\" TEXT, \"40001\" INTEGER, \"40093\" TEXT, \"40800\" BLOB);\
+         CREATE TABLE nt_uid_mapping_table (nt_uid TEXT, remark TEXT, nickname TEXT, qq TEXT);\
+         INSERT INTO nt_uid_mapping_table VALUES ('u_12345', '李四他哥', '王五', '12345');\
+         INSERT INTO nt_uid_mapping_table VALUES ('u_a', '张三备注', '张三', '10001');\
+         INSERT INTO nt_uid_mapping_table VALUES ('u_b', '', '李四', '10002');",
     )
     .unwrap();
 }
@@ -155,6 +159,59 @@ pub fn materialize_source(nt_db_dir: &Path) -> std::path::PathBuf {
         }
     }
     main
+}
+
+/// Write a fake sibling `group_info.db` into `nt_db_dir` (headerless
+/// SQLCipher, same PRAGMA suite + key as the message DB — how QQ's sibling
+/// databases are expected to open). Group ids match the seeded dataset
+/// (10001 / 20002). Returns its path.
+pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(nt_db_dir).unwrap();
+    let path = nt_db_dir.join("group_info.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE group_list (id TEXT PRIMARY KEY, name TEXT, remark TEXT);\
+         INSERT INTO group_list VALUES ('10001', '测试群', '');\
+         INSERT INTO group_list VALUES ('20002', '第二群', '');",
+    )
+    .unwrap();
+    drop(conn);
+    path
+}
+
+/// Header-prefixed variant of `write_fake_group_info`: the same DB with the
+/// fake QQ 1024-byte header prepended, so the offset-VFS open path is
+/// exercised on a non-`nt_msg.db` file (siblings may carry the header).
+pub fn write_fake_group_info_headed(nt_db_dir: &Path) -> std::path::PathBuf {
+    let path = write_fake_group_info(nt_db_dir);
+    let mut raw = std::fs::read(&path).unwrap();
+    let mut all = vec![0u8; CUSTOM_HEADER_LEN as usize];
+    all[0..8].copy_from_slice(b"QQNTDB!1");
+    all.append(&mut raw);
+    std::fs::write(&path, all).unwrap();
+    path
+}
+
+/// Write a fake sibling `profile_info.db` — HEADERLESS SQLCipher, so the
+/// loader's offset→plain open retry is exercised (real QQ siblings carry
+/// the header; headerless ones must still open). Real layout shape:
+/// `"1000"` uid / `"20002"` nick / `"1002"` QQ number.
+pub fn write_fake_profile_info(nt_db_dir: &Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(nt_db_dir).unwrap();
+    let path = nt_db_dir.join("profile_info.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE profile_info_v2 (\"1000\" TEXT, \"20002\" TEXT, \"1002\" TEXT);\
+         INSERT INTO profile_info_v2 VALUES ('u_12345', '档案昵称', '12345');\
+         INSERT INTO profile_info_v2 VALUES ('u_c', '王五档案', '10003');",
+    )
+    .unwrap();
+    drop(conn);
+    path
 }
 
 /// Write a fresh fake source DB into `nt_db_dir` (created if needed) and

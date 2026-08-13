@@ -101,14 +101,14 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
         .map(|c| c.chat_type)
         .unwrap_or_else(|| crate::store::query::classify_talker(talker).0);
     let name = conv
-        .map(|c| c.name.clone())
+        .map(|c| store.display_name(c.chat_type, &c.talker))
         .unwrap_or_else(|| talker.to_string());
-    // members: uid -> name seen in this session
+    // members: uid -> name seen in this session (remark preferred)
     let members: Vec<Value> = items
         .iter()
         .filter_map(|m| {
             let uid = &m.sender_username;
-            let nick = store.uid_names.get(uid).cloned().unwrap_or_default();
+            let nick = store.display_uid(uid);
             if uid.is_empty() { None } else {
                 Some(json!({
                     "platformId": uid,
@@ -124,7 +124,7 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
         .rev() // chatlab is chronological
         .map(|m| json!({
             "sender": m.sender_username,
-            "accountName": store.uid_names.get(&m.sender_username).cloned().unwrap_or_default(),
+            "accountName": store.display_uid(&m.sender_username),
             "timestamp": m.create_time,
             "type": m.local_type,
             "content": m.content,

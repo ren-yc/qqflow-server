@@ -80,11 +80,12 @@ pub async fn handler(
         .iter()
         .map(|uid| {
             let nick = nicks.get(uid).cloned().unwrap_or_default();
+            let remark = store.names.uid_remark.get(uid).cloned().unwrap_or_default();
             let mut m = json!({
                 "wxid": uid,
                 "displayName": nick,
                 "nickname": nick,
-                "remark": "",
+                "remark": remark,
                 "alias": "",
                 "groupNickname": nick,
                 "avatarUrl": "",

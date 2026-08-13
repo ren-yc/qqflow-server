@@ -21,8 +21,7 @@ use crate::db::live::LiveReader;
 use crate::db::scan::DbInfo;
 use crate::sync;
 use crate::sync::Event;
-use crate::store::index;
-use crate::store::{AppState, Store};
+use crate::store::{self, index, AppState, Store};
 
 /// Per-account readiness state (serialized as-is into /health).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -185,10 +184,21 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
     let info_for_build = info.clone();
     let key_for_build = key.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<(Arc<Mutex<LiveReader>>, usize)> {
-        let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build);
+        let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build.clone());
         reader.open()?; // verify the key now — bad key → error state (unchanged UX)
         let conn = reader.acquire()?;
-        let st = index::build_index(conn)?;
+        let mut st = index::build_index(conn)?;
+        // uid→备注/QQ、群号→群名 maps (best-effort — empty on schema churn).
+        let nt_db_dir = info_for_build
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        st.names = store::names::load_names(
+            conn,
+            nt_db_dir,
+            &key_for_build,
+            &store::names::KnownKeys::from_store(&st),
+        );
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         install_index(&store, &tx, st);
         Ok((Arc::new(Mutex::new(reader)), count))
@@ -197,18 +207,20 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
 
     match result {
         Ok(Ok((reader, count))) => {
-            let account = Arc::new(sync::AccountSync::new(
-                reader,
-                state.store.clone(),
-                state.events.clone(),
-                info.path.clone(),
-            ));
-            state.sync.register(account.clone());
             let watch_dir = info
                 .path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
+            let account = Arc::new(sync::AccountSync::new(
+                reader,
+                state.store.clone(),
+                state.events.clone(),
+                info.path.clone(),
+                watch_dir.clone(),
+                key.clone(),
+            ));
+            state.sync.register(account.clone());
             tokio::spawn(sync::watch::spawn(
                 account,
                 watch_dir,

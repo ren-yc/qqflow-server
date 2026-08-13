@@ -7,6 +7,7 @@
 //! poller — a single source of truth for both HTTP queries and SSE events.
 
 pub mod index;
+pub mod names;
 pub mod query;
 
 use std::collections::HashMap;
@@ -46,11 +47,33 @@ impl Conversation {
     }
 }
 
+/// uid/群 name maps loaded from QQ's mapping sources (see `names`) —
+/// best-effort: on schema churn these stay empty and display falls back to
+/// message-derived names.
+#[derive(Debug, Default)]
+pub struct NameMaps {
+    /// uid -> remark name (联系人备注). Ground truth on current QQ
+    /// versions: no readable table stores remarks — this stays empty and
+    /// display falls back to the nicknames.
+    pub uid_remark: HashMap<String, String>,
+    /// uid -> authoritative contact nickname (联系人档案 `20002`).
+    pub uid_nick: HashMap<String, String>,
+    /// uid -> bare QQ number, when the version exposes it (optional).
+    pub uid_qq: HashMap<String, String>,
+    /// groupId -> group name, from a group-info source (sibling DB or
+    /// mapping tables inside nt_msg.db).
+    pub group_name: HashMap<String, String>,
+    /// groupId -> group remark (loaded but not exposed in v1).
+    pub group_remark: HashMap<String, String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Store {
     pub convs: HashMap<String, Conversation>,
     /// uid -> latest known nickname ("40093").
     pub uid_names: HashMap<String, String>,
+    /// uid/群 name maps from the mapping sources (see `names`).
+    pub names: NameMaps,
     /// Highest rowid seen per table (poller watermark).
     pub watermark_group: i64,
     pub watermark_c2c: i64,
@@ -59,6 +82,51 @@ pub struct Store {
 impl Store {
     pub fn conversation(&self, chat_type: ChatType, talker: &str) -> Option<&Conversation> {
         self.convs.get(&conv_key(chat_type, talker))
+    }
+
+    /// Session display name (pure lookup — never mutates `conv.name`):
+    /// c2c: remark > profile nick (uid_nick) > message nick (conv.name) > uid;
+    /// group: group remark (60026, QQ 客户端也优先显示备注) > group-info
+    /// name > rename-message name (conv.name) > group id.
+    pub fn display_name(&self, chat_type: ChatType, talker: &str) -> String {
+        let from_map = match chat_type {
+            ChatType::C2c => self
+                .names
+                .uid_remark
+                .get(talker)
+                .filter(|s| !s.is_empty())
+                .or_else(|| self.names.uid_nick.get(talker).filter(|s| !s.is_empty())),
+            ChatType::Group => self
+                .names
+                .group_remark
+                .get(talker)
+                .filter(|s| !s.is_empty())
+                .or_else(|| self.names.group_name.get(talker).filter(|s| !s.is_empty())),
+        };
+        if let Some(name) = from_map.filter(|s| !s.is_empty()) {
+            return name.clone();
+        }
+        if let Some(name) = self
+            .conversation(chat_type, talker)
+            .map(|c| c.name.clone())
+            .filter(|s| !s.is_empty())
+        {
+            return name;
+        }
+        talker.to_string()
+    }
+
+    /// Person display name: remark > profile nick (uid_nick) > latest
+    /// message nick (uid_names) > uid.
+    pub fn display_uid(&self, uid: &str) -> String {
+        self.names
+            .uid_remark
+            .get(uid)
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.names.uid_nick.get(uid).filter(|s| !s.is_empty()))
+            .or_else(|| self.uid_names.get(uid).filter(|s| !s.is_empty()))
+            .cloned()
+            .unwrap_or_else(|| uid.to_string())
     }
 
     /// Look up a conversation by talker string, falling back to the other
@@ -111,5 +179,86 @@ mod tests {
             .find_conversation("12345")
             .expect("all-digit c2c peer must resolve via fallback");
         assert_eq!(found.chat_type, ChatType::C2c);
+    }
+
+    fn conv(chat_type: ChatType, talker: &str, name: &str) -> Conversation {
+        Conversation {
+            chat_type,
+            talker: talker.into(),
+            name: name.into(),
+            msgs: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn display_name_c2c_prefers_remark_over_profile_nick_over_nick_over_uid() {
+        let mut store = Store::default();
+        store
+            .convs
+            .insert(conv_key(ChatType::C2c, "u_a"), conv(ChatType::C2c, "u_a", "张三"));
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三", "message nick only");
+
+        store.names.uid_nick.insert("u_a".into(), "档案昵称".into());
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "档案昵称", "profile nick wins");
+
+        store.names.uid_remark.insert("u_a".into(), "张三备注".into());
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三备注", "remark wins");
+
+        store.names.uid_remark.insert("u_a".into(), String::new());
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "档案昵称", "empty remark falls back");
+
+        assert_eq!(store.display_name(ChatType::C2c, "u_unknown"), "u_unknown", "no data -> uid");
+    }
+
+    #[test]
+    fn display_name_group_prefers_remark_over_info_name_over_rename_msg_over_id() {
+        let mut store = Store::default();
+        store
+            .convs
+            .insert(conv_key(ChatType::Group, "10001"), conv(ChatType::Group, "10001", "改名消息群名"));
+        assert_eq!(
+            store.display_name(ChatType::Group, "10001"),
+            "改名消息群名",
+            "rename-message name"
+        );
+
+        store.names.group_name.insert("10001".into(), "群信息库群名".into());
+        assert_eq!(
+            store.display_name(ChatType::Group, "10001"),
+            "群信息库群名",
+            "group-info name wins over rename message"
+        );
+
+        store.names.group_remark.insert("10001".into(), "群备注名".into());
+        assert_eq!(
+            store.display_name(ChatType::Group, "10001"),
+            "群备注名",
+            "group remark wins (QQ 客户端行为)"
+        );
+
+        store.names.group_remark.insert("10001".into(), String::new());
+        assert_eq!(
+            store.display_name(ChatType::Group, "10001"),
+            "群信息库群名",
+            "empty group remark falls back"
+        );
+
+        assert_eq!(store.display_name(ChatType::Group, "99999"), "99999", "no data -> group id");
+    }
+
+    #[test]
+    fn display_uid_prefers_remark_over_profile_nick_over_message_nick_over_uid() {
+        let mut store = Store::default();
+        store.uid_names.insert("u_a".into(), "张三".into());
+        assert_eq!(store.display_uid("u_a"), "张三", "message nick only");
+
+        store.names.uid_nick.insert("u_a".into(), "档案昵称".into());
+        assert_eq!(store.display_uid("u_a"), "档案昵称", "profile nick wins");
+
+        store.names.uid_remark.insert("u_a".into(), "张三备注".into());
+        assert_eq!(store.display_uid("u_a"), "张三备注", "remark wins");
+
+        assert_eq!(store.display_uid("u_zzz"), "u_zzz", "no data -> uid");
     }
 }

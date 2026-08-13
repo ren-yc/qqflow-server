@@ -90,21 +90,39 @@ pub fn open_decrypted(path: &Path, key: &str) -> Result<Connection> {
     )
 }
 
-/// Open the LIVE source `nt_msg.db` (with its 1024-byte custom header)
-/// read-only and in place, via the `qqflow-offset` VFS. Never copies and
-/// never creates files; usable while the QQ client holds the database.
-pub fn open_live(path: &Path, key: &str) -> Result<Connection> {
-    vfs::ensure_installed()?;
+/// Open any NT database read-only with an explicit header choice.
+/// `offset=true` virtually strips the 1024-byte custom header via the
+/// `qqflow-offset` VFS (for files that carry QQ's plaintext header — the
+/// source `nt_msg.db` and possibly sibling databases like `group_info.db`);
+/// `offset=false` opens the file as-is (headerless SQLCipher). Never copies
+/// and never creates files; usable while the QQ client holds the database.
+/// Key verification (sqlite_master) is part of `open_checked` — a wrong
+/// header choice simply fails verification.
+pub fn open_live_mode(path: &Path, key: &str, offset: bool) -> Result<Connection> {
+    if offset {
+        vfs::ensure_installed()?;
+    }
     let meta = std::fs::metadata(path)
         .with_context(|| format!("源数据库不存在: {}", path.display()))?;
-    if meta.len() <= CUSTOM_HEADER_LEN {
+    if offset && meta.len() <= CUSTOM_HEADER_LEN {
         anyhow::bail!(
             "源数据库过小: {} ({} 字节 <= 自定义头 {CUSTOM_HEADER_LEN} 字节)，不是有效的 nt_msg.db",
             path.display(),
             meta.len()
         );
     }
-    open_checked(path, key, OpenFlags::SQLITE_OPEN_READ_ONLY, Some(vfs::VFS_NAME))
+    open_checked(
+        path,
+        key,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        offset.then_some(vfs::VFS_NAME),
+    )
+}
+
+/// Open the LIVE source `nt_msg.db` (with its 1024-byte custom header)
+/// read-only and in place, via the `qqflow-offset` VFS.
+pub fn open_live(path: &Path, key: &str) -> Result<Connection> {
+    open_live_mode(path, key, true)
 }
 
 /// Verify the key by reading sqlite_master (only possible with a valid key).

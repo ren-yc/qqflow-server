@@ -114,7 +114,8 @@ fn conv_last_ts(c: &crate::store::Conversation) -> i64 {
     c.msgs.iter().map(|m| m.ts).max().unwrap_or(0)
 }
 
-/// Sessions sorted by last message time (newest first).
+/// Sessions sorted by last message time (newest first). Display names
+/// resolve through the name maps (remark / group-info > message-derived).
 pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<SessionInfo> {
     let kw = keyword.map(|k| k.to_lowercase());
     let mut all: Vec<&crate::store::Conversation> = store.convs.values().collect();
@@ -122,7 +123,7 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
     all.into_iter()
         .filter(|c| {
             if let Some(k) = &kw {
-                c.name.to_lowercase().contains(k.as_str())
+                store.display_name(c.chat_type, &c.talker).to_lowercase().contains(k.as_str())
                     || c.talker.to_lowercase().contains(k.as_str())
             } else {
                 true
@@ -132,7 +133,7 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
         .take(limit)
         .map(|c| SessionInfo {
             username: c.talker.clone(),
-            display_name: c.name.clone(),
+            display_name: store.display_name(c.chat_type, &c.talker),
             r#type: c.chat_type.weflow_code(),
             last_timestamp: conv_last_ts(c),
             unread_count: 0,
@@ -140,20 +141,35 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
         .collect()
 }
 
-/// Contacts: every UID that appeared in chat, with the latest nickname.
+/// Contacts: every UID known to chat or to the name maps (a profile-only
+/// uid with no chat history appears too — that is the point of the
+/// mapping), with nickname (profile > message-derived), remark and
+/// optional QQ number.
 pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<crate::server::handlers::contacts::ContactOut> {
     let kw = keyword.map(|k| k.to_lowercase());
-    let mut rows: Vec<crate::server::handlers::contacts::ContactOut> = store
-        .uid_names
-        .iter()
-        .map(|(uid, nick)| crate::server::handlers::contacts::ContactOut {
-            username: uid.clone(),
-            display_name: nick.clone(),
-            nickname: nick.clone(),
-            remark: String::new(),
-            alias: String::new(),
-            avatar_url: String::new(),
-            r#type: "friend".into(),
+    let mut uid_set: std::collections::BTreeSet<&String> = store.uid_names.keys().collect();
+    uid_set.extend(store.names.uid_remark.keys());
+    uid_set.extend(store.names.uid_nick.keys());
+    let mut rows: Vec<crate::server::handlers::contacts::ContactOut> = uid_set
+        .into_iter()
+        .map(|uid| {
+            let nick = store
+                .names
+                .uid_nick
+                .get(uid)
+                .or_else(|| store.uid_names.get(uid))
+                .cloned()
+                .unwrap_or_default();
+            crate::server::handlers::contacts::ContactOut {
+                username: uid.clone(),
+                display_name: store.display_uid(uid),
+                nickname: nick,
+                remark: store.names.uid_remark.get(uid).cloned().unwrap_or_default(),
+                alias: String::new(),
+                avatar_url: String::new(),
+                qq: store.names.uid_qq.get(uid).cloned(),
+                r#type: "friend".into(),
+            }
         })
         .collect();
     rows.sort_by_key(|a| a.display_name.to_lowercase());

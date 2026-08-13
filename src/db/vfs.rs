@@ -12,6 +12,13 @@
 //!   - -wal / -shm / -journal / anything else: pass-through, unshifted
 //!     (the WAL has no custom header)
 //!
+//! The offset applies to ANY `*.db` main file opened through this VFS, not
+//! just `nt_msg.db` — sibling NT databases in the same `nt_db` directory
+//! (e.g. `group_info.db`, `nt_uid_mapping.db`) are created by the same
+//! client stack and may carry the same 1024-byte header. A headerless file
+//! opened shifted simply fails key verification (read-only open — no
+//! corruption, no files created); callers retry without the offset.
+//!
 //! `PRAGMA cipher_plaintext_header_size` cannot do this: `lockBtree`
 //! memcmps the DECODED page-1 buffer against "SQLite format 3\0" while the
 //! codec copies the plaintext header bytes in verbatim (QQ's magic is
@@ -100,8 +107,9 @@ pub fn ensure_installed() -> Result<()> {
 
 /// Only the main db file gets the offset. The pager always sets
 /// SQLITE_OPEN_MAIN_DB for it (the WAL/shm get their own flags); the
-/// filename check is a second guard (case-insensitive `nt_msg.db` suffix,
-/// excluding `-wal`/`-shm`/`-journal`).
+/// filename check is a second guard (case-insensitive `*.db` suffix — the
+/// source `nt_msg.db` and any sibling NT database that may carry the same
+/// 1024-byte header — excluding `-wal`/`-shm`/`-journal`).
 fn is_offset_main(z_name: ffi::sqlite3_filename, flags: c_int) -> bool {
     if flags & ffi::SQLITE_OPEN_MAIN_DB == 0 {
         return false;
@@ -112,7 +120,7 @@ fn is_offset_main(z_name: ffi::sqlite3_filename, flags: c_int) -> bool {
     if lower.ends_with(b"-wal") || lower.ends_with(b"-shm") || lower.ends_with(b"-journal") {
         return false;
     }
-    lower.ends_with(b"nt_msg.db")
+    lower.ends_with(b".db")
 }
 
 unsafe extern "C" fn x_open(
@@ -325,9 +333,17 @@ mod tests {
         assert!(!is_offset_main(journal.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
         // Without the MAIN_DB flag nothing is shifted.
         assert!(!is_offset_main(main.as_ptr(), ffi::SQLITE_OPEN_READONLY));
-        // Other suffixes / case-insensitive.
+        // Any *.db main file gets the offset — siblings like group_info.db
+        // may carry the same header; non-db suffixes never do.
         let other = CString::new(r"C:\x\y.db").unwrap();
-        assert!(!is_offset_main(other.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
+        assert!(is_offset_main(other.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
+        let group_info = CString::new(r"C:\SomeUser\nt_qq\nt_db\group_info.db").unwrap();
+        assert!(is_offset_main(group_info.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
+        let notdb = CString::new(r"C:\x\y.db-shm2").unwrap();
+        assert!(!is_offset_main(notdb.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
+        let txt = CString::new(r"C:\x\notes.txt").unwrap();
+        assert!(!is_offset_main(txt.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
+        // Case-insensitive.
         let upper = CString::new(r"C:\Q\NT_MSG.DB").unwrap();
         assert!(is_offset_main(upper.as_ptr(), ffi::SQLITE_OPEN_MAIN_DB));
     }

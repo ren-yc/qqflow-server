@@ -94,7 +94,7 @@ pub async fn handler(
             let m = &conv.msgs[i];
             json!({
                 "sender": m.from_uid,
-                "accountName": store.uid_names.get(&m.from_uid).cloned().unwrap_or_default(),
+                "accountName": store.display_uid(&m.from_uid),
                 "timestamp": m.ts,
                 "type": m.parsed.msg_type.code(),
                 "content": m.parsed.content,
@@ -109,7 +109,7 @@ pub async fn handler(
         for m in &conv.msgs {
             if !seen.contains(&m.from_uid) && !m.from_uid.is_empty() {
                 seen.push(m.from_uid.clone());
-                let nick = store.uid_names.get(&m.from_uid).cloned().unwrap_or_default();
+                let nick = store.display_uid(&m.from_uid);
                 out.push(json!({
                     "platformId": m.from_uid,
                     "accountName": nick,
@@ -129,7 +129,7 @@ pub async fn handler(
             "generator": "qqflow-server",
         },
         "meta": {
-            "name": conv.name,
+            "name": store.display_name(chat_type, &talker),
             "platform": "qq",
             "type": chat_type.as_str(),
             "groupId": talker,

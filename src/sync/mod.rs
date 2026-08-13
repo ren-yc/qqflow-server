@@ -44,6 +44,10 @@ pub struct AccountSync {
     retry: AtomicBool,
     /// Source main db path — derives the `-wal` path the fallback stats.
     db_path: PathBuf,
+    /// `nt_db` directory — sibling group-info databases live here (name maps).
+    db_dir: PathBuf,
+    /// SQLCipher key — sibling databases share it (name maps).
+    key: String,
     /// Last observed (mtime-millis, size) of the source WAL; the fallback
     /// poll compares against it to detect changes the watcher missed.
     last_wal: Mutex<Option<(u64, u64)>>,
@@ -55,6 +59,8 @@ impl AccountSync {
         store: Arc<RwLock<Store>>,
         tx: broadcast::Sender<Event>,
         db_path: PathBuf,
+        db_dir: PathBuf,
+        key: String,
     ) -> Self {
         Self {
             reader,
@@ -62,8 +68,29 @@ impl AccountSync {
             tx,
             retry: AtomicBool::new(false),
             db_path,
+            db_dir,
+            key,
             last_wal: Mutex::new(None),
         }
+    }
+
+    /// Re-read name maps (备注/群名) from nt_msg.db + sibling databases.
+    /// Registration and manual sync only — never on watch ticks, keeping
+    /// the poll pass zero-file-IO. Best-effort: a failure leaves the
+    /// previous maps in place.
+    pub fn refresh_names(&self) {
+        let mut reader = self.reader.lock();
+        let Ok(conn) = reader.acquire() else {
+            tracing::debug!("[names] refresh skipped: live connection unavailable");
+            return;
+        };
+        let known = {
+            let guard = self.store.read();
+            crate::store::names::KnownKeys::from_store(&guard)
+        };
+        let maps = crate::store::names::load_names(conn, &self.db_dir, &self.key, &known);
+        let mut guard = self.store.write();
+        guard.names = maps;
     }
 
     /// Cheap change detection (no data IO — at most one metadata stat):
@@ -143,16 +170,17 @@ impl AccountSync {
                 .iter()
                 .chain(&new_c)
                 .map(|r| {
-                    let group_name = guard
-                        .conversation(r.chat_type, &r.talker)
-                        .map(|c| c.name.clone());
+                    // Display names resolve through the name maps — the
+                    // remark (私聊) / group-info name (群聊) wins when known.
+                    let group_name = Some(guard.display_name(r.chat_type, &r.talker));
+                    let source_name = Some(guard.display_uid(&r.from_uid));
                     if r.parsed.msg_type == MsgType::Recall {
                         Event::message_revoke(
                             r.chat_type,
                             r.talker.clone(),
                             group_name,
                             r.rowid,
-                            Some(r.from_nick.clone()),
+                            source_name,
                             r.parsed.content.clone(),
                             r.ts,
                         )
@@ -162,7 +190,7 @@ impl AccountSync {
                             r.talker.clone(),
                             group_name,
                             r.rowid,
-                            Some(r.from_nick.clone()),
+                            source_name,
                             r.parsed.content.clone(),
                             r.ts,
                         )
@@ -201,12 +229,16 @@ impl SyncEngine {
     }
 
     /// Manual sync: run a full pass on every registered account and return
-    /// all newly appended records, newest first.
+    /// all newly appended records, newest first. Name maps (备注/群名) ride
+    /// the manual sync — the one place a client-visible refresh happens.
     pub fn sync_all(&self) -> Vec<MessageRecord> {
         let mut out = Vec::new();
         for account in self.snapshot() {
             match account.poll_once() {
-                Ok(records) => out.extend(records),
+                Ok(records) => {
+                    out.extend(records);
+                    account.refresh_names();
+                }
                 Err(e) => tracing::warn!("manual sync error: {e:#}"),
             }
         }

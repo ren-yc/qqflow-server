@@ -29,7 +29,14 @@ async fn watch_event_drives_sse_push() {
     let (tx, mut rx) = tokio::sync::broadcast::channel::<Event>(64);
     let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
-    let account = Arc::new(AccountSync::new(reader, store, tx, src.clone()));
+    let account = Arc::new(AccountSync::new(
+        reader,
+        store,
+        tx,
+        src.clone(),
+        nt_db.clone(),
+        FAKE_KEY.into(),
+    ));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let task = tokio::spawn(watch::spawn(
@@ -84,7 +91,14 @@ fn fallback_changed_detects_wal_writes() {
     let (tx, _rx) = tokio::sync::broadcast::channel::<Event>(64);
     let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
-    let account = Arc::new(AccountSync::new(reader, store, tx, src));
+    let account = Arc::new(AccountSync::new(
+        reader,
+        store,
+        tx,
+        src.clone(),
+        nt_db.clone(),
+        FAKE_KEY.into(),
+    ));
 
     // Baseline: the first check initializes the snapshot (reports a change);
     // the second, with nothing new on disk, reports none.

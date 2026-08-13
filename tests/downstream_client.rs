@@ -324,7 +324,9 @@ async fn downstream_client_real_db() {
         assert!(c["username"].is_string());
         assert!(c["displayName"].is_string());
         assert!(c["nickname"].is_string());
-        assert_eq!(c["remark"], "", "v1 remark is always empty");
+        // remark comes from the uid mapping table — real data, value
+        // unknown; only the shape is asserted (was: always empty).
+        assert!(c["remark"].is_string(), "remark must be a string");
         assert_eq!(c["alias"], "", "v1 alias is always empty");
         assert_eq!(c["avatarUrl"], "", "v1 avatarUrl is always empty");
         assert_eq!(c["type"], "friend");
@@ -332,9 +334,10 @@ async fn downstream_client_real_db() {
     println!("[CLIENT] contacts: {} rows", v["count"]);
     for c in v["contacts"].as_array().unwrap().iter().take(5) {
         println!(
-            "[CLIENT]   uid {} -> nickname {:?}",
+            "[CLIENT]   uid {} -> name {:?} remark {:?}",
             c["username"],
-            c["displayName"].as_str().unwrap_or_default()
+            c["displayName"].as_str().unwrap_or_default(),
+            c["remark"].as_str().unwrap_or_default()
         );
     }
 

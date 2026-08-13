@@ -153,8 +153,8 @@ GET /api/v1/push/messages
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
 | `avatarUrl` | v1 恒省略（序列化时跳过该字段） |
-| `sourceName` | 发送者昵称（无昵称时为空串） |
-| `groupName` | 会话显示名：群聊为群名，私聊为对方昵称；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
+| `sourceName` | 发送者显示名（备注优先：备注 > 最新昵称 > UID） |
+| `groupName` | 会话显示名（群聊：群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊：备注 > 档案昵称 > 对方昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
 | `lastRowidGroup` / `lastRowidC2c` | 仅 `sync` 事件：群/私聊表当前水位线（rowid 最大值） |
@@ -284,9 +284,9 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）：
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
-- `meta.name`（会话显示名）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
-- `members[].platformId`、`members[].accountName`、`members[].groupNickname`、`members[].avatar`（恒空）
-- `messages[].sender`、`messages[].accountName`、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+- `meta.name`（会话显示名：群聊为群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊为备注 > 档案昵称 > 昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
+- `members[].platformId`、`members[].accountName`（备注优先）、`members[].groupNickname`、`members[].avatar`（恒空）
+- `messages[].sender`、`messages[].accountName`（备注优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
 ---
 
@@ -314,7 +314,7 @@ GET /api/v1/sessions
 - `success`
 - `count`
 - `sessions[].username`
-- `sessions[].displayName`（群聊为群名，未知时回落为群号；私聊为对方昵称）
+- `sessions[].displayName`（群聊：群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊：备注 > 档案昵称 > 对方昵称 > UID）
 - `sessions[].type`（`2`=群聊，`1`=私聊）
 - `sessions[].lastTimestamp`
 - `sessions[].unreadCount`（v1 恒为 `0`）
@@ -413,7 +413,7 @@ GET /api/v1/sessions/{id}/messages
 
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
-v1 联系人来源：消息中出现过的 UID → 最新昵称映射（无独立联系人库）。
+v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。昵称来自联系人档案（`profile_info.db` 的 `20002`，经 ground-truth 探针确认），QQ 号来自 `nt_msg.db` 的 `nt_uid_mapping_table` + 档案（版本相关，列结构按值探测，缺表/缺列时退化为消息昵称列表）。备注（remark）：当前 QQ 版本的可读表中无此列，v1 恒为空串；有备注列的版本会按列名/字段 id 提示（`20003`/`remark`）自动启用。
 
 **请求**
 
@@ -434,8 +434,11 @@ GET /api/v1/contacts
 - `success`
 - `count`
 - `contacts[].username`（UID）
-- `contacts[].displayName` / `contacts[].nickname`（均为最新昵称）
-- `contacts[].remark` / `contacts[].alias` / `contacts[].avatarUrl`（v1 恒为空串）
+- `contacts[].displayName`（备注 > 档案昵称 > 消息昵称 > UID）
+- `contacts[].nickname`（档案昵称 > 消息昵称；均无时为空串）
+- `contacts[].remark`（当前 QQ 版本的可读表无备注列，v1 恒为空串；有备注列的版本自动启用）
+- `contacts[].alias` / `contacts[].avatarUrl`（v1 恒为空串）
+- `contacts[].qq`（可选；映射表提供 uid→QQ 号时返回，否则字段省略）
 - `contacts[].type`（v1 恒为 `"friend"`）
 
 ---
@@ -472,7 +475,8 @@ GET /api/v1/group-members
 - `updatedAt`（毫秒时间戳）
 - `members[].wxid`（发送者 UID）
 - `members[].displayName` / `members[].nickname` / `members[].groupNickname`（均为昵称）
-- `members[].remark` / `members[].alias` / `members[].avatarUrl`（v1 恒为空串）
+- `members[].remark`（有备注列的 QQ 版本来自档案/映射表；当前版本恒为空串）
+- `members[].alias` / `members[].avatarUrl`（v1 恒为空串）
 - `members[].isOwner` / `members[].isFriend`（v1 恒为 `false`）
 - `members[].messageCount`（仅 `includeMessageCounts=1` 时返回）
 

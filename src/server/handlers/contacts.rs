@@ -38,6 +38,10 @@ pub struct ContactOut {
     pub remark: String,
     pub alias: String,
     pub avatar_url: String,
+    /// uid -> QQ number from the uid mapping table, when the version
+    /// exposes it (absent otherwise — old clients ignore the field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qq: Option<String>,
     pub r#type: String,
 }
 
