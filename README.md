@@ -89,6 +89,14 @@ bash scripts/build.sh test                        # Linux/macOS
   输入优先读项目根 `qqflow-server.json` 的 `qq`/`key`/`db_path`，缺失时回退
   `QQFLOW_TEST_QQ` / `QQFLOW_TEST_DB_KEY` / `QQFLOW_TEST_DB_ROOT` 环境变量）
 
+## 鸣谢
+
+本项目借鉴了以下项目的部分功能特性。
+
+[hicccc77/WeFlow](https://github.com/hicccc77/WeFlow)
+
+[yfgug/QQFlow](https://github.com/yfgug/QQFlow)
+
 ## 免责声明
 
 仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存
