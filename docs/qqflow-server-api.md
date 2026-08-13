@@ -4,11 +4,11 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 ## 启用方式
 
-**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5031）/ `--host`（127.0.0.1）/ `--log`（info）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
+**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
 
 - 默认监听地址：`127.0.0.1`
-- 默认端口：`5031`
-- 基础地址：`http://127.0.0.1:5031`
+- 默认端口：`5032`
+- 基础地址：`http://127.0.0.1:5032`
 - **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台完成镜像、解密与索引构建（见 §1.1）
 - API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到 `<data-dir>/token.txt`（启动日志仅打印保存路径，不打印 token 值）
 - 索引就绪前（存在 `awaiting_key` / `indexing` / `error` 账号时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts` 不检查就绪状态，可随时调用
@@ -162,7 +162,7 @@ GET /api/v1/push/messages
 ### 示例
 
 ```bash
-curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=YOUR_TOKEN"
+curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=YOUR_TOKEN"
 ```
 
 ```text
@@ -204,9 +204,9 @@ GET /api/v1/messages
 ### 示例
 
 ```bash
-curl "http://127.0.0.1:5031/api/v1/messages?talker=10001&limit=20&access_token=YOUR_TOKEN"
-curl "http://127.0.0.1:5031/api/v1/messages?talker=10001&chatlab=1&access_token=YOUR_TOKEN"
-curl "http://127.0.0.1:5031/api/v1/messages?talker=u_abc123&start=20260101&end=20260131&access_token=YOUR_TOKEN"
+curl "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=20&access_token=YOUR_TOKEN"
+curl "http://127.0.0.1:5032/api/v1/messages?talker=10001&chatlab=1&access_token=YOUR_TOKEN"
+curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=20260131&access_token=YOUR_TOKEN"
 ```
 
 ### JSON 响应字段
@@ -549,17 +549,17 @@ POST /api/v1/sync
 ```bash
 TOKEN=$(Get-Content "$env:LOCALAPPDATA\qqflow-server\token.txt")   # PowerShell
 # 注册账号（客户端驱动启动；密钥仅内存保存）
-curl -X POST http://127.0.0.1:5031/api/v1/accounts \
+curl -X POST http://127.0.0.1:5032/api/v1/accounts \
   -H "Content-Type: application/json" \
   -d "{\"qq\": \"1234567890\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\", \"access_token\": \"$TOKEN\"}"
 # GET 带 Token Header
-curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5031/api/v1/messages?talker=10001&limit=20"
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=20"
 # POST 带 JSON Body（参数走 Body，token 亦可走 Body）
-curl -X POST http://127.0.0.1:5031/api/v1/messages \
+curl -X POST http://127.0.0.1:5032/api/v1/messages \
   -H "Content-Type: application/json" \
   -d "{\"access_token\": \"$TOKEN\", \"talker\": \"10001\", \"limit\": 50}"
 # SSE
-curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=$TOKEN"
+curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=$TOKEN"
 ```
 
 ### Python
@@ -567,7 +567,7 @@ curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=$TOKEN"
 ```python
 import requests
 
-BASE_URL = "http://127.0.0.1:5031"
+BASE_URL = "http://127.0.0.1:5032"
 headers = {"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/json"}
 
 messages = requests.post(

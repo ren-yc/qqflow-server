@@ -29,19 +29,19 @@ The toolchain is pinned by `rust-toolchain.toml` (rustc 1.97.1, version-locked f
 Run against real data — **no config file**; run parameters come from CLI flags, all optional with the defaults shown:
 
 ```powershell
-.\qqflow-server.exe                                  # defaults: 127.0.0.1:5031, log info
+.\qqflow-server.exe                                  # defaults: 127.0.0.1:5032, log info
 .\qqflow-server.exe --port 5999 --host 0.0.0.0 --log debug
 .\qqflow-server.exe --help
 ```
 
-CLI flags: `--port` (5031) / `--host` (127.0.0.1) / `--log` (error|warn|info|debug, default info) / `--watch-debounce-ms` (350) / `--watch-fallback-ms` (30000, 0 disables the slow fallback poll; the 10 s watcher re-attach is independent). Unknown flags are fatal.
+CLI flags: `--port` (5032) / `--host` (127.0.0.1) / `--log` (error|warn|info|debug, default info) / `--watch-debounce-ms` (350) / `--watch-fallback-ms` (30000, 0 disables the slow fallback poll; the 10 s watcher re-attach is independent). Unknown flags are fatal.
 
 Accounts are **client-driven**: startup only scans platform paths for discovery and lists the accounts as `awaiting_key` in `/health` (zero-account startup is valid). A downstream client registers an account via `POST /api/v1/accounts` with `{qq, key, db_path}`:
 
 - `db_path` (optional) is a direct `nt_msg.db` file or a Tencent Files-style root (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`); omitting it reuses the scanned path.
 - Keys are validated (16 printable-ASCII bytes) and kept **in memory only** — never persisted. A wrong key puts the account in `error` state (recoverable by re-registering); the process never exits over key problems.
 
-Default `127.0.0.1:5031` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`; the startup log prints the file path, not the token value. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
+Default `127.0.0.1:5032` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`; the startup log prints the file path, not the token value. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
 
 ## Architecture
 

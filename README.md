@@ -32,23 +32,23 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 
 # 2. 启动（无配置文件；参数全部由命令行指定，均有默认值）
 .\qqflow-server.exe
-.\qqflow-server.exe --port 5031 --host 127.0.0.1 --log info
+.\qqflow-server.exe --port 5032 --host 127.0.0.1 --log info
 .\qqflow-server.exe --help
 ```
 
-命令行参数：`--port`（默认 5031）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）。
+命令行参数：`--port`（默认 5032）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）。
 
 **账号为客户端驱动**：启动后服务以空账号状态运行（`/health` 列出平台扫描发现的账号，状态 `awaiting_key`）；密钥不由配置提供，由客户端运行时注册（仅内存保存，不持久化）：
 
 ```bash
-curl -X POST http://127.0.0.1:5031/api/v1/accounts \
+curl -X POST http://127.0.0.1:5032/api/v1/accounts \
   -H "Content-Type: application/json" \
   -d "{\"qq\": \"<QQ号>\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\", \"access_token\": \"<token.txt内容>\"}"
 ```
 
 `db_path` 可为 `nt_msg.db` 文件路径或 Tencent Files 风格目录（省略则复用扫描到的路径）；密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
-默认 `http://127.0.0.1:5031`，token 自动生成并持久化到 `<data-dir>/token.txt`（启动日志仅打印文件路径，不打印 token 值）。
+默认 `http://127.0.0.1:5032`，token 自动生成并持久化到 `<data-dir>/token.txt`（启动日志仅打印文件路径，不打印 token 值）。
 
 ## API（与 WeFlow 契约对齐）
 
@@ -67,8 +67,8 @@ curl -X POST http://127.0.0.1:5031/api/v1/accounts \
 鉴权三方式：`Authorization: Bearer <token>` / `?access_token=`（SSE 推荐）/ POST JSON Body。
 
 ```bash
-curl -H "Authorization: Bearer <token>" "http://127.0.0.1:5031/api/v1/sessions"
-curl -N "http://127.0.0.1:5031/api/v1/push/messages?access_token=<token>"
+curl -H "Authorization: Bearer <token>" "http://127.0.0.1:5032/api/v1/sessions"
+curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=<token>"
 ```
 
 ## 测试

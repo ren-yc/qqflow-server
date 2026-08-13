@@ -1,6 +1,6 @@
 //! Runtime configuration from command-line arguments (no config file).
 //!
-//! `--port` (5031), `--host` (127.0.0.1), `--log` (info), plus the watch
+//! `--port` (5032), `--host` (127.0.0.1), `--log` (info), plus the watch
 //! tuning knobs `--watch-debounce-ms` (350) and `--watch-fallback-ms`
 //! (30000). Account database paths and SQLCipher keys are NOT configuration
 //! — downstream clients register them at runtime via `POST /api/v1/accounts`.
@@ -33,7 +33,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            port: 5031,
+            port: 5032,
             host: "127.0.0.1".into(),
             log: "info".into(),
             watch_debounce_ms: 350,
@@ -48,7 +48,7 @@ fn help() -> String {
      用法: qqflow-server [选项]\n\
      \n\
      选项:\n\
-       --port <u16>              监听端口（默认 5031）\n\
+       --port <u16>              监听端口（默认 5032）\n\
        --host <ip>               绑定地址（默认 127.0.0.1）\n\
        --log <level>             日志级别: error|warn|info|debug（默认 info）\n\
        --watch-debounce-ms <ms>  文件事件防抖（默认 350）\n\
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn defaults_with_no_args() {
         let cfg = parse_args(vec![]).unwrap().expect("config");
-        assert_eq!(cfg.port, 5031);
+        assert_eq!(cfg.port, 5032);
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.log, "info");
         assert_eq!(cfg.watch_debounce_ms, 350);
