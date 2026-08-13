@@ -100,7 +100,8 @@ fn scan_root(base: &Path) -> Result<Vec<DbInfo>> {
         if !name.chars().all(|c| c.is_ascii_digit()) {
             continue; // skip non-account dirs
         }
-        let db = qq_db_path(&e.path(), &name);
+        // `base` is the walk root — `e.path()` already ends with `name`.
+        let db = qq_db_path(base, &name);
         if db.is_file() {
             out.push(DbInfo { qq: name, path: db });
         }
