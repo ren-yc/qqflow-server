@@ -260,7 +260,12 @@ fn scan_table(
     chat_type: ChatType,
     store: &mut Store,
 ) -> Result<i64> {
-    let sql = format!("SELECT rowid, {} FROM {table}", cols_sql(chat_type, cols));
+    // `rowid` needs an explicit alias: QQ declares "40001" as INTEGER
+    // PRIMARY KEY (the rowid alias), so SQLite names the bare `rowid`
+    // expression's result column "40001" and the by-name lookup in
+    // `map_row` would fail on every row (rows are skipped and the index
+    // silently comes up empty). The fixed name keeps map_row name-driven.
+    let sql = format!("SELECT rowid AS \"rowid\", {} FROM {table}", cols_sql(chat_type, cols));
     let mut stmt = conn
         .prepare(&sql)
         .with_context(|| format!("prepare scan {table}"))?;
@@ -316,7 +321,8 @@ pub fn read_new(
         ChatType::Group => (GROUP_TABLE, probe_cols(conn, GROUP_TABLE)),
         ChatType::C2c => (C2C_TABLE, probe_cols(conn, C2C_TABLE)),
     };
-    let sql = format!("SELECT rowid, {} FROM {table} WHERE rowid > ?1", cols_sql(chat_type, cols));
+    // Same `rowid AS "rowid"` aliasing as `scan_table` (see there).
+    let sql = format!("SELECT rowid AS \"rowid\", {} FROM {table} WHERE rowid > ?1", cols_sql(chat_type, cols));
     let mut stmt = conn
         .prepare(&sql)
         .with_context(|| format!("prepare read {table}"))?;
@@ -410,6 +416,48 @@ mod tests {
         assert_eq!(store.display_uid("u_a"), "张三", "global display never shows the card");
         // seq = 100 -> seq>>32 = 0: the 40050 value must be used, not 0.
         assert_ne!(m.ts, seq_to_time(m.seq));
+    }
+
+    /// Real-QQ-like layout: `"40001"` is the INTEGER PRIMARY KEY (the rowid
+    /// alias), so SQLite reports a bare `SELECT rowid` result column as
+    /// `"40001"` — the exact aliasing that silently emptied the index when
+    /// `map_row` read the rowid by name (see `rowid_alias_columns_still_index`).
+    fn make_table_int_pk() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE group_msg_table (\"40021\" TEXT, \"40001\" INTEGER PRIMARY KEY, \"40020\" TEXT, \
+             \"40093\" TEXT, \"40800\" BLOB, \"40013\" INTEGER, \"40050\" INTEGER, \"40090\" TEXT);\
+             CREATE TABLE c2c_msg_table (\"40020\" TEXT, \"40001\" INTEGER PRIMARY KEY, \"40093\" TEXT, \"40800\" BLOB);\
+             INSERT INTO group_msg_table VALUES ('10001', 123, 'u_a', '张三', CAST('你好' AS BLOB), 1, 1234567890, '群名片');\
+             INSERT INTO c2c_msg_table VALUES ('u_5', 456, '李四', CAST('在吗' AS BLOB));",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn rowid_alias_columns_still_index() {
+        // Regression: QQ declares "40001" as INTEGER PRIMARY KEY; SQLite
+        // then names the `rowid` expression column "40001", so name-driven
+        // map_row must still resolve every row (it used to fail and the
+        // whole index silently came up empty on a real QQ db).
+        let conn = make_table_int_pk();
+        let store = build_index(&conn, None).unwrap();
+        assert_eq!(store.convs.len(), 2, "group + c2c conversations indexed");
+        assert_eq!(store.watermark_group, 123);
+        assert_eq!(store.watermark_c2c, 456);
+        let g = store.conversation(ChatType::Group, "10001").unwrap();
+        assert_eq!(g.msgs.len(), 1);
+        assert_eq!(g.msgs[0].seq, 123, "seq read from the 40001 column, not the rowid alias");
+        assert_eq!(g.msgs[0].ts, 1234567890, "40050 still authoritative");
+        let c = store.conversation(ChatType::C2c, "u_5").unwrap();
+        assert_eq!(c.msgs.len(), 1);
+        assert_eq!(c.msgs[0].seq, 456);
+        // Incremental read path resolves the same aliased rowid.
+        let (wm, records) = read_new(&conn, ChatType::Group, 0).unwrap();
+        assert_eq!(wm, 123);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].rowid, 123);
     }
 
     #[test]

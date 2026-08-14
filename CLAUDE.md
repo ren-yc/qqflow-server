@@ -90,6 +90,7 @@ VFS.
 - Table shapes (numeric column names are QQ-version-dependent, treat as fragile):
   - `group_msg_table`: `"40021"` group id, `"40001"` seq, `"40020"` sender uid, `"40093"` nickname, `"40800"` message blob
   - `c2c_msg_table`: `"40020"` peer uid, `"40001"` seq, `"40093"` nickname, `"40800"` blob
+  - `"40001"` 是 `INTEGER PRIMARY KEY`（rowid 别名，rowid == 40001 值）；SQLite 因此把裸 `SELECT rowid` 的结果列命名为 `"40001"`，扫描/增量 SQL 显式 `rowid AS "rowid"` 固定列名（`map_row` 按名读取依赖它；缺失该别名曾致真库索引静默为 0）
 - Spec-derived optional columns (QQDecrypt/nt_msg_db_util analysis, ground-truth probed per table by `store::index::probe_cols` — absent columns degrade): `"40013"` message direction (0 other / 1,2 self / 3 system / unknown bitmasks observed → `direction_to_is_send`: 1|2→1 else 0), `"40050"` unix send time (preferred over `seq >> 32` per-row when non-zero — probe found ~29% of rows disagree by >2 s), `"40090"` sender group card (ground-truth confirmed per-sender card; **scope = per-conversation only**: rides in `MessageRecord.card` → `Store.group_cards` (conv_key → uid → card) and displays via `Store::display_sender` in group context (SSE `source_name`, chatlab members/accountName, group-members `groupNickname`) — it NEVER enters the global `uid_names`/`display_uid`/contacts (would leak the group card into c2c chats; 40093 is often empty on card rows, so without `profile_info.db` the global name degrades to the uid while the in-group display still shows the card).
 - Message timestamp: `"40050"` when present/non-zero, else packed high 32 bits of seq: `seq_to_time(seq) = seq >> 32` (`parser::types`).
 - Conversation map key: `g:<groupId>` / `c:<peerUid>` (`store::conv_key`). `classify_talker` disambiguates: all-digit → group, `u_`-prefixed → c2c.
@@ -140,6 +141,7 @@ Structured-first hybrid. `parser::proto` is a hand-rolled two-level protobuf wir
 - Numeric column names (`"40021"`, `"40800"`, …), table layouts, and the uid→QQ mapping table all vary with QQ versions; code degrades gracefully (best-effort queries, heuristic parsing).
 - uid→昵称/备注/QQ、群号→群名的映射表列结构无稳定文档：`nt_uid_mapping_table`/`profile_info.db` 的列与 `group_info.db` 的存在性/布局/是否带头均由 `store::names` 在加载时值驱动探测（缺表缺列 → 空映射，显示回落消息昵称/群号）；ground-truth 探针（`tests/real_db_groundtruth.rs` 的 `probe_columns` + 兄弟文件探测 + `load_names` 端到端验证）输出真实布局用于仲裁。
 - `MessageOut::is_send` derives from the `"40013"` direction column (`direction_to_is_send`: 0/3/unknown → 0, 1/2 → 1); degrades to 0 when the QQ version lacks the column.
+- `"40001"` 的 `INTEGER PRIMARY KEY` 声明（rowid 别名）随版本稳定存在，但 SQLite 对 `SELECT rowid` 的结果列名会随该声明变化（真库实测命名为 `"40001"`）；索引 SQL 显式 `rowid AS "rowid"`，`store::index` 的 `rowid_alias_columns_still_index` 单测用同构 fixture 守护该命名。
 
 ## Tests
 
