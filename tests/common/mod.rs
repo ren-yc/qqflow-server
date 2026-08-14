@@ -308,7 +308,7 @@ pub fn write_fake_group_info_headed(nt_db_dir: &Path) -> std::path::PathBuf {
 /// Write a fake sibling `profile_info.db` — HEADERLESS SQLCipher, so the
 /// loader's offset→plain open retry is exercised (real QQ siblings carry
 /// the header; headerless ones must still open). Real layout shape:
-/// `"1000"` uid / `"20002"` nick / `"1002"` QQ number.
+/// `"1000"` uid / `"20002"` nick / `"20009"` remark / `"1002"` QQ number.
 pub fn write_fake_profile_info(nt_db_dir: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(nt_db_dir).unwrap();
     let path = nt_db_dir.join("profile_info.db");
@@ -316,9 +316,9 @@ pub fn write_fake_profile_info(nt_db_dir: &Path) -> std::path::PathBuf {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
     conn.execute_batch(
-        "CREATE TABLE profile_info_v2 (\"1000\" TEXT, \"20002\" TEXT, \"1002\" TEXT);\
-         INSERT INTO profile_info_v2 VALUES ('u_12345', '档案昵称', '12345');\
-         INSERT INTO profile_info_v2 VALUES ('u_c', '王五档案', '10003');",
+        "CREATE TABLE profile_info_v2 (\"1000\" TEXT, \"20002\" TEXT, \"20009\" TEXT, \"1002\" TEXT);\
+         INSERT INTO profile_info_v2 VALUES ('u_12345', '档案昵称', '', '12345');\
+         INSERT INTO profile_info_v2 VALUES ('u_c', '王五档案', '王五备注', '10003');",
     )
     .unwrap();
     drop(conn);

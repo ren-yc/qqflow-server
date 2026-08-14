@@ -197,6 +197,11 @@ fn fake_db_names_loaded() {
     // profile_info.db (authoritative, probed first): nick per uid.
     assert_eq!(maps.uid_nick.get("u_12345").map(String::as_str), Some("档案昵称"), "profile nick wins");
     assert_eq!(maps.uid_nick.get("u_c").map(String::as_str), Some("王五档案"), "profile-only uid");
+    assert_eq!(
+        maps.uid_remark.get("u_c").map(String::as_str),
+        Some("王五备注"),
+        "20009 remark column harvested (field-id hint)"
+    );
     // uid mapping table (inside nt_msg.db): remark + qq per uid.
     assert_eq!(maps.uid_remark.get("u_12345").map(String::as_str), Some("李四他哥"));
     assert_eq!(maps.uid_remark.get("u_a").map(String::as_str), Some("张三备注"));
@@ -210,9 +215,13 @@ fn fake_db_names_loaded() {
     // check display resolution through the store.
     store.names = maps;
 
-    assert_eq!(store.display_uid("u_12345"), "李四他哥", "remark wins over profile nick");
+    assert_eq!(store.display_uid("u_12345"), "李四他哥", "remark wins over message nick");
     assert_eq!(store.display_uid("u_a"), "张三备注", "remark wins");
-    assert_eq!(store.display_uid("u_c"), "王五档案", "profile nick wins over message nick 王五");
+    assert_eq!(
+        store.display_uid("u_c"),
+        "王五备注",
+        "20009 remark wins over message nick 王五 and profile nick 王五档案"
+    );
     assert_eq!(store.display_uid("u_b"), "李四", "no remark/profile row -> message nick");
     assert_eq!(
         store.display_name(ChatType::Group, "10001"),
@@ -220,7 +229,16 @@ fn fake_db_names_loaded() {
         "group-info name"
     );
     assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三备注", "c2c remark wins");
-    assert_eq!(store.display_name(ChatType::C2c, "u_c"), "王五档案", "c2c profile nick wins");
+    assert_eq!(
+        store.display_name(ChatType::C2c, "u_12345"),
+        "李四他哥",
+        "c2c remark wins over 会话名(首行 40093 王五)"
+    );
+    assert_eq!(
+        store.display_name(ChatType::C2c, "u_c"),
+        "王五备注",
+        "c2c remark wins over profile nick (no conversation)"
+    );
 }
 
 /// Structured image rows flow through the whole pipeline: the spec-shaped

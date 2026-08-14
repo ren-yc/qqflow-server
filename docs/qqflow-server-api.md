@@ -155,8 +155,8 @@ GET /api/v1/push/messages
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
 | `avatarUrl` | v1 恒省略（序列化时跳过该字段） |
-| `sourceName` | 发送者显示名（群聊：本群群名片（40090）> 备注 > 档案昵称 > 最新昵称 > UID；私聊：备注 > 档案昵称 > 最新昵称 > UID——群名片只在所属群内显示，不会泄漏进私聊/联系人） |
-| `groupName` | 会话显示名（群聊：群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊：备注 > 档案昵称 > 对方昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
+| `sourceName` | 发送者显示名（群聊：本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID；私聊：备注 > 最新昵称 > 档案昵称 > UID——群名片只在所属群内显示，不会泄漏进私聊/联系人） |
+| `groupName` | 会话显示名（群聊：群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊：备注 > 对方昵称（会话名） > 档案昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
 | `media` | 仅图片/语音/视频消息：媒体元数据对象（与 messages 的 `media` 同形状），缺失时省略 |
@@ -301,8 +301,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）：
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
-- `meta.name`（会话显示名：群聊为群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊为备注 > 档案昵称 > 昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
-- `members[].platformId`、`members[].accountName`（群聊：本群群名片 > 备注 > 档案昵称 > 最新昵称 > UID；私聊同链路无卡片）、`members[].groupNickname`（群聊群名片，私聊恒空）、`members[].avatar`（恒空）
+- `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
+- `members[].platformId`、`members[].accountName`（群聊：本群群名片 > 备注 > 最新昵称 > 档案昵称 > UID；私聊同链路无卡片）、`members[].groupNickname`（群聊群名片，私聊恒空）、`members[].avatar`（恒空）
 - `messages[].sender`、`messages[].accountName`（同上，群聊群名片优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
 ---
@@ -362,7 +362,7 @@ GET /api/v1/sessions
 - `success`
 - `count`
 - `sessions[].username`
-- `sessions[].displayName`（群聊：群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊：备注 > 档案昵称 > 对方昵称 > UID）
+- `sessions[].displayName`（群聊：群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊：备注 > 对方昵称（会话名） > 档案昵称 > UID）
 - `sessions[].type`（`2`=群聊，`1`=私聊）
 - `sessions[].lastTimestamp`
 - `sessions[].unreadCount`（v1 恒为 `0`）
@@ -461,7 +461,7 @@ GET /api/v1/sessions/{id}/messages
 
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
-v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。昵称来自联系人档案（`profile_info.db` 的 `20002`，经 ground-truth 探针确认），QQ 号来自 `nt_msg.db` 的 `nt_uid_mapping_table` + 档案（版本相关，列结构按值探测，缺表/缺列时退化为消息昵称列表）。备注（remark）：当前 QQ 版本的可读表中无此列，v1 恒为空串；有备注列的版本会按列名/字段 id 提示（`20003`/`remark`）自动启用。
+v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。昵称来自联系人档案（`profile_info.db` 的 `20002`，经 ground-truth 探针确认），QQ 号来自 `nt_msg.db` 的 `nt_uid_mapping_table` + 档案（版本相关，列结构按值探测，缺表/缺列时退化为消息昵称列表）。备注（remark）：来自 `profile_info.db` 的 `20009` 列（QQDecrypt 字段 id，真库 ground-truth 确认——本账号实测 17 个联系人设置备注）；分类按字段 id `20009` 直接识别（绕过 CJK 门槛，兼容拉丁备注），列名/字段 id 提示（`remark`/`20003`/`60026`）保留作兜底。
 
 **请求**
 
@@ -482,9 +482,9 @@ GET /api/v1/contacts
 - `success`
 - `count`
 - `contacts[].username`（UID）
-- `contacts[].displayName`（备注 > 档案昵称 > 消息昵称 > UID）
+- `contacts[].displayName`（备注 > 消息昵称 > 档案昵称 > UID）
 - `contacts[].nickname`（档案昵称 > 消息昵称；均无时为空串）
-- `contacts[].remark`（当前 QQ 版本的可读表无备注列，v1 恒为空串；有备注列的版本自动启用）
+- `contacts[].remark`（来自 `profile_info.db` 的 `20009`；未设置备注的联系人为空串）
 - `contacts[].alias`（WeFlow 的微信号槽位；QQ 场景存放该联系人 **QQ 号**——uid 映射表/profile 可读时返回，无数据源为空串；原 `qq` 字段已迁移至此）
 - `contacts[].avatarUrl`（v1 恒为空串）
 - `contacts[].type`（v1 恒为 `"friend"`）
@@ -522,8 +522,8 @@ GET /api/v1/group-members
 - `fromCache`（v1 恒为 `false`）
 - `updatedAt`（毫秒时间戳）
 - `members[].wxid`（发送者 UID）
-- `members[].displayName` / `members[].nickname` / `members[].groupNickname`（均为昵称）
-- `members[].remark`（有备注列的 QQ 版本来自档案/映射表；当前版本恒为空串）
+- `members[].displayName` / `members[].nickname`（该群消息内首见昵称）；`members[].groupNickname`（本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID）
+- `members[].remark`（来自 `profile_info.db` 的 `20009`；未设置备注的成员为空串）
 - `members[].alias` / `members[].avatarUrl`（v1 恒为空串）
 - `members[].isOwner` / `members[].isFriend`（v1 恒为 `false`）
 - `members[].messageCount`（仅 `includeMessageCounts=1` 时返回）

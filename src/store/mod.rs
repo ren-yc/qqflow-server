@@ -54,9 +54,9 @@ impl Conversation {
 /// message-derived names.
 #[derive(Debug, Default)]
 pub struct NameMaps {
-    /// uid -> remark name (联系人备注). Ground truth on current QQ
-    /// versions: no readable table stores remarks — this stays empty and
-    /// display falls back to the nicknames.
+    /// uid -> remark name (联系人备注). Ground truth: `profile_info.db`
+    /// `20009` (QQDecrypt field id, `classify_remark` 绕过 CJK 门槛)。
+    /// Loaded when the hint fires, empty otherwise.
     pub uid_remark: HashMap<String, String>,
     /// uid -> authoritative contact nickname (联系人档案 `20002`).
     pub uid_nick: HashMap<String, String>,
@@ -108,53 +108,54 @@ impl Store {
     }
 
     /// Session display name (pure lookup — never mutates `conv.name`):
-    /// c2c: remark > profile nick (uid_nick) > message nick (conv.name) > uid;
-    /// group: group remark (60026, QQ 客户端也优先显示备注) > group-info
-    /// name > rename-message name (conv.name) > group id.
+    /// c2c: remark (20009) > session name (conv.name = 首行 40093) >
+    /// profile nick (uid_nick) > uid; group: group remark (60026, QQ 客户端
+    /// 也优先显示备注) > rename-message name (conv.name, 仅真实改名名) >
+    /// group-info name (group_name) > group id.
     pub fn display_name(&self, chat_type: ChatType, talker: &str) -> String {
-        let from_map = match chat_type {
-            ChatType::C2c => self
-                .names
-                .uid_remark
-                .get(talker)
-                .filter(|s| !s.is_empty())
-                .or_else(|| self.names.uid_nick.get(talker).filter(|s| !s.is_empty())),
-            ChatType::Group => self
-                .names
-                .group_remark
-                .get(talker)
-                .filter(|s| !s.is_empty())
-                .or_else(|| self.names.group_name.get(talker).filter(|s| !s.is_empty())),
+        let remark = match chat_type {
+            ChatType::C2c => self.names.uid_remark.get(talker),
+            ChatType::Group => self.names.group_remark.get(talker),
         };
-        if let Some(name) = from_map.filter(|s| !s.is_empty()) {
+        if let Some(name) = remark.filter(|s| !s.is_empty()) {
             return name.clone();
         }
         if let Some(name) = self
             .conversation(chat_type, talker)
-            .map(|c| c.name.clone())
+            .map(|c| c.name.as_str())
             .filter(|s| !s.is_empty())
+            // 群的 conv.name 以群号占位（未改名群）——占位不参与显示，
+            // 否则群号会压过群信息库群名。
+            .filter(|s| chat_type == ChatType::C2c || *s != talker)
         {
-            return name;
+            return name.to_string();
+        }
+        let nick = match chat_type {
+            ChatType::C2c => self.names.uid_nick.get(talker),
+            ChatType::Group => self.names.group_name.get(talker),
+        };
+        if let Some(name) = nick.filter(|s| !s.is_empty()) {
+            return name.clone();
         }
         talker.to_string()
     }
 
-    /// Person display name: remark > profile nick (uid_nick) > latest
-    /// message nick (uid_names) > uid.
+    /// Person display name: remark (20009) > latest message nick
+    /// (uid_names) > profile nick (uid_nick) > uid.
     pub fn display_uid(&self, uid: &str) -> String {
         self.names
             .uid_remark
             .get(uid)
             .filter(|s| !s.is_empty())
-            .or_else(|| self.names.uid_nick.get(uid).filter(|s| !s.is_empty()))
             .or_else(|| self.uid_names.get(uid).filter(|s| !s.is_empty()))
+            .or_else(|| self.names.uid_nick.get(uid).filter(|s| !s.is_empty()))
             .cloned()
             .unwrap_or_else(|| uid.to_string())
     }
 
     /// Sender display name in a conversation context. In a group, the
     /// sender's group card ("40090") for THIS conversation wins over the
-    /// global name (remark > profile nick > message nick) — cards are
+    /// global name (remark 20009 > message nick > profile nick) — cards are
     /// per-group and must never leak into c2c chats or contacts.
     pub fn display_sender(&self, chat_type: ChatType, talker: &str, uid: &str) -> String {
         if chat_type == ChatType::Group
@@ -237,27 +238,32 @@ mod tests {
     }
 
     #[test]
-    fn display_name_c2c_prefers_remark_over_profile_nick_over_nick_over_uid() {
+    fn display_name_c2c_prefers_remark_over_conv_name_over_profile_nick_over_uid() {
         let mut store = Store::default();
         store
             .convs
             .insert(conv_key(ChatType::C2c, "u_a"), conv(ChatType::C2c, "u_a", "张三"));
-        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三", "message nick only");
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三", "会话名(首行 40093) only");
 
         store.names.uid_nick.insert("u_a".into(), "档案昵称".into());
-        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "档案昵称", "profile nick wins");
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三", "会话名 wins over 档案昵称");
 
         store.names.uid_remark.insert("u_a".into(), "张三备注".into());
         assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三备注", "remark wins");
 
         store.names.uid_remark.insert("u_a".into(), String::new());
-        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "档案昵称", "empty remark falls back");
+        assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三", "empty remark falls back to 会话名");
+
+        // 无会话记录 -> 档案昵称
+        let mut store2 = Store::default();
+        store2.names.uid_nick.insert("u_b".into(), "档案昵称".into());
+        assert_eq!(store2.display_name(ChatType::C2c, "u_b"), "档案昵称", "no conversation -> profile nick");
 
         assert_eq!(store.display_name(ChatType::C2c, "u_unknown"), "u_unknown", "no data -> uid");
     }
 
     #[test]
-    fn display_name_group_prefers_remark_over_info_name_over_rename_msg_over_id() {
+    fn display_name_group_prefers_remark_over_rename_msg_over_info_name_over_id() {
         let mut store = Store::default();
         store
             .convs
@@ -271,8 +277,8 @@ mod tests {
         store.names.group_name.insert("10001".into(), "群信息库群名".into());
         assert_eq!(
             store.display_name(ChatType::Group, "10001"),
-            "群信息库群名",
-            "group-info name wins over rename message"
+            "改名消息群名",
+            "rename-message name wins over group-info name"
         );
 
         store.names.group_remark.insert("10001".into(), "群备注名".into());
@@ -285,24 +291,38 @@ mod tests {
         store.names.group_remark.insert("10001".into(), String::new());
         assert_eq!(
             store.display_name(ChatType::Group, "10001"),
-            "群信息库群名",
-            "empty group remark falls back"
+            "改名消息群名",
+            "empty group remark falls back to rename-message name"
+        );
+
+        // 未改名群：conv.name 是群号占位，不得压过群信息库群名。
+        store
+            .convs
+            .insert(conv_key(ChatType::Group, "10002"), conv(ChatType::Group, "10002", "10002"));
+        store.names.group_name.insert("10002".into(), "群信息库名".into());
+        assert_eq!(
+            store.display_name(ChatType::Group, "10002"),
+            "群信息库名",
+            "placeholder group id never shadows the info name"
         );
 
         assert_eq!(store.display_name(ChatType::Group, "99999"), "99999", "no data -> group id");
     }
 
     #[test]
-    fn display_uid_prefers_remark_over_profile_nick_over_message_nick_over_uid() {
+    fn display_uid_prefers_remark_over_message_nick_over_profile_nick_over_uid() {
         let mut store = Store::default();
         store.uid_names.insert("u_a".into(), "张三".into());
         assert_eq!(store.display_uid("u_a"), "张三", "message nick only");
 
         store.names.uid_nick.insert("u_a".into(), "档案昵称".into());
-        assert_eq!(store.display_uid("u_a"), "档案昵称", "profile nick wins");
+        assert_eq!(store.display_uid("u_a"), "张三", "message nick wins over profile nick");
 
         store.names.uid_remark.insert("u_a".into(), "张三备注".into());
         assert_eq!(store.display_uid("u_a"), "张三备注", "remark wins");
+
+        store.names.uid_remark.insert("u_a".into(), String::new());
+        assert_eq!(store.display_uid("u_a"), "张三", "empty remark falls back to message nick");
 
         assert_eq!(store.display_uid("u_zzz"), "u_zzz", "no data -> uid");
     }

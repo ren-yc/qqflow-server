@@ -328,13 +328,23 @@ fn classify_qq(cols: &[ColStats], exclude: &[usize]) -> Option<usize> {
         })
 }
 
-/// Remark/name column: mostly-CJK values AND a column-name hint
-/// (`remark`/`note`/`alias`/`备注`) or a QQ known numeric field id
-/// (`60026` 群备注, `20003` 好友备注). Hint-only by design: the most-CJK
-/// fallback is a false-positive magnet (加好友验证问题、入群问题 are CJK too
-/// — ground-truth-confirmed) and on current versions no readable table
-/// stores remarks at all.
+/// Remark/name column: QQ's known numeric field id `20009` (用户备注,
+/// ground-truth-confirmed in `profile_info_v2/v6`) first — it BYPASSES the
+/// CJK-ratio gate because Latin-script remarks ("Bob Johnson", "CppLover")
+/// fail it (same rationale as `classify_nick`'s 20002); then mostly-CJK
+/// values AND a column-name hint (`remark`/`note`/`alias`/`备注`) or a QQ
+/// known numeric field id (`60026` 群备注, `20003` 好友备注). Hint-only by
+/// design: the most-CJK fallback is a false-positive magnet (加好友验证问
+/// 题、入群问题 are CJK too — ground-truth-confirmed) and `20003` is a
+/// timestamp column on current versions — the CJK gate keeps it excluded.
 fn classify_remark(cols: &[ColStats], exclude: &[usize]) -> Option<usize> {
+    if let Some(i) = (0..cols.len())
+        .filter(|i| !exclude.contains(i))
+        .filter(|i| cols[*i].nonempty > 0)
+        .find(|i| cols[*i].name == "20009")
+    {
+        return Some(i);
+    }
     (0..cols.len())
         .filter(|i| !exclude.contains(i))
         .filter(|i| cols[*i].nonempty > 0 && cols[*i].cjk_ratio() > 0.5)
@@ -350,7 +360,7 @@ fn classify_remark(cols: &[ColStats], exclude: &[usize]) -> Option<usize> {
 }
 
 /// Nick column (uid tables): QQ's known numeric field id `20002` (昵称)
-/// first — mixed-script nicks like "Yuchen Ren" fail the CJK ratio
+/// first — mixed-script nicks like "Alice Smith" fail the CJK ratio
 /// (ground-truth-confirmed) — then `nick`/`昵称`/`name` hints. No CJK
 /// fallback: long CJK profile texts (AI 助手介绍等) are false-positive
 /// magnets, and message-derived `uid_names` is the standing fallback.
@@ -405,7 +415,7 @@ fn classify_group_key(cols: &[ColStats], known: &KnownKeys) -> Option<usize> {
 
 /// Group name column: mostly-CJK values; QQ's known numeric field id
 /// `60007` (群名称, ground-truth-confirmed — tech-group names like
-/// "OpenMMLab社区3群" are often < 60% Han, so the CJK-only fallback misses
+/// "技术交流二群" are often < 60% Han, so the CJK-only fallback misses
 /// them) first, then the `name`/`title`/`名` hint, then the most-CJK
 /// non-key column.
 fn classify_group_name(cols: &[ColStats], exclude: &[usize]) -> Option<usize> {
@@ -726,21 +736,62 @@ mod tests {
 
     #[test]
     fn mixed_script_nick_20002_classifies_without_cjk() {
-        // "Yuchen Ren" / "." are ~0% Han — the 20002 field-id hint must
+        // "Alice Smith" / "." are ~0% Han — the 20002 field-id hint must
         // classify them without the CJK-ratio gate (ground-truth shape).
         let conn = mem_conn();
         conn.execute_batch(
             "CREATE TABLE profile_info_v2 (\"1000\" TEXT, \"20002\" TEXT, \"1002\" TEXT);\
-             INSERT INTO profile_info_v2 VALUES ('u_a', 'Yuchen Ren', '10001');\
+             INSERT INTO profile_info_v2 VALUES ('u_a', 'Alice Smith', '10001');\
              INSERT INTO profile_info_v2 VALUES ('u_b', '.', '10002');",
         )
         .unwrap();
         let mut maps = NameMaps::default();
         let known = KnownKeys::default();
         harvest_uid_profiles(&conn, &known, &mut maps);
-        assert_eq!(maps.uid_nick.get("u_a").map(String::as_str), Some("Yuchen Ren"));
+        assert_eq!(maps.uid_nick.get("u_a").map(String::as_str), Some("Alice Smith"));
         assert_eq!(maps.uid_remark.len(), 0, "no remark column -> stays empty");
         assert_eq!(maps.uid_qq.get("u_a").map(String::as_str), Some("10001"));
+    }
+
+    #[test]
+    fn remark_20009_field_id_bypasses_cjk_gate() {
+        // Latin-script remarks ("Bob Johnson") fail the CJK-ratio gate —
+        // the 20009 field-id hint must classify them regardless (real-DB
+        // ground-truth shape: profile_info_v2/v6.20009 = 用户备注).
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE profile_info_v2 (\"1000\" TEXT, \"20002\" TEXT, \"20009\" TEXT);\
+             INSERT INTO profile_info_v2 VALUES ('u_a', 'NEON_HUNTER', 'Bob Johnson');\
+             INSERT INTO profile_info_v2 VALUES ('u_b', '王五', '王五备注');",
+        )
+        .unwrap();
+        let mut maps = NameMaps::default();
+        let known = KnownKeys::default();
+        harvest_uid_profiles(&conn, &known, &mut maps);
+        assert_eq!(
+            maps.uid_remark.get("u_a").map(String::as_str),
+            Some("Bob Johnson"),
+            "Latin remark via 20009"
+        );
+        assert_eq!(maps.uid_remark.get("u_b").map(String::as_str), Some("王五备注"), "CJK remark via 20009");
+        assert_eq!(maps.uid_nick.get("u_a").map(String::as_str), Some("NEON_HUNTER"), "20002 stays the nick");
+    }
+
+    #[test]
+    fn remark_20003_stays_gated_against_timestamp_columns() {
+        // On current versions 20003 is a timestamp column (real-DB
+        // ground truth) — the CJK gate must keep it excluded despite the
+        // field-id hint.
+        let conn = mem_conn();
+        conn.execute_batch(
+            "CREATE TABLE profile_info_v2 (\"1000\" TEXT, \"20002\" TEXT, \"20003\" TEXT);\
+             INSERT INTO profile_info_v2 VALUES ('u_a', 'NEON_HUNTER', '1723344323000');",
+        )
+        .unwrap();
+        let mut maps = NameMaps::default();
+        let known = KnownKeys::default();
+        harvest_uid_profiles(&conn, &known, &mut maps);
+        assert!(maps.uid_remark.is_empty(), "20003 timestamps must not become remarks");
     }
 
     #[test]
