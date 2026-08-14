@@ -501,7 +501,7 @@ fn manual_sync_picks_up_new_rows() {
 
     let second = account.poll_once().unwrap();
     assert_eq!(second.len(), 1, "second poll returns only the new row");
-    assert_eq!(second[0].parsed.content, "手动同步新增");
+    assert_eq!(second[0].content, "手动同步新增");
 
     // The new row must also be broadcast as an SSE event.
     let ev = rx.try_recv().unwrap();

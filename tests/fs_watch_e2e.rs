@@ -114,7 +114,7 @@ fn fallback_changed_detects_wal_writes() {
     assert!(!account.changed(), "snapshot advances after the check");
     let rows = account.poll_once().unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].parsed.content, "兜底轮询新增");
+    assert_eq!(rows[0].content, "兜底轮询新增");
 
     drop(writer);
     let _ = std::fs::remove_dir_all(&dir);

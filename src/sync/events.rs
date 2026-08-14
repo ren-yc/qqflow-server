@@ -60,7 +60,8 @@ impl Event {
         }
     }
 
-    #[allow(clippy::too_many_arguments)] // one constructor per event kind
+    /// Revoke events never carry media (a recall record can only come from
+    /// the heuristic phrase path, which produces no structured media).
     pub fn message_revoke(
         chat_type: ChatType,
         session_id: String,
@@ -69,7 +70,6 @@ impl Event {
         source_name: Option<String>,
         content: String,
         timestamp: i64,
-        media: Option<MediaInfo>,
     ) -> Self {
         Self {
             event: "message.revoke".into(),
@@ -81,7 +81,7 @@ impl Event {
             source_name,
             content,
             timestamp,
-            media,
+            media: None,
             last_rowid_group: None,
             last_rowid_c2c: None,
         }

@@ -26,8 +26,9 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
 
 use crate::db::live::LiveReader;
-use crate::parser::types::{ChatType, MessageRecord, MsgType};
+use crate::parser::types::{ChatType, MsgType};
 use crate::store::index;
+use crate::store::query::MessageOut;
 use crate::store::Store;
 
 pub use events::Event;
@@ -131,10 +132,12 @@ impl AccountSync {
     }
 
     /// One sync pass: read rows above the watermark from the LIVE source,
-    /// append them, broadcast SSE events, and return the appended records.
-    /// Safe to call concurrently — the reader mutex and the store write
-    /// lock serialize overlapping passes (the second one finds nothing new).
-    pub fn poll_once(&self) -> Result<Vec<MessageRecord>> {
+    /// append them, broadcast SSE events, and return the appended messages
+    /// (already shaped as `MessageOut`, with the mediaId fetchability
+    /// filter applied). Safe to call concurrently — the reader mutex and
+    /// the store write lock serialize overlapping passes (the second one
+    /// finds nothing new).
+    pub fn poll_once(&self) -> Result<Vec<MessageOut>> {
         let mut reader = self.reader.lock();
         let result = self.poll_locked(&mut reader);
         if result.is_err() {
@@ -145,7 +148,7 @@ impl AccountSync {
         result
     }
 
-    fn poll_locked(&self, reader: &mut LiveReader) -> Result<Vec<MessageRecord>> {
+    fn poll_locked(&self, reader: &mut LiveReader) -> Result<Vec<MessageOut>> {
         let conn = reader.acquire()?;
 
         // Read phase: parse rows above the watermark without touching the
@@ -158,20 +161,17 @@ impl AccountSync {
         let (new_wm_g, new_g) = index::read_new(conn, ChatType::Group, wm_g)?;
         let (new_wm_c, new_c) = index::read_new(conn, ChatType::C2c, wm_c)?;
 
-        // Apply phase: one write-lock critical section — append both tables,
-        // advance both watermarks, and build the SSE events.
-        let events: Vec<Event> = {
+        // Apply phase: one write-lock critical section — build the SSE
+        // events and response rows here (apply moves the records into the
+        // store, no clone), append both tables, advance both watermarks.
+        let (events, outs): (Vec<Event>, Vec<MessageOut>) = {
             let mut guard = self.store.write();
             // Media root may predate the account (sync can run before the
             // index build in edge paths); resolve it lazily once.
             if guard.media_root.is_none() {
-                guard.media_root = self.db_dir.parent().map(|p| p.join("nt_data"));
+                guard.media_root = crate::store::media::media_root_of(&self.db_dir);
             }
-            index::apply_records(&mut guard, &new_g);
-            index::apply_records(&mut guard, &new_c);
-            guard.watermark_group = new_wm_g;
-            guard.watermark_c2c = new_wm_c;
-            new_g
+            let events: Vec<Event> = new_g
                 .iter()
                 .chain(&new_c)
                 .map(|r| {
@@ -181,7 +181,6 @@ impl AccountSync {
                     // wins over the global name (never leaks across chats).
                     let group_name = Some(guard.display_name(r.chat_type, &r.talker));
                     let source_name = Some(guard.display_sender(r.chat_type, &r.talker, &r.from_uid));
-                    let media = r.parsed.media.clone();
                     if r.parsed.msg_type == MsgType::Recall {
                         Event::message_revoke(
                             r.chat_type,
@@ -191,7 +190,6 @@ impl AccountSync {
                             source_name,
                             r.parsed.content.clone(),
                             r.ts,
-                            media,
                         )
                     } else {
                         Event::message_new(
@@ -202,19 +200,29 @@ impl AccountSync {
                             source_name,
                             r.parsed.content.clone(),
                             r.ts,
-                            media,
+                            r.parsed.media.clone(),
                         )
                     }
                 })
-                .collect()
+                .collect();
+            // Response rows: shaped under the lock so the mediaId filter
+            // sees the store (same contract as the messages query).
+            let outs: Vec<MessageOut> = new_g
+                .iter()
+                .chain(&new_c)
+                .map(MessageOut::from_record)
+                .map(|o| crate::store::query::with_fetchable_media_id(&guard, o))
+                .collect();
+            index::apply_records(&mut guard, new_g);
+            index::apply_records(&mut guard, new_c);
+            guard.watermark_group = new_wm_g;
+            guard.watermark_c2c = new_wm_c;
+            (events, outs)
         };
         for ev in events {
             let _ = self.tx.send(ev);
         }
-
-        let mut all = new_g;
-        all.extend(new_c);
-        Ok(all)
+        Ok(outs)
     }
 }
 
@@ -239,20 +247,20 @@ impl SyncEngine {
     }
 
     /// Manual sync: run a full pass on every registered account and return
-    /// all newly appended records, newest first. Name maps (备注/群名) ride
+    /// all newly appended messages, newest first. Name maps (备注/群名) ride
     /// the manual sync — the one place a client-visible refresh happens.
-    pub fn sync_all(&self) -> Vec<MessageRecord> {
+    pub fn sync_all(&self) -> Vec<MessageOut> {
         let mut out = Vec::new();
         for account in self.snapshot() {
             match account.poll_once() {
-                Ok(records) => {
-                    out.extend(records);
+                Ok(messages) => {
+                    out.extend(messages);
                     account.refresh_names();
                 }
                 Err(e) => tracing::warn!("manual sync error: {e:#}"),
             }
         }
-        out.sort_by_key(|r| std::cmp::Reverse((r.ts, r.rowid)));
+        out.sort_by_key(|m| std::cmp::Reverse((m.create_time, m.local_id)));
         out
     }
 }

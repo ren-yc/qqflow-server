@@ -55,11 +55,7 @@ pub async fn handler(
         .map_err(|e| ApiError::internal(format!("sync task panicked: {e}")))?;
 
     let synced = records.len();
-    let messages: Vec<MessageOut> = records
-        .into_iter()
-        .take(limit)
-        .map(|r| MessageOut::from_record(&r))
-        .collect();
+    let messages: Vec<MessageOut> = records.into_iter().take(limit).collect();
 
     Ok(Json(json!({
         "success": true,

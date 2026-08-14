@@ -19,7 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::parser::types::{MediaInfo, MsgType};
+use crate::parser::types::MediaInfo;
+use crate::store::media::resolve_local_path;
 
 /// Which media kinds to export (WeFlow sub-switches image/voice/video/emoji).
 #[derive(Debug, Clone, Copy)]
@@ -56,44 +57,6 @@ pub struct ExportOut {
     pub local_path: String,
 }
 
-/// WeFlow subdirectory per media kind (matches the
-/// `<talker>/<mediaType>/<file>` layout).
-pub fn kind_dir(kind: MsgType) -> &'static str {
-    match kind {
-        MsgType::Image => "images",
-        MsgType::Voice => "voices",
-        MsgType::Video => "videos",
-        _ => "images", // unreachable in practice; callers gate by kind
-    }
-}
-
-fn kind_enabled(kind: MsgType, opts: &ExportOptions) -> bool {
-    match kind {
-        MsgType::Image => opts.image,
-        MsgType::Voice => opts.voice,
-        MsgType::Video => opts.video,
-        _ => false,
-    }
-}
-
-/// Resolve a local cache path to an absolute filesystem path: absolute
-/// "45812" paths are used as-is (they come from QQ's own DB); relative
-/// paths resolve against the account's `nt_data` root, rejecting any `..`
-/// component at join time. None when unresolvable or the file is missing.
-pub fn resolve_local_path(local_path: &str, media_root: Option<&Path>) -> Option<PathBuf> {
-    let raw = Path::new(local_path);
-    let joined = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        let root = media_root?;
-        if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            return None;
-        }
-        root.join(raw)
-    };
-    joined.canonicalize().ok()
-}
-
 /// Safe export file name: `<key>.<source ext>` when a store key exists
 /// (md5 hex or uuid — unique per content, so two messages with different
 /// bytes can never collide on one destination; QQ's original file names
@@ -110,7 +73,7 @@ fn export_file_name(m: &MediaInfo, source: &Path) -> String {
         if let Some(ext) = source.extension().and_then(|e| e.to_str()).filter(|e| !e.is_empty() && e.len() <= 8) {
             return format!("{key}.{ext}");
         }
-        return key;
+        return key.to_string();
     }
     if let Some(name) = m.file_name.as_deref()
         && url_safe(name)
@@ -125,26 +88,25 @@ fn export_file_name(m: &MediaInfo, source: &Path) -> String {
         .to_string()
 }
 
-/// Export one media file into `<root>/<talker>/<kind>/<file>`. Returns None
-/// when the kind is disabled, the source file is missing (QQ cleared the
-/// cache), or the copy failed. Idempotent: an existing destination with the
-/// same size is left untouched (mtime preserved) — sound because the
+/// Export one media file into `<root>/<talker>/<kind_dir>/<file>`. Returns
+/// None when the kind is disabled, the source file is missing (QQ cleared
+/// the cache), or the copy failed. Idempotent: an existing destination with
+/// the same size is left untouched (mtime preserved) — sound because the
 /// destination name embeds the content key, so a same-size destination is
 /// the same media, never a different file that shares a name.
 pub fn export_media(
     ctx: &ExportContext,
     m: &MediaInfo,
-    kind: MsgType,
-    opts: &ExportOptions,
+    kind_dir: &str,
+    enabled: bool,
     media_root: Option<&Path>,
 ) -> Option<ExportOut> {
-    if !kind_enabled(kind, opts) {
+    if !enabled {
         return None;
     }
     let source = resolve_local_path(m.local_path.as_deref()?, media_root)?;
     let file_name = export_file_name(m, &source);
-    let kind = kind_dir(kind);
-    let dest_dir = ctx.root.join(&ctx.talker).join(kind);
+    let dest_dir = ctx.root.join(&ctx.talker).join(kind_dir);
     if std::fs::create_dir_all(&dest_dir).is_err() {
         tracing::debug!("[media-export] create dir failed: {}", dest_dir.display());
         return None;
@@ -154,13 +116,13 @@ pub fn export_media(
     if let (Ok(dm), Ok(sm)) = (dest.metadata(), source.metadata())
         && dm.is_file() && dm.len() == sm.len()
     {
-        return Some(out(ctx, &ctx.talker, kind, &file_name, &dest));
+        return Some(out(ctx, &ctx.talker, kind_dir, &file_name, &dest));
     }
     if std::fs::copy(&source, &dest).is_err() {
         tracing::debug!("[media-export] copy failed: {} -> {}", source.display(), dest.display());
         return None;
     }
-    Some(out(ctx, &ctx.talker, kind, &file_name, &dest))
+    Some(out(ctx, &ctx.talker, kind_dir, &file_name, &dest))
 }
 
 fn out(ctx: &ExportContext, talker: &str, kind: &str, file_name: &str, dest: &Path) -> ExportOut {
@@ -185,14 +147,16 @@ pub fn export_page(
     let messages: Vec<crate::store::query::MessageOut> = items
         .into_iter()
         .map(|mut m| {
-            let kind = match m.media_type.as_deref() {
-                Some("image") => Some(MsgType::Image),
-                Some("voice") => Some(MsgType::Voice),
-                Some("video") => Some(MsgType::Video),
-                _ => None,
+            // The WeFlow `mediaType` string maps straight to the export
+            // subdirectory + kind switch (no enum round trip needed).
+            let (dir, enabled) = match m.media_type.as_deref() {
+                Some("image") => ("images", opts.image),
+                Some("voice") => ("voices", opts.voice),
+                Some("video") => ("videos", opts.video),
+                _ => return m,
             };
-            if let (Some(kind), Some(info)) = (kind, m.media.clone())
-                && let Some(out) = export_media(ctx, &info, kind, opts, media_root)
+            if let Some(info) = m.media.as_ref()
+                && let Some(out) = export_media(ctx, info, dir, enabled, media_root)
             {
                 exported += 1;
                 m.media_file_name = Some(out.file_name);
@@ -217,19 +181,14 @@ mod tests {
     }
 
     fn media(md5: &str, name: Option<&str>, path: Option<&str>) -> MediaInfo {
-        MediaInfo {
-            md5: Some(md5.into()),
+        // Build through the parse-time conversion so the store key is
+        // computed exactly like a decoded segment.
+        MediaInfo::from(crate::parser::proto::MediaSegment {
+            md5_hex: Some(md5.into()),
             file_name: name.map(String::from),
             local_path: path.map(String::from),
             ..Default::default()
-        }
-    }
-
-    #[test]
-    fn kind_dirs_match_weflow_layout() {
-        assert_eq!(kind_dir(MsgType::Image), "images");
-        assert_eq!(kind_dir(MsgType::Voice), "voices");
-        assert_eq!(kind_dir(MsgType::Video), "videos");
+        })
     }
 
     #[test]
@@ -269,7 +228,7 @@ mod tests {
             talker: "10001".into(),
         };
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
-        let e = export_media(&ctx, &m, MsgType::Image, &ExportOptions::default(), None).expect("export");
+        let e = export_media(&ctx, &m, "images", true, None).expect("export");
         assert_eq!(e.file_name, "aabbccddeeff00112233445566778899.png");
         assert_eq!(
             e.url,
@@ -279,7 +238,7 @@ mod tests {
         assert_eq!(std::fs::read(dest).unwrap(), b"fake image bytes");
         let mtime = dest.metadata().unwrap().modified().unwrap();
         // Second export: same key + same size -> skip, mtime untouched.
-        let e2 = export_media(&ctx, &m, MsgType::Image, &ExportOptions::default(), None).expect("idempotent");
+        let e2 = export_media(&ctx, &m, "images", true, None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
         // Different content, same QQ file name: never the same destination
@@ -287,7 +246,7 @@ mod tests {
         let src2 = src_dir.join("b.png");
         std::fs::write(&src2, b"different bytes, same claimed name").unwrap();
         let m2 = media("ffeeddccbbaa99887766554433221100", Some("aabb.png"), Some(src2.to_str().unwrap()));
-        let e3 = export_media(&ctx, &m2, MsgType::Image, &ExportOptions::default(), None).expect("export2");
+        let e3 = export_media(&ctx, &m2, "images", true, None).expect("export2");
         assert_ne!(e3.file_name, e.file_name, "same QQ name, different md5 -> different file");
         assert_eq!(e3.file_name, "ffeeddccbbaa99887766554433221100.png");
     }
@@ -301,27 +260,10 @@ mod tests {
             talker: "10001".into(),
         };
         let m = media("aabbccddeeff00112233445566778899", Some("gone.png"), Some("C:\\SomeUser\\gone.png"));
-        assert!(export_media(&ctx, &m, MsgType::Image, &ExportOptions::default(), None).is_none(), "missing source -> None");
+        assert!(export_media(&ctx, &m, "images", true, None).is_none(), "missing source -> None");
         let src = root.join("x.png");
         std::fs::write(&src, b"x").unwrap();
         let m = media("aabbccddeeff00112233445566778899", Some("x.png"), Some(src.to_str().unwrap()));
-        let opts = ExportOptions { image: false, ..Default::default() };
-        assert!(export_media(&ctx, &m, MsgType::Image, &opts, None).is_none(), "disabled kind -> None");
-    }
-
-    #[test]
-    fn resolve_relative_path_under_root_and_rejects_dotdot() {
-        let root = temp_dir("resolve");
-        let media_root = root.join("nt_data");
-        std::fs::create_dir_all(&media_root.join("Pic")).unwrap();
-        let f = media_root.join("Pic").join("x.png");
-        std::fs::write(&f, b"x").unwrap();
-        // canonicalize may return a \\?\ verbatim prefix on Windows.
-        assert_eq!(
-            resolve_local_path("Pic/x.png", Some(&media_root)),
-            Some(f.canonicalize().unwrap())
-        );
-        assert!(resolve_local_path("Pic/../secret", Some(&media_root)).is_none(), ".. rejected");
-        assert!(resolve_local_path("missing.png", Some(&media_root)).is_none(), "missing file -> None");
+        assert!(export_media(&ctx, &m, "images", false, None).is_none(), "disabled kind -> None");
     }
 }

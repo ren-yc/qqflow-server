@@ -255,22 +255,24 @@ fn extract_structured(blob: &[u8]) -> Option<ParsedMessage> {
     let mut media: Option<MediaInfo> = None;
     let mut media_type: Option<MsgType> = None;
     let mut saw_known = false;
-    for seg in &segments {
+    for seg in segments {
         match seg.content_type {
             Some(1) | Some(6) => {
                 saw_known = true;
-                if let Some(t) = seg.text.as_deref().filter(|t| !t.is_empty()) {
+                if let Some(t) = seg.text.filter(|t| !t.is_empty()) {
                     if !text.is_empty() {
                         text.push('\n');
                     }
-                    text.push_str(t);
+                    text.push_str(&t);
                 }
             }
             Some(2) | Some(4) | Some(5) => {
                 saw_known = true;
-                if let Some(m) = seg.media.as_ref()
-                    && media.is_none()
+                if media.is_none()
+                    && let Some(m) = seg.media
                 {
+                    // Move the first media segment's fields — no second
+                    // copy of the metadata (v1 multi-image limitation).
                     media = Some(MediaInfo::from(m));
                     media_type = match seg.content_type {
                         Some(2) => Some(MsgType::Image),
@@ -288,10 +290,9 @@ fn extract_structured(blob: &[u8]) -> Option<ParsedMessage> {
     let msg_type = media_type.unwrap_or(MsgType::Text);
     let content = if !text.is_empty() {
         text
-    } else if media.is_some() {
-        format!("[{msg_type:?}]").to_lowercase()
     } else {
-        return None; // known segment but nothing extractable
+        // Known segment but nothing extractable -> heuristic fallback.
+        media_type?.media_placeholder().to_string()
     };
     Some(ParsedMessage { msg_type, content, media })
 }
@@ -305,14 +306,14 @@ pub fn extract_text(blob: &[u8]) -> ParsedMessage {
     // Large blobs are media payloads.
     if blob.len() > MAX_TEXT_BLOB {
         if let Some(m) = media_type_from_bytes(blob) {
-            return ParsedMessage::simple(m, format!("[{m:?}]").to_lowercase());
+            return ParsedMessage::simple(m, m.media_placeholder());
         }
         return ParsedMessage::simple(MsgType::Other, "[未知大消息]");
     }
 
     // Media signatures can appear in smaller structured blobs too.
     if let Some(m) = media_type_from_bytes(blob) {
-        return ParsedMessage::simple(m, format!("[{m:?}]").to_lowercase());
+        return ParsedMessage::simple(m, m.media_placeholder());
     }
 
     // Recall / system detection on raw bytes (UTF-8 substrings).
@@ -352,34 +353,9 @@ pub fn extract_text(blob: &[u8]) -> ParsedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::proto::tests::{bytes_field, segment as body_of, varint_field};
     use types::{direction_to_is_send, MediaInfo};
 
-    // ---- structured-blob encoder (test-side protobuf writer) ---------------
-    fn varint(mut v: u64, out: &mut Vec<u8>) {
-        loop {
-            let b = (v & 0x7f) as u8;
-            v >>= 7;
-            if v == 0 {
-                out.push(b);
-                break;
-            }
-            out.push(b | 0x80);
-        }
-    }
-    fn bytes_field(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
-        varint(field << 3 | 2, out);
-        varint(bytes.len() as u64, out);
-        out.extend_from_slice(bytes);
-    }
-    fn varint_field(field: u64, v: u64, out: &mut Vec<u8>) {
-        varint(field << 3, out);
-        varint(v, out);
-    }
-    fn body_of(seg: &[u8]) -> Vec<u8> {
-        let mut body = Vec::new();
-        bytes_field(40800, seg, &mut body);
-        body
-    }
     fn text_segment(text: &str) -> Vec<u8> {
         let mut seg = Vec::new();
         varint_field(45002, 1, &mut seg);
@@ -432,7 +408,7 @@ mod tests {
         assert_eq!(p.msg_type, MsgType::Image);
         assert_eq!(p.content, "[image]");
         let m = p.media.expect("image metadata");
-        assert_eq!(m.key().as_deref(), Some("9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"));
+        assert_eq!(m.key(), Some("9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"));
         assert_eq!(m.md5.as_deref(), Some("9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"));
         assert_eq!(m.uuid.as_deref(), Some("R020-uuid"));
         assert_eq!(m.file_name.as_deref(), Some("9f2a.png"));

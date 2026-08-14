@@ -61,17 +61,9 @@ fn base_cols(chat_type: ChatType) -> &'static str {
     }
 }
 
-/// Base column count per table (rowid included).
-fn base_len(chat_type: ChatType) -> usize {
-    match chat_type {
-        ChatType::Group => 6, // rowid + 5
-        ChatType::C2c => 5,   // rowid + 4
-    }
-}
-
 /// Column list for a scan/read query: base columns, then the probed
-/// optional columns in a fixed order (40013, 40050, 40090) so row indices
-/// stay stable.
+/// optional columns. Rows are read back by column NAME (see `map_row`), so
+/// the append order is not load-bearing.
 fn cols_sql(chat_type: ChatType, cols: TableCols) -> String {
     let mut sql = base_cols(chat_type).to_string();
     if cols.has_dir {
@@ -99,8 +91,9 @@ struct RowData {
     card: Option<String>,
 }
 
-/// Map a query row to `RowData`, reading the probed optional columns at
-/// their fixed indices (SQL NULL-safe via Option).
+/// Map a query row to `RowData`, reading every column by NAME (SQL
+/// NULL-safe via Option) — no positional coupling to `cols_sql`'s append
+/// order, so adding a future optional column cannot silently shift a slot.
 fn map_row(
     chat_type: ChatType,
     cols: TableCols,
@@ -112,27 +105,26 @@ fn map_row(
     //   c2c:   rowid, "40020"(peer=talker=sender), "40001"(seq), "40093"(nick), "40800"(blob)
     let (rowid, talker, seq, uid, nick, blob) = match chat_type {
         ChatType::Group => {
-            let rowid: i64 = row.get(0)?;
-            let talker: String = row.get(1)?;
-            let seq: i64 = row.get(2)?;
-            let uid: String = row.get(3)?;
-            let nick: String = row.get(4)?;
-            let blob: Vec<u8> = row.get(5)?;
+            let rowid: i64 = row.get("rowid")?;
+            let talker: String = row.get("40021")?;
+            let seq: i64 = row.get("40001")?;
+            let uid: String = row.get("40020")?;
+            let nick: String = row.get("40093")?;
+            let blob: Vec<u8> = row.get("40800")?;
             (rowid, talker, seq, uid, nick, blob)
         }
         ChatType::C2c => {
-            let rowid: i64 = row.get(0)?;
-            let talker: String = row.get(1)?;
-            let seq: i64 = row.get(2)?;
-            let nick: String = row.get(3)?;
-            let blob: Vec<u8> = row.get(4)?;
+            let rowid: i64 = row.get("rowid")?;
+            let talker: String = row.get("40020")?;
+            let seq: i64 = row.get("40001")?;
+            let nick: String = row.get("40093")?;
+            let blob: Vec<u8> = row.get("40800")?;
             (rowid, talker.clone(), seq, talker, nick, blob)
         }
     };
-    let base = base_len(chat_type);
-    let dir = if cols.has_dir { row.get::<_, Option<i64>>(base)? } else { None };
-    let time = if cols.has_time { row.get::<_, Option<i64>>(base + usize::from(cols.has_dir))? } else { None };
-    let card = if cols.has_card { row.get::<_, Option<String>>(base + usize::from(cols.has_dir) + usize::from(cols.has_time))? } else { None };
+    let dir = if cols.has_dir { row.get::<_, Option<i64>>("40013")? } else { None };
+    let time = if cols.has_time { row.get::<_, Option<i64>>("40050")? } else { None };
+    let card = if cols.has_card { row.get::<_, Option<String>>("40090")? } else { None };
     Ok(RowData { rowid, talker, seq, uid, nick, blob, dir, time, card })
 }
 
@@ -226,36 +218,35 @@ fn apply_record(store: &mut Store, rec: MessageRecord) {
             .insert(rec.from_uid.clone(), card.clone());
     }
     // Register fetchable media: key = md5 hex or uuid, only when a local
-    // cache path exists. First-wins, but QQ clears its cache — when the
-    // registered path no longer resolves and a later row's path does, the
-    // entry is refreshed (else the same image re-sent would 404 forever).
+    // cache path exists AND resolves (a dead path would advertise a
+    // guaranteed-404 mediaId). First-wins, but QQ clears its cache — when
+    // the registered path no longer resolves and a later row's path does,
+    // the entry is refreshed (else the same image re-sent would 404
+    // forever). A re-send with the same path skips the filesystem probes
+    // entirely (nothing can have changed for an identical path).
     if let Some(m) = &rec.parsed.media
         && let Some(key) = m.key()
         && let Some(local_path) = m.local_path.as_deref().filter(|p| !p.is_empty())
     {
-        let entry = MediaEntry {
-            local_path: local_path.to_string(),
-            file_name: m.file_name.clone(),
-        };
-        match store.media.get(&key) {
+        let replace = match store.media.get(key) {
+            Some(existing) if existing.local_path == local_path => false,
             Some(existing) => {
-                let old_alive = super::media_export::resolve_local_path(
-                    &existing.local_path,
-                    store.media_root.as_deref(),
-                )
-                .is_some();
-                let new_alive = super::media_export::resolve_local_path(
-                    local_path,
-                    store.media_root.as_deref(),
-                )
-                .is_some();
-                if !old_alive && new_alive {
-                    store.media.insert(key, entry);
-                }
+                let old_alive =
+                    super::media::resolve_local_path(&existing.local_path, store.media_root.as_deref()).is_some();
+                let new_alive =
+                    super::media::resolve_local_path(local_path, store.media_root.as_deref()).is_some();
+                !old_alive && new_alive
             }
-            None => {
-                store.media.insert(key, entry);
-            }
+            None => super::media::resolve_local_path(local_path, store.media_root.as_deref()).is_some(),
+        };
+        if replace {
+            store.media.insert(
+                key.to_string(),
+                MediaEntry {
+                    local_path: local_path.to_string(),
+                    file_name: m.file_name.clone(),
+                },
+            );
         }
     }
     conv.msgs.push(rec);
@@ -347,10 +338,12 @@ pub fn read_new(
 }
 
 /// Apply records read by `read_new` to the store (single write-lock critical
-/// section; callers write the watermarks in the same section).
-pub fn apply_records(store: &mut Store, records: &[MessageRecord]) {
+/// section; callers write the watermarks in the same section). Takes the
+/// Vec by value — each record is moved into the store, no deep clone per
+/// appended row.
+pub fn apply_records(store: &mut Store, records: Vec<MessageRecord>) {
     for rec in records {
-        apply_record(store, rec.clone());
+        apply_record(store, rec);
     }
 }
 

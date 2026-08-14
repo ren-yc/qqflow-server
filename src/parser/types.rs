@@ -28,6 +28,27 @@ impl MsgType {
             MsgType::Other => 1,
         }
     }
+
+    /// WeFlow `mediaType` string for media kinds ("image"/"voice"/"video").
+    pub fn media_type_str(self) -> Option<&'static str> {
+        match self {
+            MsgType::Image => Some("image"),
+            MsgType::Voice => Some("voice"),
+            MsgType::Video => Some("video"),
+            _ => None,
+        }
+    }
+
+    /// Display placeholder for media messages ("[image]"/"[voice]"/"[video]")
+    /// — one spelling shared by the structured and heuristic parser paths.
+    pub fn media_placeholder(self) -> &'static str {
+        match self {
+            MsgType::Image => "[image]",
+            MsgType::Voice => "[voice]",
+            MsgType::Video => "[video]",
+            _ => "[media]",
+        }
+    }
 }
 
 /// Media metadata parsed from a structured message segment (image/voice/
@@ -61,20 +82,28 @@ pub struct MediaInfo {
     /// CDN URLs (45802 thumb / 45803 preview / 45804 original).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub urls: Vec<String>,
+    /// Store lookup key — computed once at parse time (see [`MediaInfo::key`]).
+    #[serde(skip)]
+    pub key: Option<String>,
 }
 
 impl MediaInfo {
     /// Store lookup key: md5 hex (45424, or extracted from the "MD5.ext"
     /// file-name shape — real QQ images are named after their uppercase
     /// MD5 while 45424 is often empty), else uuid; None when nothing is
-    /// present.
+    /// present. Computed once at parse time — every query/export path
+    /// reuses the cached value instead of re-deriving it per row.
     ///
-    /// md5 keys are normalized to lowercase on every path — 45424 can carry
-    /// uppercase hex while the file-name-derived fallback lowercases, and
-    /// the store registration / mediaId / export file names must agree on
-    /// one spelling for the same image (case mismatches would register the
+    /// md5 keys are normalized to lowercase: 45424 can carry uppercase hex
+    /// while the file-name-derived fallback lowercases, and the store
+    /// registration / mediaId / export file names must agree on one
+    /// spelling for the same image (case mismatches would register the
     /// same media under two keys).
-    pub fn key(&self) -> Option<String> {
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    fn compute_key(&self) -> Option<String> {
         self.md5
             .clone()
             .filter(|s| !s.is_empty())
@@ -95,18 +124,21 @@ fn md5_from_file_name(name: Option<&str>) -> Option<String> {
     }
 }
 
-impl From<&crate::parser::proto::MediaSegment> for MediaInfo {
-    fn from(seg: &crate::parser::proto::MediaSegment) -> Self {
-        Self {
-            uuid: seg.uuid.clone(),
-            md5: seg.md5_hex.clone(),
-            file_name: seg.file_name.clone(),
+impl From<crate::parser::proto::MediaSegment> for MediaInfo {
+    fn from(seg: crate::parser::proto::MediaSegment) -> Self {
+        let mut info = Self {
+            uuid: seg.uuid,
+            md5: seg.md5_hex,
+            file_name: seg.file_name,
             size: seg.size,
             width: seg.width,
             height: seg.height,
-            local_path: seg.local_path.clone(),
-            urls: seg.urls.clone(),
-        }
+            local_path: seg.local_path,
+            urls: seg.urls,
+            key: None,
+        };
+        info.key = info.compute_key();
+        info
     }
 }
 
@@ -200,37 +232,31 @@ mod tests {
 
     #[test]
     fn media_key_prefers_md5_then_file_name_md5_then_uuid() {
-        let m = MediaInfo {
-            md5: Some("aabbccddeeff00112233445566778899".into()),
-            file_name: Some("OTHER.png".into()),
-            ..Default::default()
+        // Built through the parse-time conversion (From<MediaSegment>) — the
+        // cached key is computed exactly like a decoded segment.
+        let mk = |md5: Option<String>, name: Option<&str>, uuid: Option<&str>| {
+            MediaInfo::from(crate::parser::proto::MediaSegment {
+                md5_hex: md5,
+                file_name: name.map(String::from),
+                uuid: uuid.map(String::from),
+                ..Default::default()
+            })
         };
-        assert_eq!(m.key().as_deref(), Some("aabbccddeeff00112233445566778899"));
+        let m = mk(Some("aabbccddeeff00112233445566778899".into()), Some("OTHER.png"), None);
+        assert_eq!(m.key(), Some("aabbccddeeff00112233445566778899"));
         // Uppercase 45424 (real QQ data) must normalize to the same key as
         // the file-name-derived fallback — one image, one key.
-        let m = MediaInfo {
-            md5: Some("41675A034F01EEDEAEC4D93CBFBB4A06".into()),
-            file_name: Some("41675A034F01EEDEAEC4D93CBFBB4A06.png".into()),
-            ..Default::default()
-        };
+        let m = mk(Some("41675A034F01EEDEAEC4D93CBFBB4A06".into()), Some("41675A034F01EEDEAEC4D93CBFBB4A06.png"), None);
         assert_eq!(
-            m.key().as_deref(),
+            m.key(),
             Some("41675a034f01eedeaec4d93cbfbb4a06"),
             "45424 md5 lowercased"
         );
         // Empty 45424 + "MD5.ext" name (ground-truth shape) -> derived key.
-        let m = MediaInfo {
-            md5: Some(String::new()),
-            file_name: Some("41675A034F01EEDEAEC4D93CBFBB4A06.png".into()),
-            ..Default::default()
-        };
-        assert_eq!(m.key().as_deref(), Some("41675a034f01eedeaec4d93cbfbb4a06"), "file-name md5 fallback, lowercased");
-        let m = MediaInfo {
-            file_name: Some("not-a-md5.png".into()),
-            uuid: Some("R020".into()),
-            ..Default::default()
-        };
-        assert_eq!(m.key().as_deref(), Some("R020"));
+        let m = mk(Some(String::new()), Some("41675A034F01EEDEAEC4D93CBFBB4A06.png"), None);
+        assert_eq!(m.key(), Some("41675a034f01eedeaec4d93cbfbb4a06"), "file-name md5 fallback, lowercased");
+        let m = mk(None, Some("not-a-md5.png"), Some("R020"));
+        assert_eq!(m.key(), Some("R020"));
         assert_eq!(MediaInfo::default().key(), None);
     }
 }

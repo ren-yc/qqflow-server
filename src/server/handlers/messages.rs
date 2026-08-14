@@ -37,22 +37,17 @@ pub struct Params {
     pub chatlab: FlexBool,
     #[serde(default)]
     pub format: Option<String>,
-    /// WeFlow media export switch (alias: meiti) — true exports this page's
-    /// media and fills mediaFileName/mediaUrl/mediaLocalPath. Accepted as
-    /// JSON bool or "1"/"true" (see `FlexBool`).
-    #[serde(default)]
+    /// WeFlow media export switch (alias `meiti`) — true exports this
+    /// page's media and fills mediaFileName/mediaUrl/mediaLocalPath.
+    /// Accepted as JSON bool or "1"/"true" (see `FlexBool`).
+    #[serde(default, alias = "meiti")]
     pub media: FlexBool,
-    #[serde(default)]
-    pub meiti: FlexBool,
-    /// Per-kind export sub-switches (default on; false / "0" disables).
-    #[serde(default)]
+    /// Per-kind export sub-switches (default on; false / "0" disables;
+    /// `tupian`/`vioce` are the WeFlow spellings).
+    #[serde(default, alias = "tupian")]
     pub image: FlexBool,
-    #[serde(default)]
-    pub tupian: FlexBool,
-    #[serde(default)]
+    #[serde(default, alias = "vioce")]
     pub voice: FlexBool,
-    #[serde(default)]
-    pub vioce: FlexBool,
     #[serde(default)]
     pub video: FlexBool,
     /// Recognized but inert in v1: QQ emoji carry display text, no files.
@@ -95,7 +90,7 @@ pub async fn handler(
     };
 
     let chatlab = params.chatlab.is_true() || params.format.as_deref() == Some("chatlab");
-    let media_on = params.media.is_true() || params.meiti.is_true();
+    let media_on = params.media.is_true();
 
     let body = if chatlab {
         // ChatLab output carries no export envelope (WeFlow parity).
@@ -108,16 +103,28 @@ pub async fn handler(
         // No media param: capability envelope unchanged (compat) — media
         // metadata still rides on every message.
         let media_count = items.iter().filter(|m| m.media.is_some()).count();
-        json!({
-            "success": true,
-            "talker": talker,
-            "count": items.len(),
-            "hasMore": has_more,
-            "media": { "enabled": true, "exportPath": "", "count": media_count },
-            "messages": items,
-        })
+        envelope(
+            talker,
+            items.len(),
+            has_more,
+            json!({ "enabled": true, "exportPath": "", "count": media_count }),
+            json!(items),
+        )
     };
     Ok(Json(body))
+}
+
+/// WeFlow message-envelope shape — one shared builder for the media=1 and
+/// compat paths so the contract field set cannot drift between them.
+fn envelope(talker: &str, count: usize, has_more: bool, media: Value, messages: Value) -> Value {
+    json!({
+        "success": true,
+        "talker": talker,
+        "count": count,
+        "hasMore": has_more,
+        "media": media,
+        "messages": messages,
+    })
 }
 
 /// WeFlow-shaped media export envelope (`media=1` / `meiti`): exports the
@@ -136,8 +143,8 @@ async fn export_envelope(
     items: Vec<MessageOut>,
 ) -> Result<Value, ApiError> {
     let opts = ExportOptions {
-        image: !params.image.is_false() && !params.tupian.is_false(),
-        voice: !params.voice.is_false() && !params.vioce.is_false(),
+        image: !params.image.is_false(),
+        voice: !params.voice.is_false(),
         video: !params.video.is_false(),
         emoji: !params.emoji.is_false(),
     };
@@ -153,14 +160,13 @@ async fn export_envelope(
     })
     .await
     .map_err(|e| ApiError::internal(format!("媒体导出任务异常: {e}")))?;
-    Ok(json!({
-        "success": true,
-        "talker": talker,
-        "count": messages.len(),
-        "hasMore": has_more,
-        "media": { "enabled": true, "exportPath": export_path, "count": exported },
-        "messages": messages,
-    }))
+    Ok(envelope(
+        talker,
+        messages.len(),
+        has_more,
+        json!({ "enabled": true, "exportPath": export_path, "count": exported }),
+        json!(messages),
+    ))
 }
 
 /// ChatLab-style envelope for /api/v1/messages (meta + members + messages).

@@ -41,61 +41,36 @@ use crate::store::AppState;
 /// two transports must share one contract (a WeFlow-style client POSTing
 /// `{"media": true}` used to get a 400 while `?media=true` worked).
 ///
-/// Unknown STRINGS (including empty) map to `Unset` — the legacy query
-/// semantics treated anything but `1`/`true` as "absent" (switch off) and
-/// anything but `0`/`false` as "present" (sub-switch on), so leniency here
-/// preserves them; non-string, non-bool JSON values are still an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The untagged derive accepts bools and arbitrary strings; unknown STRINGS
+/// (including empty) stay as `Str` and read as "absent" through
+/// `is_true`/`is_false` — the legacy query semantics treated anything but
+/// `1`/`true` as "switch off" and anything but `0`/`false` as "sub-switch
+/// on", so leniency here preserves them. Non-string, non-bool JSON values
+/// still error. `Unset` serializes as `null` so `merge_body`'s null-skip
+/// round-trip keeps working.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(untagged)]
 pub enum FlexBool {
+    Bool(bool),
+    Str(String),
     #[default]
     Unset,
-    True,
-    False,
 }
 
 impl FlexBool {
-    pub fn is_true(self) -> bool {
-        self == FlexBool::True
-    }
-
-    pub fn is_false(self) -> bool {
-        self == FlexBool::False
-    }
-}
-
-impl<'de> Deserialize<'de> for FlexBool {
-    fn deserialize<D>(d: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::Error;
-        let v = serde_json::Value::deserialize(d)?;
-        match v {
-            serde_json::Value::Bool(true) => Ok(FlexBool::True),
-            serde_json::Value::Bool(false) => Ok(FlexBool::False),
-            serde_json::Value::String(s) if s == "1" || s.eq_ignore_ascii_case("true") => Ok(FlexBool::True),
-            serde_json::Value::String(s) if s == "0" || s.eq_ignore_ascii_case("false") => Ok(FlexBool::False),
-            serde_json::Value::String(_) => Ok(FlexBool::Unset), // lenient: unknown strings = absent
-            serde_json::Value::Null => Ok(FlexBool::Unset),
-            other => Err(D::Error::custom(format!(
-                "媒体开关需为 bool 或 \"1\"/\"0\"/\"true\"/\"false\"，得到 {other}"
-            ))),
+    pub fn is_true(&self) -> bool {
+        match self {
+            FlexBool::Bool(b) => *b,
+            FlexBool::Str(s) => s == "1" || s.eq_ignore_ascii_case("true"),
+            FlexBool::Unset => false,
         }
     }
-}
 
-/// `merge_body` requires `Serialize`: emit `null` for unset so an absent
-/// body field never overwrites a query-string value, and a JSON bool for
-/// set values (round-trips through the merge into the typed params).
-impl Serialize for FlexBool {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    pub fn is_false(&self) -> bool {
         match self {
-            FlexBool::Unset => s.serialize_none(),
-            FlexBool::True => s.serialize_bool(true),
-            FlexBool::False => s.serialize_bool(false),
+            FlexBool::Bool(b) => !*b,
+            FlexBool::Str(s) => s == "0" || s.eq_ignore_ascii_case("false"),
+            FlexBool::Unset => false,
         }
     }
 }

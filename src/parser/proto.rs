@@ -104,8 +104,6 @@ pub struct MediaSegment {
     pub uuid: Option<String>,
     /// File name (45402) — often "md5.ext".
     pub file_name: Option<String>,
-    /// 16-byte raw MD5 (45406); kept as bytes, never hex-encoded.
-    pub raw_md5: Option<Vec<u8>>,
     /// Image MD5 hex string (45424).
     pub md5_hex: Option<String>,
     /// File size in bytes (45405).
@@ -125,12 +123,26 @@ impl MediaSegment {
     fn has_media(&self) -> bool {
         self.uuid.is_some()
             || self.file_name.is_some()
-            || self.raw_md5.is_some()
             || self.md5_hex.is_some()
             || self.size.is_some()
             || self.local_path.is_some()
             || !self.urls.is_empty()
     }
+}
+
+/// Raw (borrowed) media fields during the wire walk — converted to owned
+/// strings only when the content type is a handled media kind, so the walk
+/// itself allocates nothing for the other segment types.
+#[derive(Default)]
+struct MediaSegmentRaw<'a> {
+    uuid: Option<&'a [u8]>,
+    file_name: Option<&'a [u8]>,
+    md5_hex: Option<&'a [u8]>,
+    size: Option<i64>,
+    width: Option<i32>,
+    height: Option<i32>,
+    local_path: Option<&'a [u8]>,
+    urls: Vec<&'a [u8]>,
 }
 
 /// One decoded MsgContent segment.
@@ -156,13 +168,17 @@ fn str_from_bytes(bytes: &[u8]) -> Option<String> {
 
 /// Decode one MsgContent segment (payload already stripped of its 40800
 /// wrapper). Unknown fields are skipped by wire type; a truncated segment
-/// keeps whatever decoded so far.
+/// keeps whatever decoded so far. String fields are kept as raw borrows
+/// during the walk and materialized only for the content types the
+/// structured pass handles (1/6 text, 2/4/5 media) — every other segment
+/// (recall/file/redbag/ark/...) is discarded by the caller anyway and must
+/// not cost allocations.
 fn decode_segment(bytes: &[u8]) -> ParsedSegment {
     let mut cursor = Cursor::new(bytes);
     let mut out = ParsedSegment::default();
-    let mut media = MediaSegment::default();
     let mut text_raw: Option<&[u8]> = None;
     let mut emoji_text: Option<&[u8]> = None;
+    let mut raw = MediaSegmentRaw::default();
     while let Some((field, wire)) = cursor.read_tag() {
         match (field, wire) {
             (FIELD_SEG_ID, 0) => out.seg_id = cursor.read_varint(),
@@ -173,17 +189,21 @@ fn decode_segment(bytes: &[u8]) -> ParsedSegment {
                 let _ = cursor.read_varint();
             }
             (FIELD_EMOJI_TEXT, 2) => emoji_text = cursor.read_len_bytes(),
-            (FIELD_UUID, 2) => media.uuid = cursor.read_len_bytes().and_then(str_from_bytes),
-            (FIELD_FILE_NAME, 2) => media.file_name = cursor.read_len_bytes().and_then(str_from_bytes),
-            (FIELD_RAW_MD5, 2) => media.raw_md5 = cursor.read_len_bytes().map(|b| b.to_vec()),
-            (FIELD_MD5_HEX, 2) => media.md5_hex = cursor.read_len_bytes().and_then(str_from_bytes),
-            (FIELD_SIZE, 0) => media.size = cursor.read_varint().map(|v| v as i64),
-            (FIELD_WIDTH, 0) => media.width = cursor.read_varint().map(|v| v as i32),
-            (FIELD_HEIGHT, 0) => media.height = cursor.read_varint().map(|v| v as i32),
-            (FIELD_LOCAL_PATH, 2) => media.local_path = cursor.read_len_bytes().and_then(str_from_bytes),
+            (FIELD_UUID, 2) => raw.uuid = cursor.read_len_bytes(),
+            (FIELD_FILE_NAME, 2) => raw.file_name = cursor.read_len_bytes(),
+            (FIELD_RAW_MD5, 2) => {
+                // 16-byte raw MD5 (45406) — deliberately not captured:
+                // never consumed downstream (45424 hex carries the key).
+                let _ = cursor.read_len_bytes();
+            }
+            (FIELD_MD5_HEX, 2) => raw.md5_hex = cursor.read_len_bytes(),
+            (FIELD_SIZE, 0) => raw.size = cursor.read_varint().map(|v| v as i64),
+            (FIELD_WIDTH, 0) => raw.width = cursor.read_varint().map(|v| v as i32),
+            (FIELD_HEIGHT, 0) => raw.height = cursor.read_varint().map(|v| v as i32),
+            (FIELD_LOCAL_PATH, 2) => raw.local_path = cursor.read_len_bytes(),
             (FIELD_URL_THUMB | FIELD_URL_PREVIEW | FIELD_URL_ORIGINAL | FIELD_CDN_HOST, 2) => {
-                if let Some(u) = cursor.read_len_bytes().and_then(str_from_bytes).filter(|s| !s.is_empty()) {
-                    media.urls.push(u);
+                if let Some(u) = cursor.read_len_bytes().filter(|u| !u.is_empty()) {
+                    raw.urls.push(u);
                 }
             }
             _ => {
@@ -193,12 +213,26 @@ fn decode_segment(bytes: &[u8]) -> ParsedSegment {
             }
         }
     }
-    out.text = text_raw
-        .and_then(str_from_bytes)
-        .filter(|s| !s.is_empty())
-        .or_else(|| emoji_text.and_then(str_from_bytes).filter(|s| !s.is_empty()));
-    if media.has_media() {
-        out.media = Some(media);
+    if matches!(out.content_type, Some(1) | Some(6)) {
+        out.text = text_raw
+            .and_then(str_from_bytes)
+            .filter(|s| !s.is_empty())
+            .or_else(|| emoji_text.and_then(str_from_bytes).filter(|s| !s.is_empty()));
+    }
+    if matches!(out.content_type, Some(2) | Some(4) | Some(5)) {
+        let media = MediaSegment {
+            uuid: raw.uuid.and_then(str_from_bytes),
+            file_name: raw.file_name.and_then(str_from_bytes),
+            md5_hex: raw.md5_hex.and_then(str_from_bytes),
+            size: raw.size,
+            width: raw.width,
+            height: raw.height,
+            local_path: raw.local_path.and_then(str_from_bytes),
+            urls: raw.urls.into_iter().filter_map(str_from_bytes).collect(),
+        };
+        if media.has_media() {
+            out.media = Some(media);
+        }
     }
     out
 }
@@ -224,12 +258,14 @@ pub fn parse_msg_body(blob: &[u8]) -> Vec<ParsedSegment> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    // Test-side protobuf encoder (mirrors tests/common, kept local so the
-    // wire reader is self-testing).
-    fn enc_varint(mut v: u64, out: &mut Vec<u8>) {
+    // Test-side protobuf encoder, shared by proto's own tests and
+    // parser/mod.rs's tests (pub(crate) so both unit suites use one copy;
+    // tests/common keeps a third for the integration binaries, which cannot
+    // reach crate-internal test code).
+    pub(crate) fn enc_varint(mut v: u64, out: &mut Vec<u8>) {
         loop {
             let b = (v & 0x7f) as u8;
             v >>= 7;
@@ -240,22 +276,22 @@ mod tests {
             out.push(b | 0x80);
         }
     }
-    fn enc_field(field: u64, wire: u64, payload: &[u8], out: &mut Vec<u8>) {
+    pub(crate) fn enc_field(field: u64, wire: u64, payload: &[u8], out: &mut Vec<u8>) {
         enc_varint((field << 3) | wire, out);
         out.extend_from_slice(payload);
     }
-    fn varint_field(field: u64, v: u64, out: &mut Vec<u8>) {
+    pub(crate) fn varint_field(field: u64, v: u64, out: &mut Vec<u8>) {
         let mut payload = Vec::new();
         enc_varint(v, &mut payload);
         enc_field(field, 0, &payload, out);
     }
-    fn bytes_field(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+    pub(crate) fn bytes_field(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
         let mut payload = Vec::new();
         enc_varint(bytes.len() as u64, &mut payload);
         payload.extend_from_slice(bytes);
         enc_field(field, 2, &payload, out);
     }
-    fn segment(fields: &[u8]) -> Vec<u8> {
+    pub(crate) fn segment(fields: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
         bytes_field(FIELD_MSG_CONTENT, fields, &mut body);
         body
@@ -288,7 +324,7 @@ mod tests {
         varint_field(FIELD_MEDIA_SUBTYPE, 1, &mut seg);
         bytes_field(FIELD_UUID, b"R020-uuid", &mut seg);
         bytes_field(FIELD_FILE_NAME, b"aabb.png", &mut seg);
-        bytes_field(FIELD_RAW_MD5, &[0xaa; 16], &mut seg);
+        bytes_field(FIELD_RAW_MD5, &[0xaa; 16], &mut seg); // skipped by the decoder
         bytes_field(FIELD_MD5_HEX, b"aabbccddeeff00112233445566778899", &mut seg);
         varint_field(FIELD_SIZE, 12345, &mut seg);
         varint_field(FIELD_WIDTH, 640, &mut seg);
@@ -299,7 +335,6 @@ mod tests {
         let m = parsed[0].media.as_ref().expect("media segment");
         assert_eq!(m.uuid.as_deref(), Some("R020-uuid"));
         assert_eq!(m.file_name.as_deref(), Some("aabb.png"));
-        assert_eq!(m.raw_md5.as_deref(), Some(&[0xaa; 16][..]));
         assert_eq!(m.md5_hex.as_deref(), Some("aabbccddeeff00112233445566778899"));
         assert_eq!(m.size, Some(12345));
         assert_eq!((m.width, m.height), (Some(640), Some(480)));

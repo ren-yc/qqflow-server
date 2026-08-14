@@ -17,7 +17,6 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::Deserialize;
 
-use crate::store::media_export;
 use crate::store::AppState;
 
 use super::{authorized, media_content_type};
@@ -78,11 +77,23 @@ pub async fn handler(
         return Err(ApiError::not_ready());
     }
     let (local_path, file_name) = {
-        let store = state.store.read();
-        let entry = store.media.get(&id).ok_or_else(|| ApiError::not_found("媒体不存在"))?;
-        let path = media_export::resolve_local_path(&entry.local_path, store.media_root.as_deref())
-            .ok_or_else(|| ApiError::not_found("本地缓存已清理，媒体文件不存在"))?;
-        (path, entry.file_name.clone())
+        // Take the entry out of the lock, then resolve the path on the
+        // blocking pool — canonicalize is real file IO and must neither run
+        // on a tokio worker nor extend the store read lock over a syscall.
+        let (entry, media_root) = {
+            let store = state.store.read();
+            (
+                store.media.get(&id).cloned().ok_or_else(|| ApiError::not_found("媒体不存在"))?,
+                store.media_root.clone(),
+            )
+        };
+        let path = tokio::task::spawn_blocking(move || {
+            crate::store::media::resolve_local_path(&entry.local_path, media_root.as_deref())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("媒体路径解析任务异常: {e}")))?
+        .ok_or_else(|| ApiError::not_found("本地缓存已清理，媒体文件不存在"))?;
+        (path, entry.file_name)
     };
     serve_file(&local_path, file_name.as_deref()).await
 }
@@ -115,12 +126,22 @@ pub async fn exported_handler(
     if !(seg_ok(&talker) && seg_ok(&media_type) && seg_ok(&file)) {
         return Err(ApiError::not_found("媒体不存在"));
     }
-    let root = state.export_root.as_ref();
-    let joined = root.join(&talker).join(&media_type).join(&file);
-    // Canonicalize, then verify the result stays under the canonicalized
-    // export root (defense in depth against any remaining join trickery).
-    let canonical = std::fs::canonicalize(&joined).map_err(|_| ApiError::not_found("本地缓存已清理，媒体文件不存在"))?;
-    let canonical_root = std::fs::canonicalize(root).map_err(|_| ApiError::not_found("媒体导出目录不存在"))?;
+    // Canonicalize both paths on the blocking pool (real file IO), then
+    // verify the result stays under the canonicalized export root (defense
+    // in depth against any remaining join trickery).
+    let (canonical, canonical_root) = {
+        let root = state.export_root.as_ref().clone();
+        // The original `file` is still needed below as the extension hint.
+        let probe_file = file.clone();
+        tokio::task::spawn_blocking(move || {
+            let joined = root.join(&talker).join(&media_type).join(&probe_file);
+            (std::fs::canonicalize(&joined), std::fs::canonicalize(&root))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("媒体路径解析任务异常: {e}")))?
+    };
+    let canonical = canonical.map_err(|_| ApiError::not_found("本地缓存已清理，媒体文件不存在"))?;
+    let canonical_root = canonical_root.map_err(|_| ApiError::not_found("媒体导出目录不存在"))?;
     if !canonical.starts_with(&canonical_root) {
         return Err(ApiError::not_found("媒体不存在"));
     }

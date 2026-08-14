@@ -226,7 +226,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
             .path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let media_root = nt_db_dir.parent().map(|p| p.join("nt_data"));
+        let media_root = store::media::media_root_of(nt_db_dir);
         let mut st = index::build_index(conn, media_root.as_deref())?;
         // uid→备注/QQ、群号→群名 maps (best-effort — empty on schema churn).
         st.names = store::names::load_names(

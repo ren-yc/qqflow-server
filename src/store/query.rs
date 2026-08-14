@@ -59,19 +59,29 @@ impl MessageOut {
             content: r.parsed.content.clone(),
             raw_content: r.parsed.content.clone(),
             parsed_content: r.parsed.content.clone(),
-            media_type: match r.parsed.msg_type {
-                crate::parser::types::MsgType::Image => Some("image".into()),
-                crate::parser::types::MsgType::Voice => Some("voice".into()),
-                crate::parser::types::MsgType::Video => Some("video".into()),
-                _ => None,
-            },
+            media_type: r.parsed.msg_type.media_type_str().map(String::from),
             media: r.parsed.media.clone(),
-            media_id: r.parsed.media.as_ref().and_then(|m| m.key()),
+            media_id: r.parsed.media.as_ref().and_then(|m| m.key()).map(str::to_string),
             media_file_name: None,
             media_url: None,
             media_local_path: None,
         }
     }
+}
+
+/// `mediaId` advertises a fetchable /api/v1/media/{id} — the store only
+/// registers media with a local cache path ("45812"), so a key with no
+/// entry would guarantee a 404. Omit it instead (the `media` object still
+/// carries the md5/uuid for reference). Applied by every message-emitting
+/// path (messages query and the manual-sync endpoint) so the promise can
+/// never be made by one and broken by the other.
+pub fn with_fetchable_media_id(store: &Store, mut row: MessageOut) -> MessageOut {
+    if let Some(id) = row.media_id.as_deref()
+        && !store.media.contains_key(id)
+    {
+        row.media_id = None;
+    }
+    row
 }
 
 pub struct MessageQuery<'a> {
@@ -124,17 +134,7 @@ pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool
             has_more = true;
             break;
         }
-        let mut row = MessageOut::from_record(m);
-        // mediaId advertises a fetchable /api/v1/media/{id} — the store only
-        // registers media with a local cache path ("45812"), so a key with
-        // no entry would guarantee a 404. Omit it instead (the `media`
-        // object still carries the md5/uuid for reference).
-        if let Some(id) = row.media_id.as_deref()
-            && !store.media.contains_key(id)
-        {
-            row.media_id = None;
-        }
-        out.push(row);
+        out.push(with_fetchable_media_id(store, MessageOut::from_record(m)));
     }
     (out, has_more)
 }

@@ -7,6 +7,7 @@
 //! poller — a single source of truth for both HTTP queries and SSE events.
 
 pub mod index;
+pub mod media;
 pub mod media_export;
 pub mod names;
 pub mod query;

@@ -91,16 +91,20 @@ fn test_state() -> Arc<AppState> {
                 parsed: ParsedMessage {
                     msg_type: MsgType::Image,
                     content: "[image]".into(),
-                    media: Some(MediaInfo {
-                        uuid: Some("R020-test".into()),
-                        md5: Some("aabbccddeeff00112233445566778899".into()),
-                        file_name: Some("aabb.png".into()),
-                        size: Some(1234),
-                        width: Some(640),
-                        height: Some(480),
-                        local_path: Some(media_local.clone()),
-                        urls: vec![],
-                    }),
+                    // Built through the parse-time conversion so the store
+                    // key is computed exactly like a decoded segment.
+                    media: Some(MediaInfo::from(
+                        qqflow_server::parser::proto::MediaSegment {
+                            uuid: Some("R020-test".into()),
+                            md5_hex: Some("aabbccddeeff00112233445566778899".into()),
+                            file_name: Some("aabb.png".into()),
+                            size: Some(1234),
+                            width: Some(640),
+                            height: Some(480),
+                            local_path: Some(media_local.clone()),
+                            urls: vec![],
+                        },
+                    )),
                 },
             },
         ],
@@ -528,16 +532,16 @@ fn event_json_carries_media() {
         Some("李四".into()),
         "[image]".into(),
         1782835200,
-        Some(MediaInfo {
+        Some(MediaInfo::from(qqflow_server::parser::proto::MediaSegment {
             uuid: Some("R020-test".into()),
-            md5: Some("aabbccddeeff00112233445566778899".into()),
+            md5_hex: Some("aabbccddeeff00112233445566778899".into()),
             file_name: Some("aabb.png".into()),
             size: Some(1234),
             width: Some(640),
             height: Some(480),
             local_path: None,
             urls: vec![],
-        }),
+        })),
     );
     let v: Value = serde_json::to_value(&ev).unwrap();
     assert_eq!(v["media"]["md5"], "aabbccddeeff00112233445566778899");
