@@ -62,7 +62,7 @@ GET /api/v1/health
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "accounts": [
     { "qq": "123456789", "state": "ready", "message_count": 28314 }
   ]
