@@ -28,7 +28,8 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /api/v1/health`（免鉴权）
 - `POST /api/v1/accounts`（注册账号：qq + key + db_path）
 - `GET|POST /api/v1/messages`
-- `GET /api/v1/media/{id}`（媒体文件服务，自本地缓存）
+- `GET /api/v1/media/{id}`（媒体直服，自本地缓存）
+- `GET|POST /api/v1/media/{talker}/{mediaType}/{file}`（媒体导出文件服务，见 §3.2）
 - `GET|POST /api/v1/sessions`
 - `GET /api/v1/sessions/{id}/messages`（ChatLab Pull，仅 GET）
 - `GET|POST /api/v1/contacts`
@@ -36,7 +37,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /api/v1/push/messages`（SSE）
 - `GET|POST /api/v1/sync`（手动同步）
 
-> v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体不再"未实现"：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件；WeFlow 的"导出目录"概念（`exportPath`）不适用，保持空串。
+> v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（§3.2，WeFlow 形状）。
 
 ---
 
@@ -158,6 +159,7 @@ GET /api/v1/push/messages
 | `groupName` | 会话显示名（群聊：群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊：备注 > 档案昵称 > 对方昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
+| `media` | 仅图片/语音/视频消息：媒体元数据对象（与 messages 的 `media` 同形状），缺失时省略 |
 | `lastRowidGroup` / `lastRowidC2c` | 仅 `sync` 事件：群/私聊表当前水位线（rowid 最大值） |
 
 ### 示例

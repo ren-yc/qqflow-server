@@ -6,11 +6,12 @@
 ## 范围（v1）
 
 - ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头
-- ✅ 数据读取：全量扫描建内存索引 + 文件系统事件驱动的增量同步（notify watch + 慢速兜底轮询；WAL 通过镜像目录同步，支持 QQ 运行中实时读取）
+- ✅ 数据读取：全量扫描建内存索引 + 文件系统事件驱动的增量同步（notify watch + 慢速兜底轮询；零拷贝直读实时源库，无镜像，支持 QQ 运行中实时读取）
 - ✅ 服务封装：axum HTTP + SSE，WeFlow 参考端点与字段
+- ✅ 媒体：结构化 40800 解析出元数据后，`GET /api/v1/media/{id}` 从 QQ 本地缓存直服（零拷贝）；`media=1` 按需导出（WeFlow exportPath 语义，`--media-export-dir`）经路径式路由提供
 - ✅ 三平台：Windows / Linux / macOS（仅路径探测不同，代码已按平台门控）
 - ❌ **不做密钥提取**：密钥由外部工具提供（`QQBackup/qq-win-db-key` 等），输入方式见运行节
-- ❌ 媒体文件导出、SNS 接口（QQ 无此数据）：v1 不实现
+- ❌ SNS 接口（QQ 无朋友圈数据）：v1 不实现
 
 ## 构建
 
@@ -36,7 +37,7 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 .\qqflow-server.exe --help
 ```
 
-命令行参数：`--port`（默认 5032）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）。
+命令行参数：`--port`（默认 5032）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）/ `--media-export-dir`（`media=1` 的媒体导出根目录，默认 `<data-dir>/api-media`）。
 
 **账号为客户端驱动**：启动后服务以空账号状态运行（`/health` 列出平台扫描发现的账号，状态 `awaiting_key`）；密钥不由配置提供，由客户端运行时注册（仅内存保存，不持久化）：
 
@@ -56,13 +57,14 @@ curl -X POST http://127.0.0.1:5032/api/v1/accounts \
 |---|---|
 | `GET/POST /health`、`/api/v1/health` | 健康检查（免鉴权） |
 | `POST /api/v1/accounts` | 注册账号：`qq` + `key` + 可选 `db_path`（客户端驱动启动） |
-| `GET/POST /api/v1/messages` | `talker` 必填；`limit/offset/start/end/keyword/chatlab/format` |
+| `GET/POST /api/v1/messages` | `talker` 必填；`limit/offset/start/end/keyword/chatlab/format`；`media`/`meiti` 触发媒体导出，`image`/`tupian`/`voice`/`vioce`/`video`/`emoji` 子开关 |
 | `GET/POST /api/v1/sessions` | 会话列表（`format=chatlab` 输出 ChatLab 形态） |
 | `GET /api/v1/sessions/{id}/messages` | ChatLab Pull 增量同步（`since/end/limit/offset` + `sync` 块） |
-| `GET/POST /api/v1/contacts` | 联系人（消息中出现过的 UID→昵称） |
+| `GET/POST /api/v1/contacts` | 联系人（消息中出现过的 UID ∪ 档案/映射 UID；`alias` 承载 QQ 号） |
 | `GET/POST /api/v1/group-members` | 群成员（`chatroomId`，`includeMessageCounts`） |
-| `GET/POST /api/v1/push/messages` | SSE：`sync`（基线，含水位线）→ `message.new` / `message.revoke` |
-| `GET/POST /api/v1/sync` | 手动同步（镜像刷新 + 增量读取，返回新增消息） |
+| `GET/POST /api/v1/media/{id}`、`/api/v1/media/{talker}/{mediaType}/{file}` | 媒体直服（本地缓存）/ 导出文件服务 |
+| `GET/POST /api/v1/push/messages` | SSE：`sync`（基线，含水位线）→ `message.new` / `message.revoke`（媒体消息携带 `media` 元数据） |
+| `GET/POST /api/v1/sync` | 手动同步（增量读取 + 名称映射刷新，返回新增消息） |
 
 鉴权三方式：`Authorization: Bearer <token>` / `?access_token=`（SSE 推荐）/ POST JSON Body。
 
@@ -101,5 +103,5 @@ bash scripts/build.sh test                        # Linux/macOS
 
 仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存
 （不落盘），鉴权依赖本地 token.txt，均非安全机制；QQ 升级可能导致列名/消息格式解析退化
-（启发式解析天然容错）。参考实现（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，
+（结构化解析优先、启发式兜底，天然容错）。参考实现（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，
 未逐字复制。

@@ -12,7 +12,8 @@ use anyhow::{bail, Context, Result};
 /// Full server configuration. Every field has a built-in default.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Listen port (same as WeFlow).
+    /// Listen port (WeFlow defaults to 5031; qqflow-server deliberately
+    /// keeps 5032 — CLI-overridable).
     pub port: u16,
     /// Bind address. Keep 127.0.0.1 unless you know what you are doing.
     pub host: String,
