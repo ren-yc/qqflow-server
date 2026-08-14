@@ -115,7 +115,9 @@ impl MediaInfo {
 
 /// QQ names image files "<UPPERCASE_MD5>.ext" — a 32-hex stem is a usable
 /// md5 key when the 45424 field is empty (ground-truth confirmed).
-fn md5_from_file_name(name: Option<&str>) -> Option<String> {
+/// `pub(crate)`: the store-layer cache fallback (store::media) reuses it
+/// for its file-name-md5 tier.
+pub(crate) fn md5_from_file_name(name: Option<&str>) -> Option<String> {
     let stem = name?.rsplit_once('.')?.0.trim();
     if stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()) {
         Some(stem.to_ascii_lowercase())
@@ -244,17 +246,17 @@ mod tests {
         };
         let m = mk(Some("aabbccddeeff00112233445566778899".into()), Some("OTHER.png"), None);
         assert_eq!(m.key(), Some("aabbccddeeff00112233445566778899"));
-        // Uppercase 45424 (real QQ data) must normalize to the same key as
-        // the file-name-derived fallback — one image, one key.
-        let m = mk(Some("41675A034F01EEDEAEC4D93CBFBB4A06".into()), Some("41675A034F01EEDEAEC4D93CBFBB4A06.png"), None);
+        // Uppercase 45424 must normalize to the same key as the
+        // file-name-derived fallback — one image, one key.
+        let m = mk(Some("AABBCCDDEEFF00112233445566778899".into()), Some("AABBCCDDEEFF00112233445566778899.png"), None);
         assert_eq!(
             m.key(),
-            Some("41675a034f01eedeaec4d93cbfbb4a06"),
+            Some("aabbccddeeff00112233445566778899"),
             "45424 md5 lowercased"
         );
         // Empty 45424 + "MD5.ext" name (ground-truth shape) -> derived key.
-        let m = mk(Some(String::new()), Some("41675A034F01EEDEAEC4D93CBFBB4A06.png"), None);
-        assert_eq!(m.key(), Some("41675a034f01eedeaec4d93cbfbb4a06"), "file-name md5 fallback, lowercased");
+        let m = mk(Some(String::new()), Some("AABBCCDDEEFF00112233445566778899.png"), None);
+        assert_eq!(m.key(), Some("aabbccddeeff00112233445566778899"), "file-name md5 fallback, lowercased");
         let m = mk(None, Some("not-a-md5.png"), Some("R020"));
         assert_eq!(m.key(), Some("R020"));
         assert_eq!(MediaInfo::default().key(), None);

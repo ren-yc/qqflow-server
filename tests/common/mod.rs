@@ -234,6 +234,48 @@ pub fn append_image_row(conn: &Connection, n: i64, nt_db_dir: &Path) -> String {
     md5.to_string()
 }
 
+/// Spec-shaped structured image blob WITHOUT the "45812" local path — the
+/// exact case the cache-index fallback must rescue. `file_name` is the 45402
+/// value.
+pub fn image_blob_no_local(md5_hex: &str, file_name: &str) -> Vec<u8> {
+    let mut seg = Vec::new();
+    enc_varint_field(45001, 1, &mut seg);
+    enc_varint_field(45002, 2, &mut seg); // T_Image
+    enc_varint_field(45003, 1, &mut seg); // media subtype image
+    enc_bytes_field(45503, b"fake-uuid-0001", &mut seg);
+    enc_bytes_field(45402, file_name.as_bytes(), &mut seg);
+    enc_bytes_field(45424, md5_hex.as_bytes(), &mut seg);
+    enc_varint_field(45405, 12345, &mut seg);
+    enc_varint_field(45411, 640, &mut seg);
+    enc_varint_field(45412, 480, &mut seg);
+    let mut body = Vec::new();
+    enc_bytes_field(40800, &seg, &mut body);
+    body
+}
+
+/// Append one structured image row WITHOUT a "45812" path (the
+/// cache-fallback case). Returns the row's media key (md5 hex).
+pub fn append_image_row_no_local(conn: &Connection, n: i64, md5: &str, file_name: &str) -> String {
+    let blob = image_blob_no_local(md5, file_name);
+    let ts: i64 = 1782864000;
+    conn.execute(
+        "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params!["10001", (ts << 32) | n, "u_c", "王五", blob, 0, ts, ""],
+    )
+    .unwrap();
+    md5.to_string()
+}
+
+/// Write a fake cache file with an arbitrary relative path under the fake
+/// account's `nt_data` (mirrors QQ's layout
+/// `<root>/<qq>/nt_qq/nt_data/<rel>`). Returns its path.
+pub fn write_fake_cache_file(nt_db_dir: &Path, rel: &str) -> std::path::PathBuf {
+    let path = nt_db_dir.parent().unwrap().join("nt_data").join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"fallback cache bytes").unwrap();
+    path
+}
+
 /// Materialize the writer's current state as a real QQ-style file pair:
 /// `nt_msg.db` = raw.db + 1024-byte fake header (snapshot, rewritten in
 /// place); `nt_msg.db-wal` and `nt_msg.db-shm` = HARD LINKS to the writer's

@@ -94,17 +94,27 @@ fn export_file_name(m: &MediaInfo, source: &Path) -> String {
 /// the same size is left untouched (mtime preserved) — sound because the
 /// destination name embeds the content key, so a same-size destination is
 /// the same media, never a different file that shares a name.
+///
+/// Source resolution: the row's own "45812" first, then `fallback_path` —
+/// the registered `store.media` entry that the cache-index fallback rescued
+/// at registration (media rows without a 45812 still export, and the same
+/// path serves via /api/v1/media/{id}).
 pub fn export_media(
     ctx: &ExportContext,
     m: &MediaInfo,
     kind_dir: &str,
     enabled: bool,
     media_root: Option<&Path>,
+    fallback_path: Option<&str>,
 ) -> Option<ExportOut> {
     if !enabled {
         return None;
     }
-    let source = resolve_local_path(m.local_path.as_deref()?, media_root)?;
+    let source = m
+        .local_path
+        .as_deref()
+        .and_then(|p| resolve_local_path(p, media_root))
+        .or_else(|| fallback_path.and_then(|p| resolve_local_path(p, media_root)))?;
     let file_name = export_file_name(m, &source);
     let dest_dir = ctx.root.join(&ctx.talker).join(kind_dir);
     if std::fs::create_dir_all(&dest_dir).is_err() {
@@ -137,10 +147,16 @@ fn out(ctx: &ExportContext, talker: &str, kind: &str, file_name: &str, dest: &Pa
 /// media message gets its export fields filled; returns (messages, exported
 /// count). Real file IO — run on the blocking pool (`spawn_blocking`) from
 /// the async handler, never directly on a tokio worker.
+///
+/// `media_entries` is the registered `store.media` snapshot: rows whose own
+/// "45812" is absent (cache-index-fallback rescues) export from the
+/// registered entry instead, so `media=1` and `/api/v1/media/{id}` agree on
+/// one source per mediaId.
 pub fn export_page(
     ctx: &ExportContext,
     opts: &ExportOptions,
     media_root: Option<&Path>,
+    media_entries: &std::collections::HashMap<String, crate::store::MediaEntry>,
     items: Vec<crate::store::query::MessageOut>,
 ) -> (Vec<crate::store::query::MessageOut>, usize) {
     let mut exported = 0usize;
@@ -155,13 +171,17 @@ pub fn export_page(
                 Some("video") => ("videos", opts.video),
                 _ => return m,
             };
-            if let Some(info) = m.media.as_ref()
-                && let Some(out) = export_media(ctx, info, dir, enabled, media_root)
-            {
-                exported += 1;
-                m.media_file_name = Some(out.file_name);
-                m.media_url = Some(out.url);
-                m.media_local_path = Some(out.local_path);
+            if let Some(info) = m.media.as_ref() {
+                let fallback = info
+                    .key()
+                    .and_then(|k| media_entries.get(k))
+                    .map(|e| e.local_path.as_str());
+                if let Some(out) = export_media(ctx, info, dir, enabled, media_root, fallback) {
+                    exported += 1;
+                    m.media_file_name = Some(out.file_name);
+                    m.media_url = Some(out.url);
+                    m.media_local_path = Some(out.local_path);
+                }
             }
             m
         })
@@ -228,7 +248,7 @@ mod tests {
             talker: "10001".into(),
         };
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
-        let e = export_media(&ctx, &m, "images", true, None).expect("export");
+        let e = export_media(&ctx, &m, "images", true, None, None).expect("export");
         assert_eq!(e.file_name, "aabbccddeeff00112233445566778899.png");
         assert_eq!(
             e.url,
@@ -238,7 +258,7 @@ mod tests {
         assert_eq!(std::fs::read(dest).unwrap(), b"fake image bytes");
         let mtime = dest.metadata().unwrap().modified().unwrap();
         // Second export: same key + same size -> skip, mtime untouched.
-        let e2 = export_media(&ctx, &m, "images", true, None).expect("idempotent");
+        let e2 = export_media(&ctx, &m, "images", true, None, None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
         // Different content, same QQ file name: never the same destination
@@ -246,7 +266,7 @@ mod tests {
         let src2 = src_dir.join("b.png");
         std::fs::write(&src2, b"different bytes, same claimed name").unwrap();
         let m2 = media("ffeeddccbbaa99887766554433221100", Some("aabb.png"), Some(src2.to_str().unwrap()));
-        let e3 = export_media(&ctx, &m2, "images", true, None).expect("export2");
+        let e3 = export_media(&ctx, &m2, "images", true, None, None).expect("export2");
         assert_ne!(e3.file_name, e.file_name, "same QQ name, different md5 -> different file");
         assert_eq!(e3.file_name, "ffeeddccbbaa99887766554433221100.png");
     }
@@ -260,10 +280,19 @@ mod tests {
             talker: "10001".into(),
         };
         let m = media("aabbccddeeff00112233445566778899", Some("gone.png"), Some("C:\\SomeUser\\gone.png"));
-        assert!(export_media(&ctx, &m, "images", true, None).is_none(), "missing source -> None");
+        assert!(export_media(&ctx, &m, "images", true, None, None).is_none(), "missing source -> None");
         let src = root.join("x.png");
         std::fs::write(&src, b"x").unwrap();
         let m = media("aabbccddeeff00112233445566778899", Some("x.png"), Some(src.to_str().unwrap()));
-        assert!(export_media(&ctx, &m, "images", false, None).is_none(), "disabled kind -> None");
+        assert!(export_media(&ctx, &m, "images", false, None, None).is_none(), "disabled kind -> None");
+
+        // Fallback source: the row has no 45812, but the registered store
+        // entry points at a live file — export must resolve through it.
+        let fb = root.join("fallback.jpg");
+        std::fs::write(&fb, b"fb bytes").unwrap();
+        let m = media("aabbccddeeff00112233445566778899", Some("a.jpg"), None);
+        let e = export_media(&ctx, &m, "images", true, None, Some(fb.to_str().unwrap()))
+            .expect("fallback source exports");
+        assert_eq!(std::fs::read(Path::new(&e.local_path)).unwrap(), b"fb bytes");
     }
 }

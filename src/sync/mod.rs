@@ -94,6 +94,29 @@ impl AccountSync {
         guard.names = maps;
     }
 
+    /// Rebuild the media cache-index fallback snapshot from nt_data, then
+    /// re-apply media registration for keys the previous (stale) snapshot
+    /// missed — rows applied between the snapshot and now get their second
+    /// chance here. Manual sync only (real file IO — the caller runs it on
+    /// the blocking pool); watch ticks never call this and only consult
+    /// the snapshot through pure map lookups.
+    pub fn refresh_media_fallback(&self) {
+        let root = {
+            let guard = self.store.read();
+            guard
+                .media_root
+                .clone()
+                .or_else(|| crate::store::media::media_root_of(&self.db_dir))
+        };
+        let Some(root) = root else {
+            return;
+        };
+        let index = crate::store::media::scan_cache_index(&root);
+        let mut guard = self.store.write();
+        guard.media_fallback = index;
+        crate::store::index::reapply_media_registration(&mut guard);
+    }
+
     /// Cheap change detection (no data IO — at most one metadata stat):
     /// true right after a failed sync (retry flag), while the live
     /// connection is closed (QQ not running yet — reopen on the next
@@ -247,11 +270,14 @@ impl SyncEngine {
     }
 
     /// Manual sync: run a full pass on every registered account and return
-    /// all newly appended messages, newest first. Name maps (备注/群名) ride
-    /// the manual sync — the one place a client-visible refresh happens.
+    /// all newly appended messages, newest first. Name maps (备注/群名) and
+    /// the media cache-index fallback ride the manual sync — the one place
+    /// a client-visible refresh happens. The fallback refreshes BEFORE the
+    /// poll so newly-read rows can already register through it.
     pub fn sync_all(&self) -> Vec<MessageOut> {
         let mut out = Vec::new();
         for account in self.snapshot() {
+            account.refresh_media_fallback();
             match account.poll_once() {
                 Ok(messages) => {
                     out.extend(messages);

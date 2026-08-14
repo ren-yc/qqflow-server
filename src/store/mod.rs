@@ -95,6 +95,12 @@ pub struct Store {
     /// entry (QQ cleared its cache) is refreshed by a later row with a
     /// live local path — see `index::apply_record`.
     pub media: HashMap<String, MediaEntry>,
+    /// Cache-index fallback snapshot: files under nt_data's media dirs
+    /// keyed by stem (see `media::scan_cache_index`). Consulted by
+    /// `index::apply_record` when a media row has no usable "45812" path —
+    /// pure map lookups there; the walk itself runs once per registration
+    /// and again on manual sync.
+    pub media_fallback: Option<media::CacheIndex>,
     /// `nt_data` root of the account — relative "45812" paths resolve here.
     pub media_root: Option<std::path::PathBuf>,
     /// Highest rowid seen per table (poller watermark).

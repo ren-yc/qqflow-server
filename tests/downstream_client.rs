@@ -251,6 +251,12 @@ async fn downstream_client_real_db() {
             "mediaId never appears without the media object"
         );
     }
+    // mediaId coverage on this page: media rows carrying a fetchable id
+    // (the cache-index fallback registers rows whose "45812" is gone —
+    // real-machine probe rescues ~63% of them).
+    let media_rows = msgs.iter().filter(|m| m.get("media").is_some()).count();
+    let with_id = msgs.iter().filter(|m| m["mediaId"].is_string()).count();
+    println!("[CLIENT] mediaId coverage in page: {with_id}/{media_rows} media rows carry mediaId");
     // newest first
     let ts_first = msgs[0]["createTime"].as_i64().unwrap();
     let ts_last = msgs.last().unwrap()["createTime"].as_i64().unwrap();

@@ -368,6 +368,121 @@ async fn fake_db_media_endpoint_serves_bytes() {
     );
 }
 
+/// Cache-index fallback: an image row whose "45812" points at a DELETED
+/// file still registers when the fake nt_data cache holds a file named by
+/// the row's md5 — and the media endpoint serves its bytes. Real-machine
+/// probe: "45812" survives on disk for ~0.3% of media rows while the
+/// fallback rescues ~63% of the rest.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn fake_db_media_fallback_registers_and_serves() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    // Row 7's 45812 points at the standard fake media file — delete it so
+    // the exact path is dead and only the cache fallback can rescue it.
+    let md5 = common::append_image_row(&writer, 7, &nt_db);
+    std::fs::remove_file(common::fake_media_path(&nt_db)).unwrap();
+    let cache_file = common::write_fake_cache_file(&nt_db, &format!("Pic/2026-08/Ori/{md5}.jpg"));
+    common::materialize_source(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let media_root = qqflow_server::store::media::media_root_of(&nt_db);
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    drop(reader);
+    drop(writer);
+
+    let entry = store.media.get(&md5).expect("fallback registered the row");
+    assert!(
+        entry.local_path.ends_with(&format!("{md5}.jpg")),
+        "entry points at the md5-named cache file: {}",
+        entry.local_path
+    );
+    assert_eq!(entry.file_name.as_deref(), Some("fake_image_01.jpg"));
+
+    // mediaId survives the fetchability filter.
+    let conv = store.conversation(ChatType::Group, "10001").unwrap();
+    let m = conv.msgs.iter().find(|m| m.rowid == 7).expect("row indexed");
+    let out = qqflow_server::store::query::with_fetchable_media_id(&store, MessageOut::from_record(m));
+    assert_eq!(out.media_id.as_deref(), Some(md5.as_str()));
+
+    // Full chain: /api/v1/media/{id} serves the cache file bytes.
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        store: Arc::new(parking_lot::RwLock::new(store)),
+        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        token: Arc::new("test-token".into()),
+        sync: Arc::new(SyncEngine::new()),
+        init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
+        export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
+    });
+    let app = build_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/media/{md5}?access_token=test-token"))
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(bytes.to_vec(), b"fallback cache bytes", "exact cache file bytes");
+    assert!(cache_file.exists(), "cache file still in place");
+}
+
+/// Fallback interplay: a live "45812" entry is never displaced by a later
+/// fallback row (first-wins); a key with no file anywhere stays
+/// unregistered and the fetchability filter omits its mediaId.
+#[test]
+fn fake_db_media_fallback_first_wins_and_no_match() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    // md5_a: row 7 carries a LIVE 45812; row 8 repeats the same key with no
+    // 45812 — a cache file exists, but the live exact entry must win.
+    let md5_a = common::append_image_row(&writer, 7, &nt_db);
+    common::append_image_row_no_local(&writer, 8, &md5_a, "fake_image_01.jpg");
+    let cache_file = common::write_fake_cache_file(&nt_db, &format!("Pic/2026-08/Ori/{md5_a}.jpg"));
+    // md5_b: no 45812 and no cache file anywhere -> never registered.
+    let md5_b = "ffffffffffffffffffffffffffffffff";
+    common::append_image_row_no_local(&writer, 9, md5_b, "ghost.png");
+    common::materialize_source(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let media_root = qqflow_server::store::media::media_root_of(&nt_db);
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    drop(reader);
+    drop(writer);
+
+    let entry = store.media.get(&md5_a).expect("registered");
+    assert!(
+        entry.local_path.ends_with("fake_image_01.jpg"),
+        "live exact 45812 wins over the fallback: {}",
+        entry.local_path
+    );
+    assert!(!entry.local_path.ends_with(&format!("{md5_a}.jpg")));
+    assert!(!store.media.contains_key(md5_b), "no file anywhere -> unregistered");
+
+    let conv = store.conversation(ChatType::Group, "10001").unwrap();
+    let rescued = conv.msgs.iter().find(|m| m.rowid == 8).unwrap();
+    let out8 = qqflow_server::store::query::with_fetchable_media_id(&store, MessageOut::from_record(rescued));
+    assert_eq!(out8.media_id.as_deref(), Some(md5_a.as_str()), "registered key keeps mediaId");
+    let ghost = conv.msgs.iter().find(|m| m.rowid == 9).expect("ghost row indexed");
+    let out9 = qqflow_server::store::query::with_fetchable_media_id(&store, MessageOut::from_record(ghost));
+    assert!(out9.media_id.is_none(), "unregistered key omits mediaId");
+    assert!(cache_file.exists(), "cache file still in place");
+}
+
 /// WeFlow-shaped media export end to end: `media=1` on /api/v1/messages
 /// exports the page's image into the export root, the response carries
 /// mediaFileName/mediaUrl/mediaLocalPath, and the three-segment media URL

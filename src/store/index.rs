@@ -16,7 +16,7 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::parser::types::{seq_to_time, ChatType, MessageRecord, MsgType};
+use crate::parser::types::{seq_to_time, ChatType, MediaInfo, MessageRecord, MsgType};
 use crate::parser::{self};
 
 use super::{conv_key, MediaEntry, Store};
@@ -182,6 +182,11 @@ fn guess_group_name(text: &str, current: &str) -> String {
 /// ("40093" only — cards never go global), media entry registration (with
 /// stale-path refresh), message push (sets `dirty`).
 fn apply_record(store: &mut Store, rec: MessageRecord) {
+    // Register fetchable media first — `register_media` takes the whole
+    // store, so it must run before the `convs.entry` borrow below.
+    if let Some(m) = &rec.parsed.media {
+        register_media(store, m, rec.parsed.msg_type);
+    }
     let key = conv_key(rec.chat_type, &rec.talker);
     let conv = store.convs.entry(key).or_insert_with(|| {
         let name = if rec.chat_type == ChatType::Group {
@@ -217,40 +222,90 @@ fn apply_record(store: &mut Store, rec: MessageRecord) {
             .or_default()
             .insert(rec.from_uid.clone(), card.clone());
     }
-    // Register fetchable media: key = md5 hex or uuid, only when a local
-    // cache path exists AND resolves (a dead path would advertise a
-    // guaranteed-404 mediaId). First-wins, but QQ clears its cache — when
-    // the registered path no longer resolves and a later row's path does,
-    // the entry is refreshed (else the same image re-sent would 404
-    // forever). A re-send with the same path skips the filesystem probes
-    // entirely (nothing can have changed for an identical path).
-    if let Some(m) = &rec.parsed.media
-        && let Some(key) = m.key()
-        && let Some(local_path) = m.local_path.as_deref().filter(|p| !p.is_empty())
-    {
-        let replace = match store.media.get(key) {
-            Some(existing) if existing.local_path == local_path => false,
-            Some(existing) => {
-                let old_alive =
-                    super::media::resolve_local_path(&existing.local_path, store.media_root.as_deref()).is_some();
-                let new_alive =
-                    super::media::resolve_local_path(local_path, store.media_root.as_deref()).is_some();
-                !old_alive && new_alive
-            }
-            None => super::media::resolve_local_path(local_path, store.media_root.as_deref()).is_some(),
-        };
-        if replace {
-            store.media.insert(
-                key.to_string(),
-                MediaEntry {
-                    local_path: local_path.to_string(),
-                    file_name: m.file_name.clone(),
-                },
-            );
-        }
-    }
     conv.msgs.push(rec);
     conv.dirty = true;
+}
+
+/// Register one media record's fetchable entry in `store.media`: key = md5
+/// hex or uuid. The row's own "45812" path is exact and preferred; when it
+/// is absent or no longer on disk, the cache-index fallback rescues the row
+/// from a file in QQ's media dirs named by the md5 / uuid / file-name md5
+/// (real-machine probe: ~63% of dead rows rescue this way — the rest are
+/// physically cleared by QQ and stay unregistered). First-wins with
+/// stale-path refresh: a live entry is never replaced, a dead one is
+/// refreshed when a later row's path resolves. A re-send with the same
+/// registered path skips every filesystem probe.
+fn register_media(store: &mut Store, m: &MediaInfo, msg_type: MsgType) {
+    let Some(key) = m.key() else { return };
+    // Chosen live path (verified below): the exact "45812" first, else the
+    // cache-index fallback (absolute). None -> nothing fetchable.
+    let chosen: Option<String> = match m.local_path.as_deref().filter(|p| !p.is_empty()) {
+        Some(lp) => {
+            if let Some(existing) = store.media.get(key)
+                && existing.local_path == lp
+            {
+                None // unchanged re-send: nothing can have changed
+            } else if super::media::resolve_local_path(lp, store.media_root.as_deref()).is_some() {
+                Some(lp.to_string())
+            } else {
+                store
+                    .media_fallback
+                    .as_ref()
+                    .and_then(|ci| super::media::fallback_candidate(ci, m, key, msg_type))
+                    .map(|p| p.to_string_lossy().into_owned())
+            }
+        }
+        None => store
+            .media_fallback
+            .as_ref()
+            .and_then(|ci| super::media::fallback_candidate(ci, m, key, msg_type))
+            .map(|p| p.to_string_lossy().into_owned()),
+    };
+    let Some(local_path) = chosen else {
+        return; // no live source — never advertise a guaranteed-404 mediaId
+    };
+    let replace = match store.media.get(key) {
+        Some(existing) if existing.local_path == local_path => false,
+        Some(existing) => {
+            // Stale-path refresh: only when the old entry no longer
+            // resolves (the chosen one is alive by construction above).
+            super::media::resolve_local_path(&existing.local_path, store.media_root.as_deref()).is_none()
+        }
+        None => true,
+    };
+    if replace {
+        store.media.insert(
+            key.to_string(),
+            MediaEntry {
+                local_path,
+                file_name: m.file_name.clone(),
+            },
+        );
+    }
+}
+
+/// Re-run media registration for still-unregistered keys (manual-sync
+/// refresh path): rows applied while the fallback snapshot was stale get a
+/// second chance now that the cache index has been rebuilt. Cheap: only
+/// unregistered keys are collected (one probe pass each), and
+/// `register_media`'s own fast paths skip the rest.
+pub fn reapply_media_registration(store: &mut Store) {
+    let mut pending: Vec<(MediaInfo, MsgType)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for conv in store.convs.values() {
+        for rec in &conv.msgs {
+            if let Some(m) = &rec.parsed.media
+                && let Some(key) = m.key()
+                && !store.media.contains_key(key)
+                && seen.insert(key.to_string())
+            {
+                pending.push((m.clone(), rec.parsed.msg_type));
+            }
+        }
+    }
+    for (m, msg_type) in pending {
+        register_media(store, &m, msg_type);
+    }
 }
 
 fn scan_table(
@@ -287,12 +342,21 @@ fn scan_table(
 
 /// Full scan of both message tables; returns the new store. `media_root`
 /// (`<root>/<qq>/nt_qq/nt_data`) must be supplied up front so media entry
-/// registration can resolve relative "45812" paths (stale-entry refresh).
+/// registration can resolve relative "45812" paths (stale-entry refresh)
+/// and build the cache-index fallback snapshot (files named md5/uuid).
+/// The cache walk runs here — the caller executes `build_index` on the
+/// blocking pool, never on a tokio worker.
 pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> Result<Store> {
     let mut store = Store {
         media_root: media_root.map(std::path::Path::to_path_buf),
         ..Store::default()
     };
+    // Cache-index fallback: index QQ's media dirs once, so media rows
+    // without a live "45812" can still register via md5/uuid-named files.
+    // None on failure -> rows degrade to the pre-fallback behavior.
+    if let Some(root) = media_root {
+        store.media_fallback = super::media::scan_cache_index(root);
+    }
     let g_cols = probe_cols(conn, GROUP_TABLE);
     let c_cols = probe_cols(conn, C2C_TABLE);
     store.watermark_group = scan_table(conn, GROUP_TABLE, g_cols, ChatType::Group, &mut store)

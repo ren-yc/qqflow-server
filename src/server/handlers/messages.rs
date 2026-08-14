@@ -148,7 +148,14 @@ async fn export_envelope(
         video: !params.video.is_false(),
         emoji: !params.emoji.is_false(),
     };
-    let media_root = state.store.read().media_root.clone();
+    let (media_root, media_entries) = {
+        let store = state.store.read();
+        // `media_entries` = registered store.media snapshot: rows without a
+        // "45812" (cache-index-fallback rescues) export from their
+        // registered entry, so media=1 and /api/v1/media/{id} agree on one
+        // source per mediaId.
+        (store.media_root.clone(), store.media.clone())
+    };
     let ctx = ExportContext {
         root: state.export_root.as_ref().clone(),
         base_url: state.base_url.as_str().to_string(),
@@ -156,7 +163,7 @@ async fn export_envelope(
     };
     let export_path = ctx.root.to_string_lossy().into_owned();
     let (messages, exported) = tokio::task::spawn_blocking(move || {
-        media_export::export_page(&ctx, &opts, media_root.as_deref(), items)
+        media_export::export_page(&ctx, &opts, media_root.as_deref(), &media_entries, items)
     })
     .await
     .map_err(|e| ApiError::internal(format!("媒体导出任务异常: {e}")))?;
