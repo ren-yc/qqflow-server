@@ -81,13 +81,16 @@ pub async fn handler(
         .map(|uid| {
             let nick = nicks.get(uid).cloned().unwrap_or_default();
             let remark = store.names.uid_remark.get(uid).cloned().unwrap_or_default();
+            // groupNickname prefers the per-conversation card (40090); the
+            // plain nickname stays the message-derived name.
+            let group_nick = store.display_sender(ChatType::Group, room, uid);
             let mut m = json!({
                 "wxid": uid,
                 "displayName": nick,
                 "nickname": nick,
                 "remark": remark,
                 "alias": "",
-                "groupNickname": nick,
+                "groupNickname": group_nick,
                 "avatarUrl": "",
                 "isOwner": false,
                 "isFriend": false,

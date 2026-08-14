@@ -68,10 +68,17 @@ impl MediaInfo {
     /// file-name shape — real QQ images are named after their uppercase
     /// MD5 while 45424 is often empty), else uuid; None when nothing is
     /// present.
+    ///
+    /// md5 keys are normalized to lowercase on every path — 45424 can carry
+    /// uppercase hex while the file-name-derived fallback lowercases, and
+    /// the store registration / mediaId / export file names must agree on
+    /// one spelling for the same image (case mismatches would register the
+    /// same media under two keys).
     pub fn key(&self) -> Option<String> {
         self.md5
             .clone()
             .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
             .or_else(|| md5_from_file_name(self.file_name.as_deref()))
             .or_else(|| self.uuid.clone().filter(|s| !s.is_empty()))
     }
@@ -134,8 +141,13 @@ pub struct MessageRecord {
     pub talker: String,
     /// Sender uid ("40020" in group table; c2c peer for c2c table).
     pub from_uid: String,
-    /// Sender nickname ("40093"; group rows prefer the "40090" group card).
+    /// Sender nickname ("40093" — the global, context-free name; group
+    /// cards ("40090") live in `card` and only display inside their group).
     pub from_nick: String,
+    /// Sender group card ("40090", group table only) — display scope is the
+    /// conversation it appeared in (`Store.group_cards`), never the global
+    /// name maps. None for c2c rows and versions without the column.
+    pub card: Option<String>,
     /// Raw "40013" direction (0 other / 1,2 self / 3 system); None when the
     /// column is absent in this QQ version (is_send degrades to 0).
     pub direction: Option<i64>,
@@ -194,6 +206,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(m.key().as_deref(), Some("aabbccddeeff00112233445566778899"));
+        // Uppercase 45424 (real QQ data) must normalize to the same key as
+        // the file-name-derived fallback — one image, one key.
+        let m = MediaInfo {
+            md5: Some("41675A034F01EEDEAEC4D93CBFBB4A06".into()),
+            file_name: Some("41675A034F01EEDEAEC4D93CBFBB4A06.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            m.key().as_deref(),
+            Some("41675a034f01eedeaec4d93cbfbb4a06"),
+            "45424 md5 lowercased"
+        );
         // Empty 45424 + "MD5.ext" name (ground-truth shape) -> derived key.
         let m = MediaInfo {
             md5: Some(String::new()),

@@ -238,10 +238,18 @@ async fn downstream_client_real_db() {
             assert!(matches!(mt.as_str(), Some("image" | "voice" | "video")));
             assert!(matches!(m["localType"].as_i64(), Some(3..=5)));
         }
-        // Structured media rides on image/voice/video messages.
+        // Structured media rides on image/voice/video messages; mediaId is
+        // present ONLY when the store registered a local cache path (the
+        // "fetchable" promise — absent means /api/v1/media/{id} would 404).
         if m.get("media").is_some() {
-            assert!(m["mediaId"].is_string(), "media implies a fetchable mediaId");
+            if let Some(id) = m["mediaId"].as_str() {
+                assert!(!id.is_empty(), "mediaId non-empty when present");
+            }
         }
+        assert!(
+            m["mediaId"].is_null() || !m["media"].is_null(),
+            "mediaId never appears without the media object"
+        );
     }
     // newest first
     let ts_first = msgs[0]["createTime"].as_i64().unwrap();

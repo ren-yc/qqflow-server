@@ -176,9 +176,11 @@ impl AccountSync {
                 .chain(&new_c)
                 .map(|r| {
                     // Display names resolve through the name maps — the
-                    // remark (私聊) / group-info name (群聊) wins when known.
+                    // remark (私聊) / group-info name (群聊) wins when known;
+                    // in a group the sender's per-conversation card (40090)
+                    // wins over the global name (never leaks across chats).
                     let group_name = Some(guard.display_name(r.chat_type, &r.talker));
-                    let source_name = Some(guard.display_uid(&r.from_uid));
+                    let source_name = Some(guard.display_sender(r.chat_type, &r.talker, &r.from_uid));
                     let media = r.parsed.media.clone();
                     if r.parsed.msg_type == MsgType::Recall {
                         Event::message_revoke(

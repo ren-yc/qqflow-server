@@ -124,7 +124,17 @@ pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool
             has_more = true;
             break;
         }
-        out.push(MessageOut::from_record(m));
+        let mut row = MessageOut::from_record(m);
+        // mediaId advertises a fetchable /api/v1/media/{id} — the store only
+        // registers media with a local cache path ("45812"), so a key with
+        // no entry would guarantee a 404. Omit it instead (the `media`
+        // object still carries the md5/uuid for reference).
+        if let Some(id) = row.media_id.as_deref()
+            && !store.media.contains_key(id)
+        {
+            row.media_id = None;
+        }
+        out.push(row);
     }
     (out, has_more)
 }
@@ -240,6 +250,7 @@ mod tests {
             talker: "10001".into(),
             from_uid: "u_a".into(),
             from_nick: "张三".into(),
+            card: None,
             direction: Some(0),
             parsed: ParsedMessage { msg_type: MsgType::Text, content: "x".into(), media: None },
         }

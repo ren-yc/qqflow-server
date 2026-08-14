@@ -137,14 +137,12 @@ fn map_row(
 }
 
 /// Decode a row into a `MessageRecord`: ts prefers "40050" (spec-authoritative
-/// unix send time) with per-row fallback to `seq >> 32`; the group card
-/// "40090" wins over the "40093" nickname when non-empty.
+/// unix send time) with per-row fallback to `seq >> 32`. `from_nick` is the
+/// "40093" nickname; the group card "40090" rides separately in `card` and
+/// only displays inside its own conversation (see `Store::display_sender`) —
+/// it never becomes the global message nick, which would leak the group card
+/// into c2c chats, contacts and SSE source names.
 fn row_to_record(chat_type: ChatType, d: RowData) -> MessageRecord {
-    let from_nick = if chat_type == ChatType::Group {
-        d.card.filter(|c| !c.is_empty()).unwrap_or(d.nick.clone())
-    } else {
-        d.nick.clone()
-    };
     MessageRecord {
         rowid: d.rowid,
         seq: d.seq,
@@ -152,7 +150,10 @@ fn row_to_record(chat_type: ChatType, d: RowData) -> MessageRecord {
         chat_type,
         talker: d.talker,
         from_uid: d.uid,
-        from_nick,
+        from_nick: d.nick,
+        card: (chat_type == ChatType::Group)
+            .then(|| d.card.filter(|c| !c.is_empty()))
+            .flatten(),
         direction: d.dir,
         parsed: parser::extract_message(&d.blob),
     }
@@ -185,8 +186,9 @@ fn guess_group_name(text: &str, current: &str) -> String {
 }
 
 /// Apply one parsed record: conversation create/lookup, group-name guess,
-/// uid -> nickname map update, media entry registration, message push
-/// (sets `dirty`).
+/// per-conversation group-card map update, uid -> nickname map update
+/// ("40093" only — cards never go global), media entry registration (with
+/// stale-path refresh), message push (sets `dirty`).
 fn apply_record(store: &mut Store, rec: MessageRecord) {
     let key = conv_key(rec.chat_type, &rec.talker);
     let conv = store.convs.entry(key).or_insert_with(|| {
@@ -213,16 +215,48 @@ fn apply_record(store: &mut Store, rec: MessageRecord) {
     if !rec.from_nick.is_empty() {
         store.uid_names.insert(rec.from_uid.clone(), rec.from_nick.clone());
     }
-    // Register fetchable media (first-wins): key = md5 hex or uuid, only
-    // when a local cache path exists.
+    // Group card ("40090") — per-conversation scope only. Re-sent messages
+    // with the same uid refresh the card within THIS group; other groups and
+    // c2c chats never see it.
+    if let Some(card) = &rec.card {
+        store
+            .group_cards
+            .entry(conv_key(rec.chat_type, &rec.talker))
+            .or_default()
+            .insert(rec.from_uid.clone(), card.clone());
+    }
+    // Register fetchable media: key = md5 hex or uuid, only when a local
+    // cache path exists. First-wins, but QQ clears its cache — when the
+    // registered path no longer resolves and a later row's path does, the
+    // entry is refreshed (else the same image re-sent would 404 forever).
     if let Some(m) = &rec.parsed.media
         && let Some(key) = m.key()
         && let Some(local_path) = m.local_path.as_deref().filter(|p| !p.is_empty())
     {
-        store.media.entry(key).or_insert(MediaEntry {
+        let entry = MediaEntry {
             local_path: local_path.to_string(),
             file_name: m.file_name.clone(),
-        });
+        };
+        match store.media.get(&key) {
+            Some(existing) => {
+                let old_alive = super::media_export::resolve_local_path(
+                    &existing.local_path,
+                    store.media_root.as_deref(),
+                )
+                .is_some();
+                let new_alive = super::media_export::resolve_local_path(
+                    local_path,
+                    store.media_root.as_deref(),
+                )
+                .is_some();
+                if !old_alive && new_alive {
+                    store.media.insert(key, entry);
+                }
+            }
+            None => {
+                store.media.insert(key, entry);
+            }
+        }
     }
     conv.msgs.push(rec);
     conv.dirty = true;
@@ -255,9 +289,14 @@ fn scan_table(
     Ok(watermark)
 }
 
-/// Full scan of both message tables; returns the new store.
-pub fn build_index(conn: &Connection) -> Result<Store> {
-    let mut store = Store::default();
+/// Full scan of both message tables; returns the new store. `media_root`
+/// (`<root>/<qq>/nt_qq/nt_data`) must be supplied up front so media entry
+/// registration can resolve relative "45812" paths (stale-entry refresh).
+pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> Result<Store> {
+    let mut store = Store {
+        media_root: media_root.map(std::path::Path::to_path_buf),
+        ..Store::default()
+    };
     let g_cols = probe_cols(conn, GROUP_TABLE);
     let c_cols = probe_cols(conn, C2C_TABLE);
     store.watermark_group = scan_table(conn, GROUP_TABLE, g_cols, ChatType::Group, &mut store)
@@ -356,13 +395,26 @@ mod tests {
     #[test]
     fn full_columns_produce_direction_ts_and_card() {
         let conn = make_table(true);
-        let store = build_index(&conn).unwrap();
+        let store = build_index(&conn, None).unwrap();
         let conv = store.conversation(ChatType::Group, "10001").unwrap();
         assert_eq!(conv.msgs.len(), 1);
         let m = &conv.msgs[0];
         assert_eq!(m.direction, Some(1), "40013 read");
         assert_eq!(m.ts, 1234567890, "40050 authoritative");
-        assert_eq!(m.from_nick, "群名片", "40090 card wins over 40093");
+        // The card rides in `card`, NOT in the global message nick.
+        assert_eq!(m.from_nick, "张三", "40093 nickname stays global");
+        assert_eq!(m.card.as_deref(), Some("群名片"), "40090 card kept per-conversation");
+        assert_eq!(
+            store.group_cards["g:10001"]["u_a"],
+            "群名片",
+            "card registered under its conversation"
+        );
+        assert_eq!(
+            store.display_sender(ChatType::Group, "10001", "u_a"),
+            "群名片",
+            "in-group display prefers the card"
+        );
+        assert_eq!(store.display_uid("u_a"), "张三", "global display never shows the card");
         // seq = 100 -> seq>>32 = 0: the 40050 value must be used, not 0.
         assert_ne!(m.ts, seq_to_time(m.seq));
     }
@@ -370,12 +422,13 @@ mod tests {
     #[test]
     fn missing_columns_degrade() {
         let conn = make_table(false);
-        let store = build_index(&conn).unwrap();
+        let store = build_index(&conn, None).unwrap();
         let conv = store.conversation(ChatType::Group, "10001").unwrap();
         let m = &conv.msgs[0];
         assert_eq!(m.direction, None, "no 40013 -> None");
         assert_eq!(m.ts, seq_to_time(m.seq), "no 40050 -> seq>>32");
         assert_eq!(m.from_nick, "张三", "no 40090 -> 40093");
+        assert_eq!(m.card, None, "no 40090 -> no card");
     }
 
     #[test]
@@ -386,6 +439,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].direction, Some(1));
         assert_eq!(records[0].ts, 1234567890);
-        assert_eq!(records[0].from_nick, "群名片");
+        assert_eq!(records[0].from_nick, "张三");
+        assert_eq!(records[0].card.as_deref(), Some("群名片"));
     }
 }

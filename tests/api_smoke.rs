@@ -17,6 +17,13 @@ use tower::ServiceExt;
 
 mod common;
 
+/// Unique per-call suffix — api_smoke tests run concurrently in one process
+/// and would otherwise share (and race on) one temp media file / export root.
+fn unique_suffix() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
 fn state_with(store: Store, ready: bool) -> Arc<AppState> {
     let (tx, _) = tokio::sync::broadcast::channel(1024);
     Arc::new(AppState {
@@ -31,7 +38,9 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
-        export_root: Arc::new(std::env::temp_dir().join("qqflow_smoke_export")),
+        export_root: Arc::new(
+            std::env::temp_dir().join(format!("qqflow_smoke_export_{}", unique_suffix())),
+        ),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
     })
 }
@@ -40,7 +49,11 @@ fn test_state() -> Arc<AppState> {
     let mut store = Store::default();
     // A real temp file backing the image message's localPath, so the media
     // endpoint test can serve actual bytes.
-    let media_file = std::env::temp_dir().join(format!("qqflow_api_smoke_{}.jpg", std::process::id()));
+    let media_file = std::env::temp_dir().join(format!(
+        "qqflow_api_smoke_{}_{}.jpg",
+        std::process::id(),
+        unique_suffix()
+    ));
     std::fs::write(&media_file, b"\xFF\xD8 fake jpeg bytes \xFF\xD9").unwrap();
     let media_local = media_file.to_string_lossy().into_owned();
     // group 10001 with two messages
@@ -57,6 +70,7 @@ fn test_state() -> Arc<AppState> {
                 talker: "10001".into(),
                 from_uid: "u_a".into(),
                 from_nick: "张三".into(),
+                card: None,
                 direction: Some(1),
                 parsed: ParsedMessage {
                     msg_type: MsgType::Text,
@@ -72,6 +86,7 @@ fn test_state() -> Arc<AppState> {
                 talker: "10001".into(),
                 from_uid: "u_b".into(),
                 from_nick: "李四".into(),
+                card: None,
                 direction: Some(0),
                 parsed: ParsedMessage {
                     msg_type: MsgType::Image,
@@ -83,7 +98,7 @@ fn test_state() -> Arc<AppState> {
                         size: Some(1234),
                         width: Some(640),
                         height: Some(480),
-                        local_path: Some(media_local),
+                        local_path: Some(media_local.clone()),
                         urls: vec![],
                     }),
                 },
@@ -95,6 +110,15 @@ fn test_state() -> Arc<AppState> {
     store.watermark_group = 2;
     store.uid_names.insert("u_a".into(), "张三".into());
     store.uid_names.insert("u_b".into(), "李四".into());
+    // Register the image's local path exactly like the index would — mediaId
+    // is only promised for keys the store can actually serve.
+    store.media.insert(
+        "aabbccddeeff00112233445566778899".into(),
+        qqflow_server::store::MediaEntry {
+            local_path: media_local,
+            file_name: Some("aabb.png".into()),
+        },
+    );
     state_with(store, true)
 }
 
@@ -204,10 +228,12 @@ async fn messages_media_enabled_v1() {
     assert!(!export_path.is_empty(), "media=1 exports into a real directory");
     assert_eq!(v["media"]["count"], 1);
     let m0 = &v["messages"][0];
-    assert_eq!(m0["mediaFileName"], "aabb.png");
+    // Export names are key-derived (<md5>.<source ext>): unique per content.
+    let exported_name = "aabbccddeeff00112233445566778899.jpg";
+    assert_eq!(m0["mediaFileName"], exported_name);
     assert_eq!(
         m0["mediaUrl"],
-        "http://127.0.0.1:5032/api/v1/media/10001/images/aabb.png"
+        format!("http://127.0.0.1:5032/api/v1/media/10001/images/{exported_name}")
     );
     assert!(
         m0["mediaLocalPath"].as_str().unwrap().starts_with(export_path),
@@ -220,16 +246,23 @@ async fn messages_media_enabled_v1() {
     assert_eq!(m0["media"]["md5"], "aabbccddeeff00112233445566778899");
     assert_eq!(m0["media"]["uuid"], "R020-test");
     assert_eq!(m0["mediaId"], "aabbccddeeff00112233445566778899");
-    let (s, _v) = get(
+    // The no-media request keeps the compat envelope — assert its BODY, not
+    // just its status (the media=1 response above must not leak into it).
+    let (s, v2) = get(
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
         false,
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert!(v["messages"][1]["media"].is_null(), "text message has no media");
-    // is_send: self-sent (40013=1) vs other (40013=0).
-    assert_eq!(m0["isSend"], 0, "rowid 2 is others' image");
-    assert_eq!(v["messages"][1]["isSend"], 1, "rowid 1 is self-sent");
+    assert_eq!(v2["media"]["enabled"], true);
+    assert_eq!(v2["media"]["exportPath"], "", "no media=1 -> empty exportPath");
+    assert_eq!(v2["media"]["count"], 1, "media metadata still counted");
+    assert!(v2["messages"][0]["mediaFileName"].is_null(), "no export fields without media=1");
+    assert!(v2["messages"][1]["media"].is_null(), "text message has no media");
+    // is_send: self-sent (40013=1) vs other (40013=0) — from the no-media
+    // response so both responses' shapes are verified.
+    assert_eq!(v2["messages"][0]["isSend"], 0, "rowid 2 is others' image");
+    assert_eq!(v2["messages"][1]["isSend"], 1, "rowid 1 is self-sent");
 }
 
 #[tokio::test]
@@ -267,6 +300,91 @@ async fn messages_media_alias_and_kind_switches() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["media"]["count"], 0, "tupian=0 skips image export");
     assert!(v["messages"][0]["mediaFileName"].is_null());
+}
+
+#[tokio::test]
+async fn media_id_omitted_when_store_has_no_entry() {
+    // The media metadata rides on the message, but mediaId promises a
+    // fetchable /api/v1/media/{id} — with no registered local path the key
+    // must be omitted, never advertised as a guaranteed 404.
+    let state = test_state();
+    state.store.write().media.clear();
+    let app = build_router(state);
+    let (s, v) = call(app, "/api/v1/messages?talker=10001&access_token=test-token-123456").await;
+    assert_eq!(s, StatusCode::OK);
+    let m0 = &v["messages"][0];
+    assert!(m0["media"]["md5"].is_string(), "media object still rides along");
+    assert!(m0["mediaId"].is_null(), "mediaId omitted when not fetchable");
+}
+
+#[tokio::test]
+async fn media_single_segment_post_serves_bytes() {
+    // The {id} route is GET|POST like the three-segment route (POST with
+    // the token in the body is the documented transport).
+    let state = test_state();
+    let app = build_router(state);
+    let (s, _v) = post_json(
+        app.clone(),
+        "/api/v1/media/aabbccddeeff00112233445566778899",
+        json!({"access_token": "test-token-123456"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "POST /api/v1/media/{{id}} must not 405");
+    // Without the token the POST is rejected like any other route.
+    let (s, _v) = post_json(app, "/api/v1/media/aabbccddeeff00112233445566778899", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn post_body_booleans_for_media_params() {
+    // JSON booleans in the POST body must work exactly like ?media=1 —
+    // the two transports share one contract.
+    let state = test_state();
+    let app = build_router(state);
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/messages",
+        json!({
+            "talker": "10001",
+            "media": true,
+            "access_token": "test-token-123456",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "media:true must not 400");
+    assert_eq!(v["media"]["enabled"], true);
+    assert_eq!(v["media"]["count"], 1, "JSON bool media triggers the export");
+    assert!(!v["messages"][0]["mediaFileName"].is_null());
+
+    // Per-kind switches accept JSON bools too: image:false skips images.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/messages",
+        json!({
+            "talker": "10001",
+            "media": true,
+            "image": false,
+            "access_token": "test-token-123456",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "image:false must not 400");
+    assert_eq!(v["media"]["count"], 0, "image:false disables the image export");
+    assert!(v["messages"][0]["mediaFileName"].is_null());
+
+    // chatlab accepts a JSON bool as well (same contract class).
+    let (s, v) = post_json(
+        app,
+        "/api/v1/messages",
+        json!({
+            "talker": "10001",
+            "chatlab": true,
+            "access_token": "test-token-123456",
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "chatlab:true must not 400");
+    assert_eq!(v["chatlab"]["generator"], "qqflow-server");
 }
 
 #[tokio::test]
@@ -458,6 +576,7 @@ fn ts_boundary_state() -> Arc<AppState> {
         talker: "10001".into(),
         from_uid: "u_a".into(),
         from_nick: "张三".into(),
+        card: None,
         direction: Some(0),
         parsed: ParsedMessage { msg_type: MsgType::Text, content: content.into(), media: None },
     };
@@ -545,6 +664,7 @@ async fn all_digit_c2c_talker_resolves_via_fallback() {
             talker: "12345".into(),
             from_uid: "12345".into(),
             from_nick: "数字UID好友".into(),
+            card: None,
             direction: Some(0),
             parsed: ParsedMessage { msg_type: MsgType::Text, content: "在吗".into(), media: None },
         }],

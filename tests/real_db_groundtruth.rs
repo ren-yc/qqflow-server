@@ -157,7 +157,7 @@ fn fake_db_indexes_c2c_rows() {
     let mut reader = LiveReader::new(path, FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
     drop(reader);
 
     println!(
@@ -189,7 +189,7 @@ fn fake_db_names_loaded() {
     let mut reader = LiveReader::new(path, FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let mut store = qqflow_server::store::index::build_index(conn).unwrap();
+    let mut store = qqflow_server::store::index::build_index(conn, None).unwrap();
     let known = qqflow_server::store::names::KnownKeys::from_store(&store);
     let maps = qqflow_server::store::names::load_names(conn, &nt_db, FAKE_KEY, &known);
     drop(reader);
@@ -238,7 +238,7 @@ fn fake_db_index_media_metadata() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
     drop(reader);
 
     // Media map: md5 key -> local cache file.
@@ -267,8 +267,16 @@ fn fake_db_index_media_metadata() {
     assert_eq!(MessageOut::from_record(self_rec).is_send, 1, "40013=1 -> self");
     let sys_rec = conv.msgs.iter().find(|m| m.rowid == 4).unwrap();
     assert_eq!(MessageOut::from_record(sys_rec).is_send, 0, "40013=3 system -> 0");
-    // Group card (40090) wins over 40093 for u_a rows.
-    assert_eq!(self_rec.from_nick, "张三群名片");
+    // Group card (40090) stays per-conversation: the global nick keeps
+    // 40093, the card only surfaces inside its own group.
+    assert_eq!(self_rec.from_nick, "张三", "40093 nickname stays global");
+    assert_eq!(self_rec.card.as_deref(), Some("张三群名片"), "40090 card kept");
+    assert_eq!(
+        store.display_sender(ChatType::Group, "10001", "u_a"),
+        "张三群名片",
+        "in-group display prefers the card"
+    );
+    assert_eq!(store.display_uid("u_a"), "张三", "global display never shows the card");
 
     drop(writer);
 }
@@ -288,7 +296,7 @@ async fn fake_db_media_endpoint_serves_bytes() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
     drop(reader);
     drop(writer);
 
@@ -358,7 +366,7 @@ async fn fake_db_media_export_serves_exported_bytes() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
     drop(reader);
     drop(writer);
 
@@ -390,10 +398,12 @@ async fn fake_db_media_export_serves_exported_bytes() {
     assert_eq!(v["media"]["exportPath"], export_root.to_string_lossy().as_ref());
     assert_eq!(v["media"]["count"], 1, "the image row exported");
     let m = v["messages"].as_array().unwrap().iter().find(|m| m["mediaId"] == md5).expect("image row");
-    assert_eq!(m["mediaFileName"], "fake_image_01.jpg");
+    // Export names are key-derived (<md5>.jpg): unique per content.
+    let exported_name = format!("{md5}.jpg");
+    assert_eq!(m["mediaFileName"], exported_name);
     assert_eq!(
         m["mediaUrl"],
-        "http://127.0.0.1:5032/api/v1/media/10001/images/fake_image_01.jpg"
+        format!("http://127.0.0.1:5032/api/v1/media/10001/images/{exported_name}")
     );
     let local = m["mediaLocalPath"].as_str().unwrap();
     assert!(local.starts_with(export_root.to_string_lossy().as_ref()));
@@ -407,7 +417,7 @@ async fn fake_db_media_export_serves_exported_bytes() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/v1/media/10001/images/fake_image_01.jpg?access_token=test-token")
+                .uri(format!("/api/v1/media/10001/images/{exported_name}?access_token=test-token"))
                 .method("GET")
                 .body(Body::empty())
                 .unwrap(),
@@ -422,7 +432,7 @@ async fn fake_db_media_export_serves_exported_bytes() {
     // 4) POST variant works too (WeFlow GET|POST).
     let (s, _v) = common::post_json(
         app.clone(),
-        "/api/v1/media/10001/images/fake_image_01.jpg",
+        &format!("/api/v1/media/10001/images/{exported_name}"),
         &[],
         serde_json::json!({"access_token": "test-token"}),
     )
@@ -447,7 +457,7 @@ async fn fake_db_media_export_serves_exported_bytes() {
     // 6) Unknown media_type -> 404.
     let (s, _v) = common::get_json(
         app.clone(),
-        "/api/v1/media/10001/other/fake_image_01.jpg?access_token=test-token",
+        &format!("/api/v1/media/10001/other/{exported_name}?access_token=test-token"),
         &[],
     )
     .await;

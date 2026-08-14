@@ -79,12 +79,20 @@ pub struct MediaEntry {
 #[derive(Debug, Default)]
 pub struct Store {
     pub convs: HashMap<String, Conversation>,
-    /// uid -> latest known nickname ("40093").
+    /// uid -> latest known nickname ("40093") — the context-free global
+    /// fallback. Group cards ("40090") never enter here: they only display
+    /// inside the conversation they were seen in (`group_cards`).
     pub uid_names: HashMap<String, String>,
     /// uid/群 name maps from the mapping sources (see `names`).
     pub names: NameMaps,
+    /// Group cards ("40090") per conversation: conv_key -> (uid -> card).
+    /// Display scope is the group the card was seen in (SSE source_name,
+    /// chatlab members) — never c2c chats or the global contact lists.
+    pub group_cards: HashMap<String, HashMap<String, String>>,
     /// Media lookup: md5 hex / uuid -> local cache file, built from the
-    /// structured media metadata at index time (first-wins).
+    /// structured media metadata at index time. First-wins, but a stale
+    /// entry (QQ cleared its cache) is refreshed by a later row with a
+    /// live local path — see `index::apply_record`.
     pub media: HashMap<String, MediaEntry>,
     /// `nt_data` root of the account — relative "45812" paths resolve here.
     pub media_root: Option<std::path::PathBuf>,
@@ -141,6 +149,23 @@ impl Store {
             .or_else(|| self.uid_names.get(uid).filter(|s| !s.is_empty()))
             .cloned()
             .unwrap_or_else(|| uid.to_string())
+    }
+
+    /// Sender display name in a conversation context. In a group, the
+    /// sender's group card ("40090") for THIS conversation wins over the
+    /// global name (remark > profile nick > message nick) — cards are
+    /// per-group and must never leak into c2c chats or contacts.
+    pub fn display_sender(&self, chat_type: ChatType, talker: &str, uid: &str) -> String {
+        if chat_type == ChatType::Group
+            && let Some(card) = self
+                .group_cards
+                .get(&conv_key(chat_type, talker))
+                .and_then(|cards| cards.get(uid))
+                .filter(|s| !s.is_empty())
+        {
+            return card.clone();
+        }
+        self.display_uid(uid)
     }
 
     /// Look up a conversation by talker string, falling back to the other
@@ -279,5 +304,46 @@ mod tests {
         assert_eq!(store.display_uid("u_a"), "张三备注", "remark wins");
 
         assert_eq!(store.display_uid("u_zzz"), "u_zzz", "no data -> uid");
+    }
+
+    #[test]
+    fn display_sender_card_stays_inside_its_group() {
+        let mut store = Store::default();
+        store.uid_names.insert("u_a".into(), "张三".into());
+        store
+            .group_cards
+            .insert(conv_key(ChatType::Group, "10001").into(), {
+                let mut m = HashMap::new();
+                m.insert("u_a".to_string(), "1群名片".to_string());
+                m
+            });
+        store
+            .group_cards
+            .insert(conv_key(ChatType::Group, "10002").into(), {
+                let mut m = HashMap::new();
+                m.insert("u_a".to_string(), "2群名片".to_string());
+                m
+            });
+        assert_eq!(
+            store.display_sender(ChatType::Group, "10001", "u_a"),
+            "1群名片",
+            "card for THIS conversation"
+        );
+        assert_eq!(
+            store.display_sender(ChatType::Group, "10002", "u_a"),
+            "2群名片",
+            "different group, different card"
+        );
+        assert_eq!(
+            store.display_sender(ChatType::Group, "10003", "u_a"),
+            "张三",
+            "no card in this group -> global name"
+        );
+        assert_eq!(
+            store.display_sender(ChatType::C2c, "u_a", "u_a"),
+            "张三",
+            "cards never leak into c2c chats"
+        );
+        assert_eq!(store.display_uid("u_a"), "张三", "global display ignores cards");
     }
 }

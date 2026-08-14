@@ -31,6 +31,11 @@ pub struct Params {
 
 /// Stream a local file with a content-type from its extension. The file
 /// must exist (canonicalized paths are pre-verified by the callers).
+///
+/// Extension source: the file-name hint first (entry.file_name / URL
+/// segment), then the resolved local file's own extension — uuid-keyed
+/// media with a missing or extension-less file name must still be typed
+/// from what is actually on disk (e.g. a real `.silk`/`.jpg`).
 async fn serve_file(local_path: &std::path::Path, file_name_hint: Option<&str>) -> Result<Response, ApiError> {
     let file = tokio::fs::File::open(local_path)
         .await
@@ -40,8 +45,9 @@ async fn serve_file(local_path: &std::path::Path, file_name_hint: Option<&str>) 
         .await
         .map_err(|_| ApiError::not_found("本地缓存已清理，媒体文件不存在"))?
         .len();
-    let ext = file_name_hint
-        .and_then(|n| std::path::Path::new(n).extension())
+    let hint_ext = file_name_hint.and_then(|n| std::path::Path::new(n).extension());
+    let ext = hint_ext
+        .or_else(|| local_path.extension())
         .and_then(|e| e.to_str())
         .unwrap_or("");
     let content_type = media_content_type(ext);

@@ -15,12 +15,11 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::parser::types::MsgType;
 use crate::store::media_export::{self, ExportContext, ExportOptions};
 use crate::store::query::{query_messages, MessageOut, MessageQuery};
 use crate::store::AppState;
 
-use super::{authorized, merge_body, parse_time_bound};
+use super::{authorized, merge_body, parse_time_bound, FlexBool};
 use crate::server::error::ApiError;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -33,49 +32,34 @@ pub struct Params {
     pub start: Option<String>,
     pub end: Option<String>,
     pub keyword: Option<String>,
+    /// ChatLab output switch — bool (POST body) or "1"/"true" (query).
     #[serde(default)]
-    pub chatlab: Option<String>,
+    pub chatlab: FlexBool,
     #[serde(default)]
     pub format: Option<String>,
-    /// WeFlow media export switch (alias: meiti) — `1/true` exports this
-    /// page's media and fills mediaFileName/mediaUrl/mediaLocalPath.
+    /// WeFlow media export switch (alias: meiti) — true exports this page's
+    /// media and fills mediaFileName/mediaUrl/mediaLocalPath. Accepted as
+    /// JSON bool or "1"/"true" (see `FlexBool`).
     #[serde(default)]
-    pub media: Option<String>,
+    pub media: FlexBool,
     #[serde(default)]
-    pub meiti: Option<String>,
-    /// Per-kind export sub-switches (default true; "0"/"false" disables).
+    pub meiti: FlexBool,
+    /// Per-kind export sub-switches (default on; false / "0" disables).
     #[serde(default)]
-    pub image: Option<String>,
+    pub image: FlexBool,
     #[serde(default)]
-    pub tupian: Option<String>,
+    pub tupian: FlexBool,
     #[serde(default)]
-    pub voice: Option<String>,
+    pub voice: FlexBool,
     #[serde(default)]
-    pub vioce: Option<String>,
+    pub vioce: FlexBool,
     #[serde(default)]
-    pub video: Option<String>,
+    pub video: FlexBool,
     /// Recognized but inert in v1: QQ emoji carry display text, no files.
     #[serde(default)]
-    pub emoji: Option<String>,
+    pub emoji: FlexBool,
     #[serde(default)]
     pub access_token: Option<String>,
-}
-
-fn truthy(v: Option<&str>) -> bool {
-    matches!(v, Some("1" | "true"))
-}
-
-fn is_falsey(v: Option<&str>) -> bool {
-    matches!(v, Some("0" | "false"))
-}
-
-fn kind_of(m: &MessageOut) -> Option<MsgType> {
-    match m.media_type.as_deref() {
-        Some("image") => Some(MsgType::Image),
-        Some("voice") => Some(MsgType::Voice),
-        Some("video") => Some(MsgType::Video),
-        _ => None,
-    }
 }
 
 fn default_limit() -> usize {
@@ -110,10 +94,8 @@ pub async fn handler(
         query_messages(&store, &q)
     };
 
-    let chatlab = params.chatlab.as_deref() == Some("1")
-        || params.chatlab.as_deref() == Some("true")
-        || params.format.as_deref() == Some("chatlab");
-    let media_on = truthy(params.media.as_deref()) || truthy(params.meiti.as_deref());
+    let chatlab = params.chatlab.is_true() || params.format.as_deref() == Some("chatlab");
+    let media_on = params.media.is_true() || params.meiti.is_true();
 
     let body = if chatlab {
         // ChatLab output carries no export envelope (WeFlow parity).
@@ -121,7 +103,7 @@ pub async fn handler(
     } else if media_on {
         // WeFlow-shaped export: copy this page's media into the export
         // root, fill per-message mediaFileName/mediaUrl/mediaLocalPath.
-        export_envelope(&state, talker, has_more, &params, items)
+        export_envelope(&state, talker, has_more, &params, items).await?
     } else {
         // No media param: capability envelope unchanged (compat) — media
         // metadata still rides on every message.
@@ -142,12 +124,22 @@ pub async fn handler(
 /// page's media files into `<exportRoot>/<talker>/<kind>/<file>` and fills
 /// the per-message export fields; `count` = successfully exported messages.
 /// Missing sources (QQ cleared the cache) are skipped gracefully.
-fn export_envelope(state: &AppState, talker: &str, has_more: bool, params: &Params, items: Vec<MessageOut>) -> Value {
+///
+/// The copy loop runs on the blocking pool — export is real file IO and
+/// must never stall the tokio workers (concurrent exports would starve
+/// every other request, including SSE keep-alives).
+async fn export_envelope(
+    state: &AppState,
+    talker: &str,
+    has_more: bool,
+    params: &Params,
+    items: Vec<MessageOut>,
+) -> Result<Value, ApiError> {
     let opts = ExportOptions {
-        image: !is_falsey(params.image.as_deref()) && !is_falsey(params.tupian.as_deref()),
-        voice: !is_falsey(params.voice.as_deref()) && !is_falsey(params.vioce.as_deref()),
-        video: !is_falsey(params.video.as_deref()),
-        emoji: !is_falsey(params.emoji.as_deref()),
+        image: !params.image.is_false() && !params.tupian.is_false(),
+        voice: !params.voice.is_false() && !params.vioce.is_false(),
+        video: !params.video.is_false(),
+        emoji: !params.emoji.is_false(),
     };
     let media_root = state.store.read().media_root.clone();
     let ctx = ExportContext {
@@ -155,29 +147,20 @@ fn export_envelope(state: &AppState, talker: &str, has_more: bool, params: &Para
         base_url: state.base_url.as_str().to_string(),
         talker: talker.to_string(),
     };
-    let mut exported = 0usize;
-    let messages: Vec<MessageOut> = items
-        .into_iter()
-        .map(|mut m| {
-            if let (Some(kind), Some(info)) = (kind_of(&m), m.media.clone())
-                && let Some(out) = media_export::export_media(&ctx, &info, kind, &opts, media_root.as_deref())
-            {
-                exported += 1;
-                m.media_file_name = Some(out.file_name);
-                m.media_url = Some(out.url);
-                m.media_local_path = Some(out.local_path);
-            }
-            m
-        })
-        .collect();
-    json!({
+    let export_path = ctx.root.to_string_lossy().into_owned();
+    let (messages, exported) = tokio::task::spawn_blocking(move || {
+        media_export::export_page(&ctx, &opts, media_root.as_deref(), items)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("媒体导出任务异常: {e}")))?;
+    Ok(json!({
         "success": true,
         "talker": talker,
         "count": messages.len(),
         "hasMore": has_more,
-        "media": { "enabled": true, "exportPath": ctx.root.to_string_lossy(), "count": exported },
+        "media": { "enabled": true, "exportPath": export_path, "count": exported },
         "messages": messages,
-    })
+    }))
 }
 
 /// ChatLab-style envelope for /api/v1/messages (meta + members + messages).
@@ -192,12 +175,14 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
     let name = conv
         .map(|c| store.display_name(c.chat_type, &c.talker))
         .unwrap_or_else(|| talker.to_string());
-    // members: uid -> name seen in this session (remark preferred)
+    // members: uid -> name seen in this session (remark preferred; in a
+    // group the sender's per-conversation card (40090) wins — it never
+    // leaks into c2c or the global contact lists).
     let members: Vec<Value> = items
         .iter()
         .filter_map(|m| {
             let uid = &m.sender_username;
-            let nick = store.display_uid(uid);
+            let nick = store.display_sender(chat_type, talker, uid);
             if uid.is_empty() { None } else {
                 Some(json!({
                     "platformId": uid,
@@ -213,7 +198,7 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
         .rev() // chatlab is chronological
         .map(|m| json!({
             "sender": m.sender_username,
-            "accountName": store.display_uid(&m.sender_username),
+            "accountName": store.display_sender(chat_type, talker, &m.sender_username),
             "timestamp": m.create_time,
             "type": m.local_type,
             "content": m.content,

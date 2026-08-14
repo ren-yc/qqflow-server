@@ -33,6 +33,11 @@ pub struct Config {
     /// Media export root for `media=1` (WeFlow exportPath semantics);
     /// default `<data-dir>/api-media`.
     pub media_export_dir: Option<PathBuf>,
+    /// Base URL for exported media links (`mediaUrl`), e.g.
+    /// `--base-url http://192.168.1.10:5032` when serving LAN clients.
+    /// Default: derived from `--host`/`--port` (0.0.0.0 / :: fall back to
+    /// 127.0.0.1 — bind-all addresses are not reachable as URLs).
+    pub base_url: Option<String>,
 }
 
 impl Default for Config {
@@ -44,6 +49,7 @@ impl Default for Config {
             watch_debounce_ms: 350,
             watch_fallback_ms: 30_000,
             media_export_dir: None,
+            base_url: None,
         }
     }
 }
@@ -60,6 +66,8 @@ fn help() -> String {
        --watch-debounce-ms <ms>  文件事件防抖（默认 350）\n\
        --watch-fallback-ms <ms>  慢速兜底轮询，0 关闭（默认 30000）\n\
        --media-export-dir <dir>  媒体导出根目录（默认 <data-dir>/api-media）\n\
+       --base-url <url>          媒体导出链接 base URL（默认 http://<host>:<port>，\n\
+                                 绑定 0.0.0.0/:: 时回退 127.0.0.1；局域网访问请显式指定）\n\
        -h, --help                显示本帮助\n\
      \n\
      账号与密钥不在命令行提供：启动后由客户端 POST /api/v1/accounts\n\
@@ -113,6 +121,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
                     .map_err(|_| anyhow::anyhow!("--watch-fallback-ms 需为非负整数: {value}"))?
             }
             "--media-export-dir" => cfg.media_export_dir = Some(PathBuf::from(value)),
+            "--base-url" => cfg.base_url = Some(value),
             other => bail!("未知参数: {other}\n{}", help()),
         }
         i += 2;

@@ -96,7 +96,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(health::handler).post(health::handler))
         .route("/api/v1/accounts", post(accounts::handler))
         .route("/api/v1/messages", get(messages::handler).post(messages::handler))
-        .route("/api/v1/media/{id}", get(media::handler))
+        .route("/api/v1/media/{id}", get(media::handler).post(media::handler))
         .route(
             "/api/v1/media/{talker}/{media_type}/{file}",
             get(media::exported_handler).post(media::exported_handler),
@@ -167,6 +167,33 @@ fn begin_indexing(state: &AppState, qq: &str) -> Option<AccountStatus> {
     }
 }
 
+/// Base URL for exported media links (`mediaUrl`). An explicit `override`
+/// (`--base-url`) wins; otherwise `http://<host>:<port>` — except bind-all
+/// addresses (0.0.0.0 / ::), which are not reachable as URLs and fall back
+/// to 127.0.0.1 (LAN clients must pass `--base-url` explicitly). IPv6 hosts
+/// are bracketed: `http://[::1]:5032`.
+fn derive_base_url(host: &str, port: u16, override_url: Option<&str>) -> String {
+    match override_url {
+        Some(url) => url.to_string(),
+        None => {
+            let host = match host {
+                "0.0.0.0" | "::" => {
+                    tracing::warn!(
+                        "[init] 绑定地址 {host} 不可作为 URL，mediaUrl 回退 127.0.0.1；局域网客户端请用 --base-url 显式指定"
+                    );
+                    "127.0.0.1".to_string()
+                }
+                h => h.to_string(),
+            };
+            if host.contains(':') && !host.starts_with('[') {
+                format!("http://[{host}]:{port}")
+            } else {
+                format!("http://{host}:{port}")
+            }
+        }
+    }
+}
+
 /// Global readiness = at least one account and every account `ready`.
 pub fn update_ready(state: &AppState) {
     let accs = state.accounts.read();
@@ -192,21 +219,22 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
         let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build.clone());
         reader.open()?; // verify the key now — bad key → error state (unchanged UX)
         let conn = reader.acquire()?;
-        let mut st = index::build_index(conn)?;
-        // uid→备注/QQ、群号→群名 maps (best-effort — empty on schema churn).
+        // Media root: <root>/<qq>/nt_qq/nt_db -> <root>/<qq>/nt_qq/nt_data;
+        // relative "45812" local cache paths resolve against it. Supplied to
+        // build_index up front so media registration can refresh stale paths.
         let nt_db_dir = info_for_build
             .path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
+        let media_root = nt_db_dir.parent().map(|p| p.join("nt_data"));
+        let mut st = index::build_index(conn, media_root.as_deref())?;
+        // uid→备注/QQ、群号→群名 maps (best-effort — empty on schema churn).
         st.names = store::names::load_names(
             conn,
             nt_db_dir,
             &key_for_build,
             &store::names::KnownKeys::from_store(&st),
         );
-        // Media root: <root>/<qq>/nt_qq/nt_db -> <root>/<qq>/nt_qq/nt_data;
-        // relative "45812" local cache paths resolve against it.
-        st.media_root = nt_db_dir.parent().map(|p| p.join("nt_data"));
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         install_index(&store, &tx, st);
         Ok((Arc::new(Mutex::new(reader)), count))
@@ -298,7 +326,11 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
             .clone()
             .unwrap_or_else(|| data_dir.join("api-media")),
     );
-    let base_url = Arc::new(format!("http://{}:{}", cfg.host, cfg.port));
+    // Exported-media URL base. `--base-url` overrides; otherwise derive
+    // from host/port — but bind-all addresses (0.0.0.0 / ::) are not
+    // reachable as URLs, so they fall back to 127.0.0.1 (LAN clients must
+    // pass --base-url explicitly). IPv6 hosts are bracketed: [::1]:5032.
+    let base_url = Arc::new(derive_base_url(&cfg.host, cfg.port, cfg.base_url.as_deref()));
     let state = Arc::new(AppState {
         store: store.clone(),
         events: tx.clone(),
@@ -382,6 +414,24 @@ mod tests {
         set_account_state(&state, "10001", AccountStatus::Ready, 7, None);
         update_ready(&state);
         assert!(state.ready.load(Ordering::SeqCst), "all ready flips the flag");
+    }
+
+    #[test]
+    fn base_url_derivation() {
+        assert_eq!(
+            derive_base_url("127.0.0.1", 5032, None),
+            "http://127.0.0.1:5032"
+        );
+        // Bind-all addresses are not reachable as URLs -> 127.0.0.1.
+        assert_eq!(derive_base_url("0.0.0.0", 5032, None), "http://127.0.0.1:5032");
+        assert_eq!(derive_base_url("::", 5032, None), "http://127.0.0.1:5032");
+        // IPv6 hosts get brackets.
+        assert_eq!(derive_base_url("::1", 5032, None), "http://[::1]:5032");
+        // --base-url overrides everything verbatim.
+        assert_eq!(
+            derive_base_url("0.0.0.0", 5032, Some("http://192.168.1.10:5032")),
+            "http://192.168.1.10:5032"
+        );
     }
 
     #[test]

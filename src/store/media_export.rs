@@ -4,9 +4,18 @@
 //! local cache into `<exportRoot>/<talker>/<images|voices|videos>/<file>`
 //! and reports `mediaFileName` / `mediaUrl` / `mediaLocalPath` per message
 //! (WeFlow HTTP-API.md layout). Copy, not hardlink — QQ clears its cache
-//! and a hardlink would die with it. Idempotent: a destination with the
-//! same size is left untouched. A missing source (cache cleared) or a
-//! disabled kind silently yields None — the caller omits the fields.
+//! and a hardlink would die with it.
+//!
+//! File names are derived from the media store key (md5 hex or uuid, plus
+//! the source extension): same content -> same destination across pages, so
+//! the same-size idempotency check is sound (two messages with the same key
+//! are byte-identical; different content can never share a destination
+//! name). QQ's original `fileName` is only kept when no key exists.
+//! A missing source (cache cleared) or a disabled kind silently yields None
+//! — the caller omits the fields.
+//!
+//! `export_page` performs real file IO and is meant to run on the blocking
+//! pool (`spawn_blocking`) from the async handler, never on a tokio worker.
 
 use std::path::{Path, PathBuf};
 
@@ -85,8 +94,11 @@ pub fn resolve_local_path(local_path: &str, media_root: Option<&Path>) -> Option
     joined.canonicalize().ok()
 }
 
-/// Safe export file name: QQ's file name when it is a bare file name with
-/// URL-safe characters, else `<key>.<source ext>`, else `<key>`.
+/// Safe export file name: `<key>.<source ext>` when a store key exists
+/// (md5 hex or uuid — unique per content, so two messages with different
+/// bytes can never collide on one destination; QQ's original file names
+/// are arbitrary and DO collide across messages), else QQ's file name when
+/// it is a bare URL-safe name, else the source file name.
 fn export_file_name(m: &MediaInfo, source: &Path) -> String {
     let url_safe = |s: &str| {
         !s.is_empty()
@@ -94,16 +106,16 @@ fn export_file_name(m: &MediaInfo, source: &Path) -> String {
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     };
-    if let Some(name) = m.file_name.as_deref()
-        && url_safe(name)
-    {
-        return name.to_string();
-    }
     if let Some(key) = m.key().filter(|k| url_safe(k)) {
         if let Some(ext) = source.extension().and_then(|e| e.to_str()).filter(|e| !e.is_empty() && e.len() <= 8) {
             return format!("{key}.{ext}");
         }
         return key;
+    }
+    if let Some(name) = m.file_name.as_deref()
+        && url_safe(name)
+    {
+        return name.to_string();
     }
     source
         .file_name()
@@ -116,7 +128,9 @@ fn export_file_name(m: &MediaInfo, source: &Path) -> String {
 /// Export one media file into `<root>/<talker>/<kind>/<file>`. Returns None
 /// when the kind is disabled, the source file is missing (QQ cleared the
 /// cache), or the copy failed. Idempotent: an existing destination with the
-/// same size is left untouched (mtime preserved).
+/// same size is left untouched (mtime preserved) — sound because the
+/// destination name embeds the content key, so a same-size destination is
+/// the same media, never a different file that shares a name.
 pub fn export_media(
     ctx: &ExportContext,
     m: &MediaInfo,
@@ -157,6 +171,40 @@ fn out(ctx: &ExportContext, talker: &str, kind: &str, file_name: &str, dest: &Pa
     }
 }
 
+/// Export a whole page of messages (the `media=1` / `meiti` path): each
+/// media message gets its export fields filled; returns (messages, exported
+/// count). Real file IO — run on the blocking pool (`spawn_blocking`) from
+/// the async handler, never directly on a tokio worker.
+pub fn export_page(
+    ctx: &ExportContext,
+    opts: &ExportOptions,
+    media_root: Option<&Path>,
+    items: Vec<crate::store::query::MessageOut>,
+) -> (Vec<crate::store::query::MessageOut>, usize) {
+    let mut exported = 0usize;
+    let messages: Vec<crate::store::query::MessageOut> = items
+        .into_iter()
+        .map(|mut m| {
+            let kind = match m.media_type.as_deref() {
+                Some("image") => Some(MsgType::Image),
+                Some("voice") => Some(MsgType::Voice),
+                Some("video") => Some(MsgType::Video),
+                _ => None,
+            };
+            if let (Some(kind), Some(info)) = (kind, m.media.clone())
+                && let Some(out) = export_media(ctx, &info, kind, opts, media_root)
+            {
+                exported += 1;
+                m.media_file_name = Some(out.file_name);
+                m.media_url = Some(out.url);
+                m.media_local_path = Some(out.local_path);
+            }
+            m
+        })
+        .collect();
+    (messages, exported)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,7 +238,11 @@ mod tests {
         let safe = root.join("aabb.png");
         std::fs::write(&safe, b"x").unwrap();
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), None);
-        assert_eq!(export_file_name(&m, &safe), "aabb.png", "bare file name accepted");
+        assert_eq!(
+            export_file_name(&m, &safe),
+            "aabbccddeeff00112233445566778899.png",
+            "md5 key preferred over QQ's arbitrary file name (collision-safe)"
+        );
         let m = media("aabbccddeeff00112233445566778899", Some("a/../evil.png"), None);
         assert_eq!(export_file_name(&m, &safe), "aabbccddeeff00112233445566778899.png", "separator/.. rejected -> key.ext");
         let m = media("aabbccddeeff00112233445566778899", Some("..\\evil"), None);
@@ -199,6 +251,9 @@ mod tests {
         assert_eq!(export_file_name(&m, &safe), "aabbccddeeff00112233445566778899.png", "non-url-safe name rejected");
         let m = media("", Some(""), None);
         assert_eq!(export_file_name(&m, &safe), "aabb.png", "no key/name -> source file name");
+        // No md5/uuid at all: QQ's bare URL-safe name is kept.
+        let m = media("", Some("photo.png"), None);
+        assert_eq!(export_file_name(&m, &safe), "photo.png", "raw name kept only without a key");
     }
 
     #[test]
@@ -215,15 +270,26 @@ mod tests {
         };
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
         let e = export_media(&ctx, &m, MsgType::Image, &ExportOptions::default(), None).expect("export");
-        assert_eq!(e.file_name, "aabb.png");
-        assert_eq!(e.url, "http://127.0.0.1:5032/api/v1/media/10001/images/aabb.png");
+        assert_eq!(e.file_name, "aabbccddeeff00112233445566778899.png");
+        assert_eq!(
+            e.url,
+            "http://127.0.0.1:5032/api/v1/media/10001/images/aabbccddeeff00112233445566778899.png"
+        );
         let dest = Path::new(&e.local_path);
         assert_eq!(std::fs::read(dest).unwrap(), b"fake image bytes");
         let mtime = dest.metadata().unwrap().modified().unwrap();
-        // Second export: same size -> skip, mtime untouched.
+        // Second export: same key + same size -> skip, mtime untouched.
         let e2 = export_media(&ctx, &m, MsgType::Image, &ExportOptions::default(), None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
+        // Different content, same QQ file name: never the same destination
+        // (the md5 key differs -> distinct file, no overwrite).
+        let src2 = src_dir.join("b.png");
+        std::fs::write(&src2, b"different bytes, same claimed name").unwrap();
+        let m2 = media("ffeeddccbbaa99887766554433221100", Some("aabb.png"), Some(src2.to_str().unwrap()));
+        let e3 = export_media(&ctx, &m2, MsgType::Image, &ExportOptions::default(), None).expect("export2");
+        assert_ne!(e3.file_name, e.file_name, "same QQ name, different md5 -> different file");
+        assert_eq!(e3.file_name, "ffeeddccbbaa99887766554433221100.png");
     }
 
     #[test]

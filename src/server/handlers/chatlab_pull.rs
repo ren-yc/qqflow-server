@@ -94,7 +94,7 @@ pub async fn handler(
             let m = &conv.msgs[i];
             json!({
                 "sender": m.from_uid,
-                "accountName": store.display_uid(&m.from_uid),
+                "accountName": store.display_sender(chat_type, &talker, &m.from_uid),
                 "timestamp": m.ts,
                 "type": m.parsed.msg_type.code(),
                 "content": m.parsed.content,
@@ -109,10 +109,12 @@ pub async fn handler(
         for m in &conv.msgs {
             if !seen.contains(&m.from_uid) && !m.from_uid.is_empty() {
                 seen.push(m.from_uid.clone());
-                let nick = store.display_uid(&m.from_uid);
+                let nick = store.display_sender(chat_type, &talker, &m.from_uid);
                 out.push(json!({
                     "platformId": m.from_uid,
                     "accountName": nick,
+                    // groupNickname = the per-conversation group card (40090)
+                    // when known, else the account name.
                     "groupNickname": if chat_type == ChatType::Group { nick.clone() } else { String::new() },
                     "avatar": "",
                 }));

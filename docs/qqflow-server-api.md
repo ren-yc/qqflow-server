@@ -155,7 +155,7 @@ GET /api/v1/push/messages
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
 | `avatarUrl` | v1 恒省略（序列化时跳过该字段） |
-| `sourceName` | 发送者显示名（备注优先：备注 > 最新昵称 > UID） |
+| `sourceName` | 发送者显示名（群聊：本群群名片（40090）> 备注 > 档案昵称 > 最新昵称 > UID；私聊：备注 > 档案昵称 > 最新昵称 > UID——群名片只在所属群内显示，不会泄漏进私聊/联系人） |
 | `groupName` | 会话显示名（群聊：群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊：备注 > 档案昵称 > 对方昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
@@ -202,8 +202,8 @@ GET /api/v1/messages
 | `keyword` | string | 否   | 基于消息显示文本过滤                                  |
 | `chatlab` | string | 否   | `1/true` 时输出 ChatLab 格式                          |
 | `format`  | string | 否   | `json` 或 `chatlab`                                   |
-| `media`   | string | 否   | `1/true`（别名 `meiti`）触发该页媒体导出，填充 `mediaFileName`/`mediaUrl`/`mediaLocalPath` 并启用 WeFlow 形状的 `media.exportPath`；不带参数时保持兼容 envelope（`exportPath=""`，媒体元数据仍随消息返回） |
-| `image`（别名 `tupian`）/ `voice`（别名 `vioce`）/ `video` / `emoji` | string | 否   | 媒体导出子开关，默认开启，`0`/`false` 关闭 |
+| `media`   | string/bool | 否 | `1`/`true`（别名 `meiti`）触发该页媒体导出，填充 `mediaFileName`/`mediaUrl`/`mediaLocalPath` 并启用 WeFlow 形状的 `media.exportPath`；不带参数时保持兼容 envelope（`exportPath=""`，媒体元数据仍随消息返回）。两种传输一致：query-string 用 `1`/`true`/`0`/`false` 字符串，POST body 直接用 JSON bool |
+| `image`（别名 `tupian`）/ `voice`（别名 `vioce`）/ `video` / `emoji` | string/bool | 否 | 媒体导出子开关，默认开启，`0`/`false` 关闭（同上，POST body 接受 JSON bool） |
 
 ### 示例
 
@@ -232,7 +232,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | `content` / `rawContent` / `parsedContent` | v1 三者相同，为解析后文本 |
 | `mediaType` | 仅图片/语音/视频消息：`image` / `voice` / `video` |
 | `media` | 仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略） |
-| `mediaId` | 媒体获取键（md5 hex 或 uuid），用于 `GET /api/v1/media/{id}`；`media` 存在时必有 |
+| `mediaId` | 媒体获取键（md5 hex 或 uuid，统一小写），用于 `GET /api/v1/media/{id}`；**仅当索引注册了本地缓存路径（`media.localPath` 非空）时提供**——否则省略（`media` 对象仍在，但该键无法取到字节，承诺了就是必 404） |
 | `mediaFileName` / `mediaUrl` / `mediaLocalPath` | 仅 `media=1` 导出后出现：导出文件名、可访问 URL、导出目录绝对路径（WeFlow 形状字段） |
 
 消息类型码：
@@ -277,7 +277,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
         "size": 44540,
         "width": 507,
         "height": 307,
-        "localPath": "D:\\...\\nt_data\\Pic\\2026-08\\Ori\\9f2a....png"
+        "localPath": "C:\\SomeUser\\nt_qq\\nt_data\\Pic\\2026-08\\Ori\\9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d.png"
       },
       "mediaId": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"
     },
@@ -302,8 +302,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
 - `meta.name`（会话显示名：群聊为群备注 > 群信息库群名 > 改名消息群名 > 群号；私聊为备注 > 档案昵称 > 昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
-- `members[].platformId`、`members[].accountName`（备注优先）、`members[].groupNickname`、`members[].avatar`（恒空）
-- `messages[].sender`、`messages[].accountName`（备注优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+- `members[].platformId`、`members[].accountName`（群聊：本群群名片 > 备注 > 档案昵称 > 最新昵称 > UID；私聊同链路无卡片）、`members[].groupNickname`（群聊群名片，私聊恒空）、`members[].avatar`（恒空）
+- `messages[].sender`、`messages[].accountName`（同上，群聊群名片优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
 ---
 
@@ -331,10 +331,12 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 - 每条媒体消息填充 `mediaFileName` / `mediaUrl`（=`{base}/api/v1/media/{talker}/{type}/{file}`）/ `mediaLocalPath`（绝对路径）
 - envelope 变为 `"media": {"enabled": true, "exportPath": "<导出根>", "count": <本次导出条数>}`
 - 子开关 `image`（别名 `tupian`）、`voice`（别名 `vioce`）、`video`、`emoji` 默认开启，`0`/`false` 关闭对应类型导出
+- 导出在阻塞线程池执行（`spawn_blocking`），不阻塞 HTTP worker（并发导出/SSE 互不影响）
+- 幂等：目标已存在且同尺寸即跳过（不重写、mtime 保留）——目标文件名由内容键（md5 hex / uuid，小写）派生，同键必同内容，不会出现"同名不同字节"互相覆盖/错指
 
 **获取导出文件**：`GET|POST /api/v1/media/{talker}/{mediaType}/{file}?access_token=YOUR_TOKEN`（`mediaType` ∈ `images|voices|videos|emojis`；遍历防护：路径段拒绝 `..`/分隔符 + canonicalize 前缀校验；文件缺失或类型未知 → 404）。注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
 
-**与 WeFlow 的已知差异**（不可避免，文档化）：① `emoji` 开关接受但不产生导出（QQ 表情仅有显示文本，无文件；gif 图片走 `images/`）；② 语音导出**原始** `.silk`/`.amr` 文件（未转码为 wav）；③ `mediaUrl` 使用本服务自身 `{host}:{port}`（默认 127.0.0.1:5032，WeFlow 为 5031）；④ 导出根默认 `<data-dir>/api-media`（可 `--media-export-dir` 覆盖）；⑤ 文件名保留 QQ 原始 `fileName`（如 `MD5.png`）而非 WeFlow 式重命名；⑥ 404 错误体为统一 envelope 而非 WeFlow 的 `{"error":"Media not found"}`。`mediaId` 直服（§3.1）与 `media` 元数据对象为 qqflow 扩展，导出后仍可用。
+**与 WeFlow 的已知差异**（不可避免，文档化）：① `emoji` 开关接受但不产生导出（QQ 表情仅有显示文本，无文件；gif 图片走 `images/`）；② 语音导出**原始** `.silk`/`.amr` 文件（未转码为 wav）；③ `mediaUrl` 的 base 默认取 `http://{host}:{port}`（默认 127.0.0.1:5032，WeFlow 为 5031）——绑定 `0.0.0.0`/`::` 时该地址不可达，自动回退 `127.0.0.1` 并告警；局域网/容器部署请用 `--base-url http://<可达地址>:<port>` 显式指定；④ 导出根默认 `<data-dir>/api-media`（可 `--media-export-dir` 覆盖）；⑤ 文件名按内容键派生（`<md5|uuid>.<源扩展名>`，如 `9f2a1c...4d.png`）而非保留 QQ 原始 `fileName`——同名不同内容的文件因此永不冲突，跨页重复导出幂等（无键可派生时才保留 QQ 原始名）；⑥ 404 错误体为统一 envelope 而非 WeFlow 的 `{"error":"Media not found"}`。`mediaId` 直服（§3.1）与 `media` 元数据对象为 qqflow 扩展，导出后仍可用。
 
 ## 4. 获取会话列表
 
