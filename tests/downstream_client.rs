@@ -83,6 +83,8 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
+        export_root: Arc::new(std::env::temp_dir().join("qqflow_client_export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
     });
     let app = build_router(state.clone());
     Some((app, state, qq, root, key))
@@ -215,7 +217,8 @@ async fn downstream_client_real_db() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true);
     assert_eq!(v["talker"], first_talker);
-    assert_eq!(v["media"]["enabled"], false);
+    assert_eq!(v["media"]["enabled"], true, "media capability on");
+    assert_eq!(v["media"]["exportPath"], "");
     let msgs = v["messages"].as_array().unwrap();
     assert!(!msgs.is_empty(), "real conversation must have messages");
     assert_eq!(v["count"].as_u64().unwrap() as usize, msgs.len());
@@ -224,7 +227,8 @@ async fn downstream_client_real_db() {
         assert!(m["serverId"].is_string());
         assert!(m["localType"].is_number());
         assert!(m["createTime"].is_number());
-        assert_eq!(m["isSend"], 0, "v1 direction is always 0");
+        // Direction from 40013: 0 (other/system) or 1 (self) — never 2+.
+        assert!(matches!(m["isSend"].as_i64(), Some(0 | 1)), "isSend from 40013");
         assert!(m["senderUsername"].is_string());
         assert!(m["content"].is_string());
         assert!(m["rawContent"].is_string());
@@ -234,12 +238,46 @@ async fn downstream_client_real_db() {
             assert!(matches!(mt.as_str(), Some("image" | "voice" | "video")));
             assert!(matches!(m["localType"].as_i64(), Some(3..=5)));
         }
+        // Structured media rides on image/voice/video messages.
+        if m.get("media").is_some() {
+            assert!(m["mediaId"].is_string(), "media implies a fetchable mediaId");
+        }
     }
     // newest first
     let ts_first = msgs[0]["createTime"].as_i64().unwrap();
     let ts_last = msgs.last().unwrap()["createTime"].as_i64().unwrap();
     assert!(ts_first >= ts_last, "messages must be newest first");
     println!("[CLIENT] messages({first_talker}): {} rows, ts=[{ts_last},{ts_first}]", msgs.len());
+
+    // ---- 4b. media=1 export: WeFlow-shaped fields on real media rows ----
+    let uri = format!("/api/v1/messages?talker={first_talker}&limit=50&media=1&access_token={token}");
+    let (s, v) = client_get(app.clone(), &uri, &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    let export_path = v["media"]["exportPath"].as_str().unwrap();
+    assert!(!export_path.is_empty(), "media=1 exports into a real directory");
+    let exported = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m.get("mediaFileName").is_some())
+        .count();
+    assert_eq!(
+        v["media"]["count"].as_u64().unwrap() as usize,
+        exported,
+        "count matches exported rows"
+    );
+    for m in v["messages"].as_array().unwrap() {
+        if let Some(name) = m.get("mediaFileName").and_then(|n| n.as_str()) {
+            let url = m["mediaUrl"].as_str().unwrap();
+            assert!(url.starts_with("http://127.0.0.1:5032/api/v1/media/"), "mediaUrl shape");
+            assert!(url.ends_with(&format!("/{name}")), "mediaUrl ends with the file name");
+            assert!(
+                m["mediaLocalPath"].as_str().unwrap().starts_with(export_path),
+                "mediaLocalPath under exportPath"
+            );
+        }
+    }
+    println!("[CLIENT] media=1 export: {exported} media rows exported (count={})", v["media"]["count"]);
 
     // ---- 5. messages: POST body transport + YYYYMMDD bounds + token in body
     let (s, v) = client_post(
@@ -327,7 +365,9 @@ async fn downstream_client_real_db() {
         // remark comes from the uid mapping table — real data, value
         // unknown; only the shape is asserted (was: always empty).
         assert!(c["remark"].is_string(), "remark must be a string");
-        assert_eq!(c["alias"], "", "v1 alias is always empty");
+        // alias carries the QQ number (WeFlow's alias slot, migrated from
+        // the old `qq` field): a string, empty only when no mapping source.
+        assert!(c["alias"].is_string(), "alias must be a string");
         assert_eq!(c["avatarUrl"], "", "v1 avatarUrl is always empty");
         assert_eq!(c["type"], "friend");
     }

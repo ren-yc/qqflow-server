@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-/// Message category recognized by the heuristic parser.
+/// Message category recognized by the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MsgType {
@@ -30,11 +30,96 @@ impl MsgType {
     }
 }
 
+/// Media metadata parsed from a structured message segment (image/voice/
+/// video) — field ids per the upstream 40800 analysis (45424 md5 hex,
+/// 45405 size, 45411/45412 dims, 45503 uuid, 45812 local cache path, CDN
+/// urls 45802/45803/45804). All optional: absent fields stay absent.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaInfo {
+    /// File UUID (45503).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// Image MD5 hex string (45424) — the media store lookup key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    /// File name (45402), often "md5.ext".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// File size in bytes (45405).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    /// Image width (45411).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    /// Image height (45412).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
+    /// Local cache path (45812) — served by /api/v1/media/{id}.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
+    /// CDN URLs (45802 thumb / 45803 preview / 45804 original).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+}
+
+impl MediaInfo {
+    /// Store lookup key: md5 hex (45424, or extracted from the "MD5.ext"
+    /// file-name shape — real QQ images are named after their uppercase
+    /// MD5 while 45424 is often empty), else uuid; None when nothing is
+    /// present.
+    pub fn key(&self) -> Option<String> {
+        self.md5
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| md5_from_file_name(self.file_name.as_deref()))
+            .or_else(|| self.uuid.clone().filter(|s| !s.is_empty()))
+    }
+}
+
+/// QQ names image files "<UPPERCASE_MD5>.ext" — a 32-hex stem is a usable
+/// md5 key when the 45424 field is empty (ground-truth confirmed).
+fn md5_from_file_name(name: Option<&str>) -> Option<String> {
+    let stem = name?.rsplit_once('.')?.0.trim();
+    if stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(stem.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+impl From<&crate::parser::proto::MediaSegment> for MediaInfo {
+    fn from(seg: &crate::parser::proto::MediaSegment) -> Self {
+        Self {
+            uuid: seg.uuid.clone(),
+            md5: seg.md5_hex.clone(),
+            file_name: seg.file_name.clone(),
+            size: seg.size,
+            width: seg.width,
+            height: seg.height,
+            local_path: seg.local_path.clone(),
+            urls: seg.urls.clone(),
+        }
+    }
+}
+
 /// Result of parsing one message BLOB.
 #[derive(Debug, Clone, Serialize)]
 pub struct ParsedMessage {
     pub msg_type: MsgType,
     pub content: String,
+    /// Structured media metadata (image/voice/video); None for text/system
+    /// messages and for blobs the structured parser could not decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaInfo>,
+}
+
+impl ParsedMessage {
+    /// Build a parse result without structured media metadata (heuristic
+    /// path and constructors in tests).
+    pub fn simple(msg_type: MsgType, content: impl Into<String>) -> Self {
+        Self { msg_type, content: content.into(), media: None }
+    }
 }
 
 /// A single chat record (row from group_msg_table / c2c_msg_table).
@@ -49,8 +134,11 @@ pub struct MessageRecord {
     pub talker: String,
     /// Sender uid ("40020" in group table; c2c peer for c2c table).
     pub from_uid: String,
-    /// Sender nickname ("40093").
+    /// Sender nickname ("40093"; group rows prefer the "40090" group card).
     pub from_nick: String,
+    /// Raw "40013" direction (0 other / 1,2 self / 3 system); None when the
+    /// column is absent in this QQ version (is_send degrades to 0).
+    pub direction: Option<i64>,
     pub parsed: ParsedMessage,
 }
 
@@ -82,4 +170,43 @@ impl ChatType {
 /// value (verified against a real database: seq = (ts << 32) | low32).
 pub fn seq_to_time(seq: i64) -> i64 {
     seq >> 32
+}
+
+/// Map the raw "40013" direction to WeFlow `is_send` (1 = sent by me):
+/// 0 (other) -> 0, 1/2 (self) -> 1, 3 (system) and any unknown bitmask
+/// value -> 0 (never claim a message is self-sent on unverified semantics).
+pub fn direction_to_is_send(d: i64) -> i64 {
+    match d {
+        1 | 2 => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_key_prefers_md5_then_file_name_md5_then_uuid() {
+        let m = MediaInfo {
+            md5: Some("aabbccddeeff00112233445566778899".into()),
+            file_name: Some("OTHER.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(m.key().as_deref(), Some("aabbccddeeff00112233445566778899"));
+        // Empty 45424 + "MD5.ext" name (ground-truth shape) -> derived key.
+        let m = MediaInfo {
+            md5: Some(String::new()),
+            file_name: Some("41675A034F01EEDEAEC4D93CBFBB4A06.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(m.key().as_deref(), Some("41675a034f01eedeaec4d93cbfbb4a06"), "file-name md5 fallback, lowercased");
+        let m = MediaInfo {
+            file_name: Some("not-a-md5.png".into()),
+            uuid: Some("R020".into()),
+            ..Default::default()
+        };
+        assert_eq!(m.key().as_deref(), Some("R020"));
+        assert_eq!(MediaInfo::default().key(), None);
+    }
 }

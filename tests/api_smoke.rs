@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use parking_lot::RwLock;
-use qqflow_server::parser::types::{seq_to_time, ChatType, MessageRecord, MsgType, ParsedMessage};
+use qqflow_server::parser::types::{seq_to_time, ChatType, MediaInfo, MessageRecord, MsgType, ParsedMessage};
 use qqflow_server::sync::Event;
 use qqflow_server::server::{build_router, AccountStatus};
 use qqflow_server::store::{conv_key, AppState, Conversation, Store};
@@ -31,11 +31,18 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
+        export_root: Arc::new(std::env::temp_dir().join("qqflow_smoke_export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
     })
 }
 
 fn test_state() -> Arc<AppState> {
     let mut store = Store::default();
+    // A real temp file backing the image message's localPath, so the media
+    // endpoint test can serve actual bytes.
+    let media_file = std::env::temp_dir().join(format!("qqflow_api_smoke_{}.jpg", std::process::id()));
+    std::fs::write(&media_file, b"\xFF\xD8 fake jpeg bytes \xFF\xD9").unwrap();
+    let media_local = media_file.to_string_lossy().into_owned();
     // group 10001 with two messages
     let conv = Conversation {
         chat_type: ChatType::Group,
@@ -50,7 +57,12 @@ fn test_state() -> Arc<AppState> {
                 talker: "10001".into(),
                 from_uid: "u_a".into(),
                 from_nick: "张三".into(),
-                parsed: ParsedMessage { msg_type: MsgType::Text, content: "你好".into() },
+                direction: Some(1),
+                parsed: ParsedMessage {
+                    msg_type: MsgType::Text,
+                    content: "你好".into(),
+                    media: None,
+                },
             },
             MessageRecord {
                 rowid: 2,
@@ -60,7 +72,21 @@ fn test_state() -> Arc<AppState> {
                 talker: "10001".into(),
                 from_uid: "u_b".into(),
                 from_nick: "李四".into(),
-                parsed: ParsedMessage { msg_type: MsgType::Image, content: "[image]".into() },
+                direction: Some(0),
+                parsed: ParsedMessage {
+                    msg_type: MsgType::Image,
+                    content: "[image]".into(),
+                    media: Some(MediaInfo {
+                        uuid: Some("R020-test".into()),
+                        md5: Some("aabbccddeeff00112233445566778899".into()),
+                        file_name: Some("aabb.png".into()),
+                        size: Some(1234),
+                        width: Some(640),
+                        height: Some(480),
+                        local_path: Some(media_local),
+                        urls: vec![],
+                    }),
+                },
             },
         ],
         dirty: false,
@@ -164,14 +190,83 @@ async fn messages_pagination_and_filter() {
 }
 
 #[tokio::test]
-async fn messages_media_disabled_v1() {
+async fn messages_media_enabled_v1() {
     let (s, v) = get(
         "/api/v1/messages?talker=10001&media=1&access_token=test-token-123456",
         false,
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["media"]["enabled"], false);
+    assert_eq!(v["media"]["enabled"], true);
+    // media=1 triggers the WeFlow-shaped export: exportPath = real root,
+    // count = exported messages, per-message mediaFileName/Url/LocalPath.
+    let export_path = v["media"]["exportPath"].as_str().unwrap();
+    assert!(!export_path.is_empty(), "media=1 exports into a real directory");
+    assert_eq!(v["media"]["count"], 1);
+    let m0 = &v["messages"][0];
+    assert_eq!(m0["mediaFileName"], "aabb.png");
+    assert_eq!(
+        m0["mediaUrl"],
+        "http://127.0.0.1:5032/api/v1/media/10001/images/aabb.png"
+    );
+    assert!(
+        m0["mediaLocalPath"].as_str().unwrap().starts_with(export_path),
+        "mediaLocalPath under exportPath"
+    );
+    // The exported file exists on disk with the exact bytes.
+    let exported = std::fs::read(m0["mediaLocalPath"].as_str().unwrap()).unwrap();
+    assert_eq!(exported, b"\xFF\xD8 fake jpeg bytes \xFF\xD9");
+    // Structured metadata + mediaId direct-serve survive alongside export.
+    assert_eq!(m0["media"]["md5"], "aabbccddeeff00112233445566778899");
+    assert_eq!(m0["media"]["uuid"], "R020-test");
+    assert_eq!(m0["mediaId"], "aabbccddeeff00112233445566778899");
+    let (s, _v) = get(
+        "/api/v1/messages?talker=10001&access_token=test-token-123456",
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(v["messages"][1]["media"].is_null(), "text message has no media");
+    // is_send: self-sent (40013=1) vs other (40013=0).
+    assert_eq!(m0["isSend"], 0, "rowid 2 is others' image");
+    assert_eq!(v["messages"][1]["isSend"], 1, "rowid 1 is self-sent");
+}
+
+#[tokio::test]
+async fn messages_without_media_param_keeps_compat_envelope() {
+    // No media param: capability envelope unchanged (exportPath ""), media
+    // metadata still rides on messages.
+    let (s, v) = get(
+        "/api/v1/messages?talker=10001&access_token=test-token-123456",
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["media"]["enabled"], true);
+    assert_eq!(v["media"]["exportPath"], "");
+    assert_eq!(v["media"]["count"], 1);
+    assert!(v["messages"][0]["mediaFileName"].is_null(), "no export fields without media=1");
+}
+
+#[tokio::test]
+async fn messages_media_alias_and_kind_switches() {
+    // meiti alias triggers the export like media=1.
+    let (s, v) = get(
+        "/api/v1/messages?talker=10001&meiti=1&access_token=test-token-123456",
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["media"]["count"], 1, "meiti alias exports");
+    // tupian=0 disables image export: count 0, no per-message fields.
+    let (s, v) = get(
+        "/api/v1/messages?talker=10001&media=1&tupian=0&access_token=test-token-123456",
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["media"]["count"], 0, "tupian=0 skips image export");
+    assert!(v["messages"][0]["mediaFileName"].is_null());
 }
 
 #[tokio::test]
@@ -293,6 +388,7 @@ fn event_json_shape() {
         Some("张三".into()),
         "你好".into(),
         1782835200,
+        None,
     );
     let v: Value = serde_json::to_value(&ev).unwrap();
     assert_eq!(v["event"], "message.new");
@@ -301,6 +397,35 @@ fn event_json_shape() {
     assert_eq!(v["rawid"], "42");
     assert_eq!(v["groupName"], "项目群");
     assert!(v.get("lastRowidGroup").is_none(), "new events must not carry sync fields");
+    assert!(v.get("media").is_none(), "no media -> key absent");
+}
+
+#[test]
+fn event_json_carries_media() {
+    let ev = Event::message_new(
+        ChatType::Group,
+        "10001".into(),
+        Some("项目群".into()),
+        43,
+        Some("李四".into()),
+        "[image]".into(),
+        1782835200,
+        Some(MediaInfo {
+            uuid: Some("R020-test".into()),
+            md5: Some("aabbccddeeff00112233445566778899".into()),
+            file_name: Some("aabb.png".into()),
+            size: Some(1234),
+            width: Some(640),
+            height: Some(480),
+            local_path: None,
+            urls: vec![],
+        }),
+    );
+    let v: Value = serde_json::to_value(&ev).unwrap();
+    assert_eq!(v["media"]["md5"], "aabbccddeeff00112233445566778899");
+    assert_eq!(v["media"]["uuid"], "R020-test");
+    assert_eq!(v["media"]["width"], 640);
+    assert!(v["media"].get("localPath").is_none(), "absent optional field skipped");
 }
 
 #[test]
@@ -333,7 +458,8 @@ fn ts_boundary_state() -> Arc<AppState> {
         talker: "10001".into(),
         from_uid: "u_a".into(),
         from_nick: "张三".into(),
-        parsed: ParsedMessage { msg_type: MsgType::Text, content: content.into() },
+        direction: Some(0),
+        parsed: ParsedMessage { msg_type: MsgType::Text, content: content.into(), media: None },
     };
     let conv = Conversation {
         chat_type: ChatType::Group,
@@ -419,7 +545,8 @@ async fn all_digit_c2c_talker_resolves_via_fallback() {
             talker: "12345".into(),
             from_uid: "12345".into(),
             from_nick: "数字UID好友".into(),
-            parsed: ParsedMessage { msg_type: MsgType::Text, content: "在吗".into() },
+            direction: Some(0),
+            parsed: ParsedMessage { msg_type: MsgType::Text, content: "在吗".into(), media: None },
         }],
         dirty: false,
     };

@@ -162,6 +162,11 @@ impl AccountSync {
         // advance both watermarks, and build the SSE events.
         let events: Vec<Event> = {
             let mut guard = self.store.write();
+            // Media root may predate the account (sync can run before the
+            // index build in edge paths); resolve it lazily once.
+            if guard.media_root.is_none() {
+                guard.media_root = self.db_dir.parent().map(|p| p.join("nt_data"));
+            }
             index::apply_records(&mut guard, &new_g);
             index::apply_records(&mut guard, &new_c);
             guard.watermark_group = new_wm_g;
@@ -174,6 +179,7 @@ impl AccountSync {
                     // remark (私聊) / group-info name (群聊) wins when known.
                     let group_name = Some(guard.display_name(r.chat_type, &r.talker));
                     let source_name = Some(guard.display_uid(&r.from_uid));
+                    let media = r.parsed.media.clone();
                     if r.parsed.msg_type == MsgType::Recall {
                         Event::message_revoke(
                             r.chat_type,
@@ -183,6 +189,7 @@ impl AccountSync {
                             source_name,
                             r.parsed.content.clone(),
                             r.ts,
+                            media,
                         )
                     } else {
                         Event::message_new(
@@ -193,6 +200,7 @@ impl AccountSync {
                             source_name,
                             r.parsed.content.clone(),
                             r.ts,
+                            media,
                         )
                     }
                 })

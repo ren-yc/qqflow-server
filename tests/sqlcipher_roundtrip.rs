@@ -40,8 +40,8 @@ fn live_read_wal_and_checkpoint() {
     let ts: i64 = 1782864000;
     let insert = |conn: &Connection, rowid: i64, seq: i64, nick: &str, text: &str| {
         conn.execute(
-            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5)",
-            params!["10001", seq, "u_a", nick, text.as_bytes()],
+            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params!["10001", seq, "u_a", nick, text.as_bytes(), 1, ts, ""],
         )
         .unwrap();
         assert_eq!(rowid, conn.last_insert_rowid());

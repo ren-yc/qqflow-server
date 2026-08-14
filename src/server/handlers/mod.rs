@@ -5,10 +5,29 @@ pub mod chatlab_pull;
 pub mod contacts;
 pub mod group_members;
 pub mod health;
+pub mod media;
 pub mod messages;
 pub mod push_events;
 pub mod sessions;
 pub mod sync;
+
+/// Media content type by file extension (served by the media routes;
+/// the map mirrors WeFlow's, plus QQ's amr/silk).
+pub fn media_content_type(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "amr" => "audio/amr",
+        "silk" => "audio/silk",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+}
 
 use axum::http::HeaderMap;
 

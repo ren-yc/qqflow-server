@@ -28,6 +28,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /api/v1/health`（免鉴权）
 - `POST /api/v1/accounts`（注册账号：qq + key + db_path）
 - `GET|POST /api/v1/messages`
+- `GET /api/v1/media/{id}`（媒体文件服务，自本地缓存）
 - `GET|POST /api/v1/sessions`
 - `GET /api/v1/sessions/{id}/messages`（ChatLab Pull，仅 GET）
 - `GET|POST /api/v1/contacts`
@@ -35,7 +36,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /api/v1/push/messages`（SSE）
 - `GET|POST /api/v1/sync`（手动同步）
 
-> v1 未实现：`/api/v1/media/*`（媒体导出）、`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据，媒体存于独立加密缓存。
+> v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体不再"未实现"：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件；WeFlow 的"导出目录"概念（`exportPath`）不适用，保持空串。
 
 ---
 
@@ -199,7 +200,8 @@ GET /api/v1/messages
 | `keyword` | string | 否   | 基于消息显示文本过滤                                  |
 | `chatlab` | string | 否   | `1/true` 时输出 ChatLab 格式                          |
 | `format`  | string | 否   | `json` 或 `chatlab`                                   |
-| `media`   | string | 否   | 兼容占位参数，v1 恒为 `media.enabled=false`           |
+| `media`   | string | 否   | `1/true`（别名 `meiti`）触发该页媒体导出，填充 `mediaFileName`/`mediaUrl`/`mediaLocalPath` 并启用 WeFlow 形状的 `media.exportPath`；不带参数时保持兼容 envelope（`exportPath=""`，媒体元数据仍随消息返回） |
+| `image`（别名 `tupian`）/ `voice`（别名 `vioce`）/ `video` / `emoji` | string | 否   | 媒体导出子开关，默认开启，`0`/`false` 关闭 |
 
 ### 示例
 
@@ -222,11 +224,14 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | `localId` | 本地 rowid（消息唯一标识，数字） |
 | `serverId` | 消息 seq（字符串） |
 | `localType` | 消息类型码（见下表） |
-| `createTime` | 秒级 Unix 时间戳 |
-| `isSend` | v1 恒为 `0`（方向无法可靠推导） |
+| `createTime` | 秒级 Unix 时间戳（优先 `40050` 列，缺列时回退 seq 高位） |
+| `isSend` | 方向：`1`=本人发送，`0`=他人/系统（来自 `40013` 列；QQ 版本缺列或值非 1/2 时恒 `0`） |
 | `senderUsername` | 发送者 UID |
 | `content` / `rawContent` / `parsedContent` | v1 三者相同，为解析后文本 |
 | `mediaType` | 仅图片/语音/视频消息：`image` / `voice` / `video` |
+| `media` | 仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略） |
+| `mediaId` | 媒体获取键（md5 hex 或 uuid），用于 `GET /api/v1/media/{id}`；`media` 存在时必有 |
+| `mediaFileName` / `mediaUrl` / `mediaLocalPath` | 仅 `media=1` 导出后出现：导出文件名、可访问 URL、导出目录绝对路径（WeFlow 形状字段） |
 
 消息类型码：
 
@@ -240,7 +245,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | 撤回 | 6 |
 | 系统 | 7 |
 
-> v1 差异：无 `replyToMessageId` / `quote` / `mediaFileName` / `mediaUrl` / `mediaLocalPath` 字段。
+> v1 差异：无 `replyToMessageId` / `quote` 字段；媒体通过 `media` 对象 + `mediaId` 提供，字节经 `GET /api/v1/media/{id}` 获取。
 
 **示例响应**
 
@@ -250,7 +255,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
   "talker": "10001",
   "count": 2,
   "hasMore": true,
-  "media": { "enabled": false, "exportPath": "", "count": 0 },
+  "media": { "enabled": true, "exportPath": "", "count": 1 },
   "messages": [
     {
       "localId": 1234567890123,
@@ -262,7 +267,17 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "content": "[image]",
       "rawContent": "[image]",
       "parsedContent": "[image]",
-      "mediaType": "image"
+      "mediaType": "image",
+      "media": {
+        "uuid": "R020-...",
+        "md5": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+        "fileName": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d.png",
+        "size": 44540,
+        "width": 507,
+        "height": 307,
+        "localPath": "D:\\...\\nt_data\\Pic\\2026-08\\Ori\\9f2a....png"
+      },
+      "mediaId": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"
     },
     {
       "localId": 1234567890199,
@@ -289,6 +304,35 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 - `messages[].sender`、`messages[].accountName`（备注优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
 ---
+
+## 3.1 获取媒体文件（GET|POST /api/v1/media/{id}）
+
+**请求**
+
+```
+GET /api/v1/media/{id}?access_token=YOUR_TOKEN
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `id` | string | 是 | 消息里的 `mediaId`（md5 hex 或 uuid） |
+| `access_token` | string | 是 | 鉴权（或 `Authorization: Bearer` / POST body） |
+
+**响应**：媒体文件字节流，`content-type` 按扩展名（`image/jpeg` / `image/png` / `image/gif` / `image/webp` / `video/mp4` / `audio/wav` / `audio/amr` / `audio/silk` 等），携带 `content-length`。
+
+**说明**：文件自 QQ 本地缓存目录只读读取（消息 `media.localPath`，即 `45812` 字段）。仅注册了本地路径的媒体可获取；QQ 清理缓存后文件缺失返回 `404`（`{"success":false,"code":404,"message":"本地缓存已清理，媒体文件不存在"}`）。`id` 未知同样返回 `404`。该端点仅接受索引内已注册的键，客户端无法注入任意文件路径。
+
+## 3.2 媒体导出（WeFlow 形状，`media=1`）
+
+`GET|POST /api/v1/messages?media=1`（别名 `meiti`）把**本页**媒体导出到导出根目录（`--media-export-dir`，默认 `<data-dir>/api-media`），布局 `<exportPath>/<talker>/<images|voices|videos>/<file>`，并：
+
+- 每条媒体消息填充 `mediaFileName` / `mediaUrl`（=`{base}/api/v1/media/{talker}/{type}/{file}`）/ `mediaLocalPath`（绝对路径）
+- envelope 变为 `"media": {"enabled": true, "exportPath": "<导出根>", "count": <本次导出条数>}`
+- 子开关 `image`（别名 `tupian`）、`voice`（别名 `vioce`）、`video`、`emoji` 默认开启，`0`/`false` 关闭对应类型导出
+
+**获取导出文件**：`GET|POST /api/v1/media/{talker}/{mediaType}/{file}?access_token=YOUR_TOKEN`（`mediaType` ∈ `images|voices|videos|emojis`；遍历防护：路径段拒绝 `..`/分隔符 + canonicalize 前缀校验；文件缺失或类型未知 → 404）。注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
+
+**与 WeFlow 的已知差异**（不可避免，文档化）：① `emoji` 开关接受但不产生导出（QQ 表情仅有显示文本，无文件；gif 图片走 `images/`）；② 语音导出**原始** `.silk`/`.amr` 文件（未转码为 wav）；③ `mediaUrl` 使用本服务自身 `{host}:{port}`（默认 127.0.0.1:5032，WeFlow 为 5031）；④ 导出根默认 `<data-dir>/api-media`（可 `--media-export-dir` 覆盖）；⑤ 文件名保留 QQ 原始 `fileName`（如 `MD5.png`）而非 WeFlow 式重命名；⑥ 404 错误体为统一 envelope 而非 WeFlow 的 `{"error":"Media not found"}`。`mediaId` 直服（§3.1）与 `media` 元数据对象为 qqflow 扩展，导出后仍可用。
 
 ## 4. 获取会话列表
 
@@ -437,8 +481,8 @@ GET /api/v1/contacts
 - `contacts[].displayName`（备注 > 档案昵称 > 消息昵称 > UID）
 - `contacts[].nickname`（档案昵称 > 消息昵称；均无时为空串）
 - `contacts[].remark`（当前 QQ 版本的可读表无备注列，v1 恒为空串；有备注列的版本自动启用）
-- `contacts[].alias` / `contacts[].avatarUrl`（v1 恒为空串）
-- `contacts[].qq`（可选；映射表提供 uid→QQ 号时返回，否则字段省略）
+- `contacts[].alias`（WeFlow 的微信号槽位；QQ 场景存放该联系人 **QQ 号**——uid 映射表/profile 可读时返回，无数据源为空串；原 `qq` 字段已迁移至此）
+- `contacts[].avatarUrl`（v1 恒为空串）
 - `contacts[].type`（v1 恒为 `"friend"`）
 
 ---
@@ -591,6 +635,7 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
 2. `start` / `end` 支持 `YYYYMMDD` 与秒级时间戳；纯 `YYYYMMDD` 的 `end` 会扩展到当天 `23:59:59`。
 3. 账号注册后全量构建索引（消息 → 内存），就绪前业务接口返回 `503`（SSE 接口与 `/api/v1/accounts` 除外）；构建耗时取决于库大小（真实库 2.8 万条约 2~5 秒）。注册后由文件系统事件驱动增量同步（防抖 `--watch-debounce-ms`，兜底 `--watch-fallback-ms`），也可用 `POST /api/v1/sync` 手动触发。
 4. 会话 ID 判定：全数字 → 群聊；`u_` 前缀或含非数字字符 → 私聊。查询时若按此判定未命中会话，会再尝试另一种类型（支持全数字 UID 的私聊）。
-5. 消息内容为启发式解析结果（QQ 消息体为无固定 schema 的 protobuf 形态），QQ 升级可能导致解析退化；媒体消息输出 `[image]` / `[voice]` / `[video]` 占位。
+5. 消息内容优先按 40800 结构化 wire 解码（文本取 `45101`、媒体取精确元数据），非结构化 blob 回退到启发式文本提取（QQ 消息体 schema 无稳定文档，QQ 升级可能导致解析退化）；媒体消息输出 `[image]` / `[voice]` / `[video]` 占位文本 + `media` 元数据对象。
 6. 撤回消息 `localType=6`，content 保留原文（含"你猜猜撤回了什么"提示行）。
-7. v1 未实现：媒体导出、朋友圈（SNS）、消息方向（`isSend`）、未读数（`unreadCount`）。
+7. 媒体交付双通道：`/api/v1/media/{id}` 直服本地缓存（常开）；`media=1` 按需导出（§3.2，WeFlow 形状）。v1 未实现：朋友圈（SNS）、未读数（`unreadCount`）。
+8. 端口：默认 `127.0.0.1:5032`（WeFlow 为 5031；`--port` 可改）——与 WeFlow 的差异为既定决策。

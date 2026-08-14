@@ -29,6 +29,20 @@ pub struct MessageOut {
     pub parsed_content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
+    /// Structured media metadata (image/voice/video); absent for text etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<crate::parser::types::MediaInfo>,
+    /// Media store key (md5 hex or uuid) — fetch bytes via /api/v1/media/{id}.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
+    /// WeFlow media-export fields — filled by the messages handler when
+    /// `media=1` exports this page's media (absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_local_path: Option<String>,
 }
 
 impl MessageOut {
@@ -38,7 +52,9 @@ impl MessageOut {
             server_id: r.seq.to_string(),
             local_type: r.parsed.msg_type.code(),
             create_time: r.ts,
-            is_send: 0, // v1 limitation: sender direction is not reliably derivable
+            // Direction from the "40013" column when present; degrades to 0
+            // when the QQ version lacks it.
+            is_send: r.direction.map(crate::parser::types::direction_to_is_send).unwrap_or(0),
             sender_username: r.from_uid.clone(),
             content: r.parsed.content.clone(),
             raw_content: r.parsed.content.clone(),
@@ -49,6 +65,11 @@ impl MessageOut {
                 crate::parser::types::MsgType::Video => Some("video".into()),
                 _ => None,
             },
+            media: r.parsed.media.clone(),
+            media_id: r.parsed.media.as_ref().and_then(|m| m.key()),
+            media_file_name: None,
+            media_url: None,
+            media_local_path: None,
         }
     }
 }
@@ -143,8 +164,8 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
 
 /// Contacts: every UID known to chat or to the name maps (a profile-only
 /// uid with no chat history appears too — that is the point of the
-/// mapping), with nickname (profile > message-derived), remark and
-/// optional QQ number.
+/// mapping), with nickname (profile > message-derived), remark, and the
+/// QQ number exposed in the WeFlow `alias` slot.
 pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<crate::server::handlers::contacts::ContactOut> {
     let kw = keyword.map(|k| k.to_lowercase());
     let mut uid_set: std::collections::BTreeSet<&String> = store.uid_names.keys().collect();
@@ -165,9 +186,11 @@ pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset
                 display_name: store.display_uid(uid),
                 nickname: nick,
                 remark: store.names.uid_remark.get(uid).cloned().unwrap_or_default(),
-                alias: String::new(),
+                // WeFlow's alias slot carries the QQ number here (migrated
+                // from the old `qq` field; empty when the version lacks a
+                // uid->QQ mapping source).
+                alias: store.names.uid_qq.get(uid).cloned().unwrap_or_default(),
                 avatar_url: String::new(),
-                qq: store.names.uid_qq.get(uid).cloned(),
                 r#type: "friend".into(),
             }
         })
@@ -217,7 +240,8 @@ mod tests {
             talker: "10001".into(),
             from_uid: "u_a".into(),
             from_nick: "张三".into(),
-            parsed: ParsedMessage { msg_type: MsgType::Text, content: "x".into() },
+            direction: Some(0),
+            parsed: ParsedMessage { msg_type: MsgType::Text, content: "x".into(), media: None },
         }
     }
 

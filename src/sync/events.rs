@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-use crate::parser::types::ChatType;
+use crate::parser::types::{ChatType, MediaInfo};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +23,9 @@ pub struct Event {
     pub source_name: Option<String>,
     pub content: String,
     pub timestamp: i64,
+    /// Structured media metadata for image/voice/video messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rowid_group: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,6 +33,7 @@ pub struct Event {
 }
 
 impl Event {
+    #[allow(clippy::too_many_arguments)] // one constructor per event kind
     pub fn message_new(
         chat_type: ChatType,
         session_id: String,
@@ -38,6 +42,7 @@ impl Event {
         source_name: Option<String>,
         content: String,
         timestamp: i64,
+        media: Option<MediaInfo>,
     ) -> Self {
         Self {
             event: "message.new".into(),
@@ -49,11 +54,13 @@ impl Event {
             source_name,
             content,
             timestamp,
+            media,
             last_rowid_group: None,
             last_rowid_c2c: None,
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one constructor per event kind
     pub fn message_revoke(
         chat_type: ChatType,
         session_id: String,
@@ -62,6 +69,7 @@ impl Event {
         source_name: Option<String>,
         content: String,
         timestamp: i64,
+        media: Option<MediaInfo>,
     ) -> Self {
         Self {
             event: "message.revoke".into(),
@@ -73,6 +81,7 @@ impl Event {
             source_name,
             content,
             timestamp,
+            media,
             last_rowid_group: None,
             last_rowid_c2c: None,
         }
@@ -90,6 +99,7 @@ impl Event {
             source_name: None,
             content: String::new(),
             timestamp: ts,
+            media: None,
             last_rowid_group: Some(watermark_group),
             last_rowid_c2c: Some(watermark_c2c),
         }

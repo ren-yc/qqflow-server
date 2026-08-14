@@ -1,9 +1,12 @@
-//! Heuristic message BLOB text extraction.
+//! Message BLOB parsing: structured wire decode first, heuristic fallback.
 //!
 //! QQ NT stores each message as a protobuf-ish BLOB (column "40800").
-//! Rather than decoding protobuf schemas (which change with QQ versions),
-//! this parser extracts readable text heuristically — a deliberate trade-off
-//! inherited from the behavior of QQFlow's message parser:
+//! `extract_message` tries the spec-confirmed wire layout first
+//! (`proto::parse_msg_body` — text from 45101, exact media metadata for
+//! image/voice/video), and only falls back to the heuristic parser
+//! (`extract_text`) when the blob is not a recognizable structured message.
+//! The heuristic path extracts readable text without a schema — a
+//! deliberate trade-off inherited from the behavior of QQFlow's parser:
 //!   * protobuf varint length prefixes often decode to CJK extension-block
 //!     codepoints, so only common Han characters (U+4E00..U+9FA5) count
 //!   * a candidate must be >= 2 chars with > 60% common characters
@@ -12,6 +15,7 @@
 //!   * recall/system messages are recognized by characteristic phrases
 //!   * an iteration budget (n*50) bounds worst-case cost
 
+pub mod proto;
 pub mod types;
 
 use types::{MsgType, ParsedMessage};
@@ -232,29 +236,89 @@ fn scan_ascii(blob: &[u8], budget: &mut usize) -> Option<String> {
     if best.is_empty() { None } else { Some(best) }
 }
 
-/// Extract readable text from a message BLOB.
+/// Parse one message BLOB: structured wire decode first, heuristic
+/// fallback. The structured pass only wins for exact matches (a real
+/// top-level 40800 field with known content types) — every other blob
+/// lands in the unchanged heuristic parser.
+pub fn extract_message(blob: &[u8]) -> ParsedMessage {
+    extract_structured(blob).unwrap_or_else(|| extract_text(blob))
+}
+
+/// Structured 40800 decode. Returns Some only when the blob carries a real
+/// top-level 40800 field and at least one known content type: 1/6 text
+/// (45101 / 47602 emoji display text), 2 image / 4 voice / 5 video (exact
+/// media metadata; first media segment wins — v1 multi-image limitation).
+fn extract_structured(blob: &[u8]) -> Option<ParsedMessage> {
+    use types::MediaInfo;
+    let segments = proto::parse_msg_body(blob);
+    let mut text = String::new();
+    let mut media: Option<MediaInfo> = None;
+    let mut media_type: Option<MsgType> = None;
+    let mut saw_known = false;
+    for seg in &segments {
+        match seg.content_type {
+            Some(1) | Some(6) => {
+                saw_known = true;
+                if let Some(t) = seg.text.as_deref().filter(|t| !t.is_empty()) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+            Some(2) | Some(4) | Some(5) => {
+                saw_known = true;
+                if let Some(m) = seg.media.as_ref()
+                    && media.is_none()
+                {
+                    media = Some(MediaInfo::from(m));
+                    media_type = match seg.content_type {
+                        Some(2) => Some(MsgType::Image),
+                        Some(4) => Some(MsgType::Voice),
+                        _ => Some(MsgType::Video),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    if !saw_known {
+        return None; // not a structured message body — heuristic fallback
+    }
+    let msg_type = media_type.unwrap_or(MsgType::Text);
+    let content = if !text.is_empty() {
+        text
+    } else if media.is_some() {
+        format!("[{msg_type:?}]").to_lowercase()
+    } else {
+        return None; // known segment but nothing extractable
+    };
+    Some(ParsedMessage { msg_type, content, media })
+}
+
+/// Extract readable text from a message BLOB (heuristic — unchanged).
 pub fn extract_text(blob: &[u8]) -> ParsedMessage {
     if blob.is_empty() {
-        return ParsedMessage { msg_type: MsgType::Text, content: "[空]".into() };
+        return ParsedMessage::simple(MsgType::Text, "[空]");
     }
 
     // Large blobs are media payloads.
     if blob.len() > MAX_TEXT_BLOB {
         if let Some(m) = media_type_from_bytes(blob) {
-            return ParsedMessage { msg_type: m, content: format!("[{m:?}]").to_lowercase() };
+            return ParsedMessage::simple(m, format!("[{m:?}]").to_lowercase());
         }
-        return ParsedMessage { msg_type: MsgType::Other, content: "[未知大消息]".into() };
+        return ParsedMessage::simple(MsgType::Other, "[未知大消息]");
     }
 
     // Media signatures can appear in smaller structured blobs too.
     if let Some(m) = media_type_from_bytes(blob) {
-        return ParsedMessage { msg_type: m, content: format!("[{m:?}]").to_lowercase() };
+        return ParsedMessage::simple(m, format!("[{m:?}]").to_lowercase());
     }
 
     // Recall / system detection on raw bytes (UTF-8 substrings).
     if let Ok(s) = std::str::from_utf8(blob) {
         if s.contains("你猜猜撤回了什么") {
-            return ParsedMessage { msg_type: MsgType::Recall, content: s.into() };
+            return ParsedMessage::simple(MsgType::Recall, s);
         }
         // "已将群名修改为/修改群名为" are the actual rename-message shapes
         // ("修改群名" alone never appears in real rename messages).
@@ -264,30 +328,184 @@ pub fn extract_text(blob: &[u8]) -> ParsedMessage {
             || s.contains("已将群名修改为")
             || s.contains("修改群名为")
         {
-            return ParsedMessage { msg_type: MsgType::System, content: s.into() };
+            return ParsedMessage::simple(MsgType::System, s);
         }
         // Structured JSON payloads (mini-program / share / card): extract
         // prompt/desc/title/nick instead of dumping raw JSON.
         if let Some(extracted) = extract_json_blob(s.trim()) {
-            return ParsedMessage { msg_type: MsgType::Other, content: extracted };
+            return ParsedMessage::simple(MsgType::Other, extracted);
         }
     }
 
     // Heuristic run scan with an operation budget: Han-first, then ASCII.
     let budget = &mut (blob.len() * 50);
     if let Some((text, _)) = scan_from(blob, budget) {
-        return ParsedMessage { msg_type: MsgType::Text, content: text };
+        return ParsedMessage::simple(MsgType::Text, text);
     }
     if let Some(text) = scan_ascii(blob, budget) {
-        return ParsedMessage { msg_type: MsgType::Text, content: text };
+        return ParsedMessage::simple(MsgType::Text, text);
     }
 
-    ParsedMessage { msg_type: MsgType::Other, content: "[无法解析]".into() }
+    ParsedMessage::simple(MsgType::Other, "[无法解析]")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::{direction_to_is_send, MediaInfo};
+
+    // ---- structured-blob encoder (test-side protobuf writer) ---------------
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+    fn bytes_field(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+        varint(field << 3 | 2, out);
+        varint(bytes.len() as u64, out);
+        out.extend_from_slice(bytes);
+    }
+    fn varint_field(field: u64, v: u64, out: &mut Vec<u8>) {
+        varint(field << 3, out);
+        varint(v, out);
+    }
+    fn body_of(seg: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        bytes_field(40800, seg, &mut body);
+        body
+    }
+    fn text_segment(text: &str) -> Vec<u8> {
+        let mut seg = Vec::new();
+        varint_field(45002, 1, &mut seg);
+        bytes_field(45101, text.as_bytes(), &mut seg);
+        body_of(&seg)
+    }
+    fn image_segment() -> Vec<u8> {
+        let mut seg = Vec::new();
+        varint_field(45002, 2, &mut seg);
+        varint_field(45003, 1, &mut seg);
+        bytes_field(45503, b"R020-uuid", &mut seg);
+        bytes_field(45402, b"9f2a.png", &mut seg);
+        bytes_field(45424, b"9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d", &mut seg);
+        varint_field(45405, 152340, &mut seg);
+        varint_field(45411, 1080, &mut seg);
+        varint_field(45412, 1920, &mut seg);
+        bytes_field(45812, b"C:\\SomeUser\\nt_data\\Pic\\2026-08\\9f2a.png", &mut seg);
+        body_of(&seg)
+    }
+
+    #[test]
+    fn plain_text_unchanged_by_structured_pass() {
+        // A plain UTF-8 string is not a structured body: the result must be
+        // byte-identical to the heuristic parser (no regression).
+        for blob in [
+            "你好，很高兴认识你".as_bytes().to_vec(),
+            b"hello world 12345".to_vec(),
+            vec![0xE5, 0x8F, 0x91], // partial UTF-8
+            b"".to_vec(),
+        ] {
+            let a = extract_message(&blob);
+            let b = extract_text(&blob);
+            assert_eq!(a.msg_type, b.msg_type, "blob {blob:?}");
+            assert_eq!(a.content, b.content, "blob {blob:?}");
+            assert!(a.media.is_none(), "no structured media on heuristic path");
+        }
+    }
+
+    #[test]
+    fn structured_text_exact() {
+        let p = extract_message(&text_segment("结构化正文，含标点！"));
+        assert_eq!(p.msg_type, MsgType::Text);
+        assert_eq!(p.content, "结构化正文，含标点！");
+        assert!(p.media.is_none());
+    }
+
+    #[test]
+    fn structured_image_exact_metadata() {
+        let p = extract_message(&image_segment());
+        assert_eq!(p.msg_type, MsgType::Image);
+        assert_eq!(p.content, "[image]");
+        let m = p.media.expect("image metadata");
+        assert_eq!(m.key().as_deref(), Some("9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"));
+        assert_eq!(m.md5.as_deref(), Some("9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d"));
+        assert_eq!(m.uuid.as_deref(), Some("R020-uuid"));
+        assert_eq!(m.file_name.as_deref(), Some("9f2a.png"));
+        assert_eq!(m.size, Some(152340));
+        assert_eq!((m.width, m.height), (Some(1080), Some(1920)));
+        assert_eq!(m.local_path.as_deref(), Some("C:\\SomeUser\\nt_data\\Pic\\2026-08\\9f2a.png"));
+        assert!(m.urls.is_empty());
+    }
+
+    #[test]
+    fn mixed_text_and_image_keeps_both() {
+        let mut seg1 = Vec::new();
+        varint_field(45002, 1, &mut seg1);
+        bytes_field(45101, "看这个".as_bytes(), &mut seg1);
+        let mut seg2 = Vec::new();
+        varint_field(45002, 2, &mut seg2);
+        varint_field(45003, 1, &mut seg2);
+        bytes_field(45424, b"aabbccddeeff00112233445566778899", &mut seg2);
+        let mut body = Vec::new();
+        bytes_field(40800, &seg1, &mut body);
+        bytes_field(40800, &seg2, &mut body);
+        let p = extract_message(&body);
+        assert_eq!(p.msg_type, MsgType::Image, "media type wins");
+        assert_eq!(p.content, "看这个", "caption kept as content");
+        assert_eq!(p.media.as_ref().and_then(MediaInfo::key).as_deref(), Some("aabbccddeeff00112233445566778899"));
+    }
+
+    #[test]
+    fn unknown_content_type_falls_back_to_heuristic() {
+        // Content type 3 (file) / 9 (redbag) / 99 (unknown) are not
+        // structured evidence — the heuristic decides.
+        for ct in [3u64, 9, 99] {
+            let mut seg = Vec::new();
+            varint_field(45002, ct, &mut seg);
+            bytes_field(45101, "正文".as_bytes(), &mut seg);
+            let p = extract_message(&body_of(&seg));
+            assert!(p.media.is_none(), "ct={ct}");
+            // Heuristic sees raw bytes; must not panic and stays text-ish.
+            assert!(matches!(p.msg_type, MsgType::Text | MsgType::Other));
+        }
+    }
+
+    #[test]
+    fn malformed_structured_blob_falls_back() {
+        // Truncated varint / group wire types / garbage must never panic.
+        for blob in [vec![0xFF, 0xFF, 0xFF], vec![0x80, 0x80], b"not protobuf".to_vec()] {
+            let p = extract_message(&blob);
+            let h = extract_text(&blob);
+            assert_eq!(p.msg_type, h.msg_type, "fallback equals heuristic for {blob:?}");
+        }
+    }
+
+    #[test]
+    fn text_mentioning_image_signature_stays_text() {
+        // Regression guard for the heuristic false positive: a structured
+        // TEXT message mentioning ".jpg" must stay text — the old
+        // ASCII-signature heuristic would classify it as an image.
+        let mut seg = Vec::new();
+        varint_field(45002, 1, &mut seg);
+        bytes_field(45101, "请查收 file.jpg 的修改意见".as_bytes(), &mut seg);
+        let p = extract_message(&body_of(&seg));
+        assert_eq!(p.msg_type, MsgType::Text);
+        assert!(p.content.contains("file.jpg"));
+    }
+
+    #[test]
+    fn direction_mapping() {
+        assert_eq!(direction_to_is_send(0), 0, "other");
+        assert_eq!(direction_to_is_send(1), 1, "self");
+        assert_eq!(direction_to_is_send(2), 1, "self (variant)");
+        assert_eq!(direction_to_is_send(3), 0, "system");
+    }
+
 
     #[test]
     fn empty_blob() {

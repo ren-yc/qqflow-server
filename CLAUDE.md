@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Headless HTTP API + SSE service that reads **local QQ NT chat records** (`nt_msg.db`, SQLCipher-encrypted, 1024-byte custom header, WAL mode). This is an **independent project**; other projects (WeFlow HTTP API, QQBackup tools, etc.) are used only as functional references — e.g. the HTTP interface follows the WeFlow HTTP API contract (paths, params, response envelopes, SSE field names). Docs and 调研 notes are in Chinese; code comments are bilingual.
 
-**Deliberately out of scope:** key extraction (keys come from external tools like `QQBackup/qq-win-db-key` and are supplied at runtime by clients via `POST /api/v1/accounts`), media export, SNS endpoints.
+**Deliberately out of scope:** key extraction (keys come from external tools like `QQBackup/qq-win-db-key` and are supplied at runtime by clients via `POST /api/v1/accounts`), SNS endpoints (QQ NT has no moments data). Media: the server serves bytes read-only from QQ's own local cache (`GET /api/v1/media/{id}`) AND supports the WeFlow-shaped on-demand export (`media=1` on `/api/v1/messages` copies the page's media into `--media-export-dir`, default `<data-dir>/api-media`, served via `/api/v1/media/{talker}/{mediaType}/{file}`).
 
 ## Privacy (隐私检查)
 
@@ -44,7 +44,7 @@ Run against real data — **no config file**; run parameters come from CLI flags
 .\qqflow-server.exe --help
 ```
 
-CLI flags: `--port` (5032) / `--host` (127.0.0.1) / `--log` (error|warn|info|debug, default info) / `--watch-debounce-ms` (350) / `--watch-fallback-ms` (30000, 0 disables the slow fallback poll; the 10 s watcher re-attach is independent). Unknown flags are fatal.
+CLI flags: `--port` (5032) / `--host` (127.0.0.1) / `--log` (error|warn|info|debug, default info) / `--watch-debounce-ms` (350) / `--watch-fallback-ms` (30000, 0 disables the slow fallback poll; the 10 s watcher re-attach is independent) / `--media-export-dir` (media export root for `media=1`, default `<data-dir>/api-media`). Unknown flags are fatal. Note: WeFlow's default port is 5031; qqflow-server deliberately keeps 5032 (CLI-overridable).
 
 Accounts are **client-driven**: startup only scans platform paths for discovery and lists the accounts as `awaiting_key` in `/health` (zero-account startup is valid). A downstream client registers an account via `POST /api/v1/accounts` with `{qq, key, db_path}`:
 
@@ -67,6 +67,9 @@ nt_msg.db (QQ, SQLCipher + 1024B plaintext custom header + WAL)
                          SQLCipher PRAGMA suite (page_size=4096, kdf_iter=4000,
                          HMAC-SHA1, PBKDF2-SHA512, aes-256-cbc); retries with
                          HMAC-SHA512; verifies via sqlite_master
+  → parser::extract_message (structured 40800 wire decode first —
+                         spec-confirmed MsgBody layout per QQDecrypt/
+                         nt_msg_db_util db_docs; heuristic fallback)
   → store::index::build_index / read_new + apply_records
                          full-table scan → in-memory Store; incremental rowid
                          reads + apply afterwards (two-phase, see below)
@@ -87,9 +90,12 @@ VFS.
 - Table shapes (numeric column names are QQ-version-dependent, treat as fragile):
   - `group_msg_table`: `"40021"` group id, `"40001"` seq, `"40020"` sender uid, `"40093"` nickname, `"40800"` message blob
   - `c2c_msg_table`: `"40020"` peer uid, `"40001"` seq, `"40093"` nickname, `"40800"` blob
-- Message timestamp is packed in the high 32 bits of seq: `seq_to_time(seq) = seq >> 32` (`parser::types`).
+- Spec-derived optional columns (QQDecrypt/nt_msg_db_util analysis, ground-truth probed per table by `store::index::probe_cols` — absent columns degrade): `"40013"` message direction (0 other / 1,2 self / 3 system / unknown bitmasks observed → `direction_to_is_send`: 1|2→1 else 0), `"40050"` unix send time (preferred over `seq >> 32` per-row when non-zero — probe found ~29% of rows disagree by >2 s), `"40090"` sender group card (ground-truth confirmed per-sender card, wins over `"40093"` when non-empty; 40093 is often empty on card rows).
+- Message timestamp: `"40050"` when present/non-zero, else packed high 32 bits of seq: `seq_to_time(seq) = seq >> 32` (`parser::types`).
 - Conversation map key: `g:<groupId>` / `c:<peerUid>` (`store::conv_key`). `classify_talker` disambiguates: all-digit → group, `u_`-prefixed → c2c.
 - Conversations carry a `dirty` flag set by appends; `build_index` sorts each conversation once via `Conversation::ensure_sorted`, while query paths (`query_messages`, chatlab pull) sort their own index snapshots by `(ts, rowid)` per query.
+- `Store.media: HashMap<md5-or-uuid, MediaEntry{local_path, file_name}>` maps structured media metadata to fetchable local cache files (first-wins, only entries with a local path; built at index time from `parsed.media`, keyed by `MediaInfo::key()` — 45424 md5 hex, else the "MD5.ext" file-name stem, else 45503 uuid). `Store.media_root` (`nt_qq/nt_data`) resolves relative `45812` paths. Served by `GET|POST /api/v1/media/{id}` (auth + ready gates; streamed read-only; 404 when QQ cleared the cache).
+- **WeFlow media export** (`store::media_export`, WeFlow exportPath semantics): `media=1` (alias `meiti`, per-kind switches `image/tupian`, `voice/vioce`, `video`, `emoji`) on `/api/v1/messages` copies the page's media into `<exportRoot>/<talker>/<images|voices|videos>/<file>` (copy not hardlink — QQ clears its cache; idempotent same-size skip) and fills `mediaFileName`/`mediaUrl`/`mediaLocalPath`; envelope `media: {enabled, exportPath=<root>, count=<exported>}`. Without the param the capability envelope (`exportPath=""`) is kept for compat. `GET|POST /api/v1/media/{talker}/{mediaType}/{file}` serves exported files (mediaType whitelist + segment checks + canonicalize prefix check). `exportRoot`/`baseUrl` live on `AppState` (`--media-export-dir`, default `<data-dir>/api-media`). Known deviations from WeFlow (documented): emoji switch is inert (QQ emoji carry display text, no files); voice exports raw `.silk`/`.amr` (no transcoding to wav); URLs use our own host:port (5032); file names keep QQ's originals.
 
 ### Name maps (`store::names`)
 
@@ -106,15 +112,15 @@ Idle periods cost nothing; a failed sync sets a retry flag so the next tick retr
 
 **Manual sync**: the same per-account `AccountSync` (live reader behind `Arc<Mutex>`) is shared with `GET|POST /api/v1/sync`, which runs `SyncEngine::sync_all()` on demand and returns the newly appended records (newest first) — for client init / manual refresh. `sync_all` 顺带刷新 name maps（`refresh_names`）——这是除重新注册外名称映射唯一的刷新点。Concurrent poll/sync passes serialize on the reader mutex and the store write lock.
 
-SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events; a fresh `sync` is also broadcast when an account's index build completes (clients connected during indexing start with a `(0,0)` baseline and are re-baselined by it), and broadcast lag re-syncs the client the same way. KeepAlive ping every 15 s. SSE has no ready gate — it serves 200 even while indexing.
+SSE clients (`GET/POST /api/v1/push/messages`) get a `sync` event on connect carrying current rowid watermarks (a qqflow-server extension), then live events (`message.new` events carry an optional `media` object for image/voice/video messages); a fresh `sync` is also broadcast when an account's index build completes (clients connected during indexing start with a `(0,0)` baseline and are re-baselined by it), and broadcast lag re-syncs the client the same way. KeepAlive ping every 15 s. SSE has no ready gate — it serves 200 even while indexing.
 
 ### Startup sequence (`server::run_with`)
 
 Parse CLI args → resolve data dir + token → `db::scan::scan_accounts` (platform-gated path discovery) → bind listener **early** so `/health` reports "starting" → list scanned accounts as `awaiting_key` (no build at startup) → wait for client registrations (`POST /api/v1/accounts`) → per account `server::init_account` (`spawn_blocking` live open + key verify + index; `install_index` broadcasts the SSE baseline; `AccountSync` registration + watch task) → recompute the global ready flag → wait for Ctrl-C → signal shutdown watch.
 
-### Heuristic message parser (`parser`)
+### Message parser (`parser`)
 
-Message BLOBs are protobuf-ish with no stable schema, so text extraction is heuristic by design (inherited from QQFlow behavior): scan for runs of common Han characters (U+4E00–U+9FA5, which avoids protobuf varint codepoint garbage), ≥ 2 chars with > 60% common ratio, plus an ASCII fallback; media recognized by byte signatures (`.jpg/.png/.gif/gchatpic`, `.amr/.silk/.ptt`, `shortvideo/.mp4`); recall/system by characteristic phrases ("你猜猜撤回了什么", "拍了拍", "撤回了一条", "修改群名"). An iteration budget (`n*50`) bounds worst-case cost. This is intentionally tolerant of QQ version churn — expect degraded output, not crashes.
+Structured-first hybrid. `parser::proto` is a hand-rolled two-level protobuf wire reader (no prost dependency) for the spec-confirmed `MsgBody{repeated MsgContent content=40800}` layout (45002 content types: 1 text/2 image/4 voice/5 video/6 qqface; text body `45101`, emoji text `47602`; media fields `45503` uuid, `45402` name, `45406` raw md5, `45424` md5 hex, `45405` size, `45411/45412` dims, `45802-45804` CDN urls, `45812` local cache path). `extract_message` = `extract_structured` (wins only on a real 40800 field + known content types: text from 45101, exact media metadata for image/voice/video; first media segment wins — v1 multi-image limitation) else the unchanged heuristic `extract_text` (inherited from QQFlow): runs of common Han characters (U+4E00–U+9FA5), ≥ 2 chars with > 60% common ratio, ASCII fallback; media by byte signatures (`.jpg/.png/.gif/gchatpic`, `.amr/.silk/.ptt`, `shortvideo/.mp4`); recall/system by characteristic phrases. An iteration budget (`n*50`) bounds worst-case cost. Tolerant of QQ version churn — expect degraded output, not crashes. Note: heuristic media signatures can false-positive on plain text mentioning ".jpg" — the structured pass fixes that only for real structured blobs.
 
 ### Concurrency
 
@@ -133,15 +139,15 @@ Message BLOBs are protobuf-ish with no stable schema, so text extraction is heur
 
 - Numeric column names (`"40021"`, `"40800"`, …), table layouts, and the uid→QQ mapping table all vary with QQ versions; code degrades gracefully (best-effort queries, heuristic parsing).
 - uid→昵称/备注/QQ、群号→群名的映射表列结构无稳定文档：`nt_uid_mapping_table`/`profile_info.db` 的列与 `group_info.db` 的存在性/布局/是否带头均由 `store::names` 在加载时值驱动探测（缺表缺列 → 空映射，显示回落消息昵称/群号）；ground-truth 探针（`tests/real_db_groundtruth.rs` 的 `probe_columns` + 兄弟文件探测 + `load_names` 端到端验证）输出真实布局用于仲裁。
-- `MessageOut::is_send` is hardcoded `0` — v1 limitation: message direction is not reliably derivable from the available columns.
+- `MessageOut::is_send` derives from the `"40013"` direction column (`direction_to_is_send`: 0/3/unknown → 0, 1/2 → 1); degrades to 0 when the QQ version lacks the column.
 
 ## Tests
 
 - `tests/sqlcipher_roundtrip.rs` — self-built SQLCipher test database with QQ's exact PRAGMA parameters + fake 1024-byte header + WAL. Proves: **direct live read of the header-prefixed file through the offset VFS** (the arbitration test), WAL-only writes visible to the still-open reader, checkpoint survived by the same reader without reopening, cold reopen, wrong-key failure. **Never touches real QQ data.** (The fake writer's WAL and wal-index are hard-linked to the `nt_msg.*` names the reader opens — production shares QQ's live files the same way.)
 - `tests/api_smoke.rs` — HTTP layer contract tests via `tower::ServiceExt::oneshot` (no network, no real DB); builds a fake `AppState` with seeded conversations.
 - `tests/fs_watch_e2e.rs` — file-system event → sync → SSE broadcast e2e (fake DB with a persistent writer).
-- `tests/real_db_groundtruth.rs` — fake-DB regression tests + client-registration e2e (wrong key → `error` → corrected key → `ready`) + `fake_db_names_loaded`（假库 + 带头 `group_info.db` 验证名称映射加载）；the `real_db_groundtruth` probe (`#[ignore]`) runs ground-truth queries against a REAL QQ DB via the live reader (`QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY`) — it arbitrates the offset VFS against the real on-disk layout, and its `probe_columns` + sibling-file sections arbitrate the name-map sources (`nt_uid_mapping_table` 列结构、`group_info.db` 存在性/头布局).
-- `tests/downstream_client.rs` — downstream-client GET/POST simulation against a real QQ DB, including client-driven registration (`#[ignore]`; inputs resolve from the gitignored repo-root `qqflow-server.json` (`qq`/`key`/`db_path`) first, then `QQFLOW_TEST_QQ` / `QQFLOW_TEST_DB_KEY` / `QQFLOW_TEST_DB_ROOT` env vars). contacts `remark` 断言为形状级（真库值未知）.
+- `tests/real_db_groundtruth.rs` — fake-DB regression tests + client-registration e2e (wrong key → `error` → corrected key → `ready`) + `fake_db_names_loaded`（假库 + 带头 `group_info.db` 验证名称映射加载）+ `fake_db_index_media_metadata` / `fake_db_media_endpoint_serves_bytes`（结构化图片行全链路：store.media 注册、is_send/40050/群名片、端点 200/404/401）；the `real_db_groundtruth` probe (`#[ignore]`) runs ground-truth queries against a REAL QQ DB via the live reader (`QQFLOW_TEST_DB_ROOT` / `QQFLOW_TEST_DB_KEY`) — it arbitrates the offset VFS against the real on-disk layout, its `probe_columns` + sibling-file sections arbitrate the name-map sources, and its spec-column sections arbitrate `40013` 分布（实测含位掩码 32761）、`40050` vs `seq>>32`（实测 ~29% 行差 >2s）、`40090`（逐发送者群名片确认）、真实 40800 图片段解码与 `45812` 磁盘存在率.
+- `tests/downstream_client.rs` — downstream-client GET/POST simulation against a real QQ DB, including client-driven registration (`#[ignore]`; inputs resolve from the gitignored repo-root `qqflow-server.json` (`qq`/`key`/`db_path`) first, then `QQFLOW_TEST_QQ` / `QQFLOW_TEST_DB_KEY` / `QQFLOW_TEST_DB_ROOT` env vars). Asserts the real contract: `media.enabled=true`、`isSend ∈ {0,1}`（来自 40013）、`media`/`mediaId` 随图片消息出现. contacts `remark` 断言为形状级（真库值未知）.
 - Unit tests live inline in modules (`parser`, `keystore`, `decrypt`, `vfs`, `live`, `store/names` 探测分类与列漂移退化, `store` 显示优先级).
 
 ## External references

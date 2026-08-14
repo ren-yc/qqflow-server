@@ -29,6 +29,9 @@ pub struct Config {
     /// The watcher re-attach retry (every 10 s) is independent of this
     /// setting.
     pub watch_fallback_ms: u64,
+    /// Media export root for `media=1` (WeFlow exportPath semantics);
+    /// default `<data-dir>/api-media`.
+    pub media_export_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             log: "info".into(),
             watch_debounce_ms: 350,
             watch_fallback_ms: 30_000,
+            media_export_dir: None,
         }
     }
 }
@@ -54,6 +58,7 @@ fn help() -> String {
        --log <level>             日志级别: error|warn|info|debug（默认 info）\n\
        --watch-debounce-ms <ms>  文件事件防抖（默认 350）\n\
        --watch-fallback-ms <ms>  慢速兜底轮询，0 关闭（默认 30000）\n\
+       --media-export-dir <dir>  媒体导出根目录（默认 <data-dir>/api-media）\n\
        -h, --help                显示本帮助\n\
      \n\
      账号与密钥不在命令行提供：启动后由客户端 POST /api/v1/accounts\n\
@@ -106,6 +111,7 @@ pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("--watch-fallback-ms 需为非负整数: {value}"))?
             }
+            "--media-export-dir" => cfg.media_export_dir = Some(PathBuf::from(value)),
             other => bail!("未知参数: {other}\n{}", help()),
         }
         i += 2;

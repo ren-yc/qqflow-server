@@ -23,8 +23,9 @@ use axum::http::{Request, StatusCode};
 use qqflow_server::db::decrypt::open_live_mode;
 use qqflow_server::db::live::LiveReader;
 use qqflow_server::db::scan;
-use qqflow_server::parser::types::{seq_to_time, ChatType};
+use qqflow_server::parser::types::{seq_to_time, ChatType, MsgType};
 use qqflow_server::server::{build_router, AccountRegistry, AccountState, AccountStatus};
+use qqflow_server::store::query::MessageOut;
 use qqflow_server::store::AppState;
 use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
@@ -222,6 +223,237 @@ fn fake_db_names_loaded() {
     assert_eq!(store.display_name(ChatType::C2c, "u_c"), "王五档案", "c2c profile nick wins");
 }
 
+/// Structured image rows flow through the whole pipeline: the spec-shaped
+/// 40800 blob (45002=2 + media fields) is decoded by parser::proto, the
+/// media map registers the md5 key, direction/ts come from 40013/40050,
+/// and MessageOut exposes is_send + media + mediaId.
+#[test]
+fn fake_db_index_media_metadata() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let md5 = common::append_image_row(&writer, 7, &nt_db);
+    common::materialize_source(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    drop(reader);
+
+    // Media map: md5 key -> local cache file.
+    let entry = store.media.get(&md5).expect("media entry registered");
+    assert!(entry.local_path.ends_with("fake_image_01.jpg"));
+    assert_eq!(entry.file_name.as_deref(), Some("fake_image_01.jpg"));
+
+    // The image row carries the full structured metadata.
+    let conv = store.conversation(ChatType::Group, "10001").unwrap();
+    let m = conv.msgs.iter().find(|m| m.rowid == 7).expect("image row indexed");
+    assert_eq!(m.parsed.msg_type, MsgType::Image);
+    assert_eq!(m.parsed.content, "[image]");
+    let media = m.parsed.media.as_ref().expect("structured media");
+    assert_eq!(media.md5.as_deref(), Some(md5.as_str()));
+    assert_eq!(media.uuid.as_deref(), Some("fake-uuid-0001"));
+    assert_eq!(media.file_name.as_deref(), Some("fake_image_01.jpg"));
+    assert_eq!(media.size, Some(12345));
+    assert_eq!((media.width, media.height), (Some(640), Some(480)));
+    assert_eq!(m.ts, 1782864000, "40050 authoritative over seq>>32");
+    assert_eq!(m.direction, Some(0), "image row dir=0");
+
+    // MessageOut: is_send mapping (0 other / 1 self / 3 system), media id.
+    assert_eq!(MessageOut::from_record(m).is_send, 0);
+    assert_eq!(MessageOut::from_record(m).media_id.as_deref(), Some(md5.as_str()));
+    let self_rec = conv.msgs.iter().find(|m| m.rowid == 1).unwrap();
+    assert_eq!(MessageOut::from_record(self_rec).is_send, 1, "40013=1 -> self");
+    let sys_rec = conv.msgs.iter().find(|m| m.rowid == 4).unwrap();
+    assert_eq!(MessageOut::from_record(sys_rec).is_send, 0, "40013=3 system -> 0");
+    // Group card (40090) wins over 40093 for u_a rows.
+    assert_eq!(self_rec.from_nick, "张三群名片");
+
+    drop(writer);
+}
+
+/// The media endpoint serves bytes from the local cache path registered at
+/// index time — 200 with exact content, 404 for unknown ids and for files
+/// QQ cleared from its cache, 401 without a token.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn fake_db_media_endpoint_serves_bytes() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let md5 = common::append_image_row(&writer, 7, &nt_db);
+    common::materialize_source(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    drop(reader);
+    drop(writer);
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        store: Arc::new(parking_lot::RwLock::new(store)),
+        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        token: Arc::new("test-token".into()),
+        sync: Arc::new(SyncEngine::new()),
+        init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
+        export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
+    });
+    let app = build_router(state.clone());
+
+    // 200 + exact file bytes + jpeg content type.
+    let expected = std::fs::read(common::fake_media_path(&nt_db)).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/media/{md5}?access_token=test-token"))
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/jpeg");
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(bytes.to_vec(), expected, "exact file bytes");
+
+    // Unknown id -> 404.
+    let (s, _v) = common::get_json(app.clone(), "/api/v1/media/deadbeef?access_token=test-token", &[]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // No token -> 401.
+    let (s, _v) = common::get_json(app.clone(), &format!("/api/v1/media/{md5}"), &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // File deleted (QQ cleared cache) -> 404 with a clear message.
+    std::fs::remove_file(common::fake_media_path(&nt_db)).unwrap();
+    let (s, v) = common::get_json(app.clone(), &format!("/api/v1/media/{md5}?access_token=test-token"), &[]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(
+        v["message"].as_str().unwrap().contains("缓存"),
+        "cache-cleared message: {v}"
+    );
+}
+
+/// WeFlow-shaped media export end to end: `media=1` on /api/v1/messages
+/// exports the page's image into the export root, the response carries
+/// mediaFileName/mediaUrl/mediaLocalPath, and the three-segment media URL
+/// serves the exact bytes — with traversal attacks rejected.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn fake_db_media_export_serves_exported_bytes() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let md5 = common::append_image_row(&writer, 7, &nt_db);
+    common::materialize_source(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let store = qqflow_server::store::index::build_index(conn).unwrap();
+    drop(reader);
+    drop(writer);
+
+    let export_root = std::env::temp_dir().join("qqflow_fake_export");
+    let _ = std::fs::remove_dir_all(&export_root);
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        store: Arc::new(parking_lot::RwLock::new(store)),
+        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        token: Arc::new("test-token".into()),
+        sync: Arc::new(SyncEngine::new()),
+        init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
+        export_root: Arc::new(export_root.clone()),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
+    });
+    let app = build_router(state.clone());
+
+    // 1) Export via media=1: envelope + per-message export fields.
+    let (s, v) = common::get_json(
+        app.clone(),
+        "/api/v1/messages?talker=10001&media=1&access_token=test-token",
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["media"]["enabled"], true);
+    assert_eq!(v["media"]["exportPath"], export_root.to_string_lossy().as_ref());
+    assert_eq!(v["media"]["count"], 1, "the image row exported");
+    let m = v["messages"].as_array().unwrap().iter().find(|m| m["mediaId"] == md5).expect("image row");
+    assert_eq!(m["mediaFileName"], "fake_image_01.jpg");
+    assert_eq!(
+        m["mediaUrl"],
+        "http://127.0.0.1:5032/api/v1/media/10001/images/fake_image_01.jpg"
+    );
+    let local = m["mediaLocalPath"].as_str().unwrap();
+    assert!(local.starts_with(export_root.to_string_lossy().as_ref()));
+
+    // 2) The exported file exists with the fake JPEG bytes.
+    let expected = std::fs::read(common::fake_media_path(&nt_db)).unwrap();
+    assert_eq!(std::fs::read(local).unwrap(), expected);
+
+    // 3) GET the three-segment URL -> exact bytes + image/jpeg.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/media/10001/images/fake_image_01.jpg?access_token=test-token")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/jpeg");
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(bytes.to_vec(), expected);
+
+    // 4) POST variant works too (WeFlow GET|POST).
+    let (s, _v) = common::post_json(
+        app.clone(),
+        "/api/v1/media/10001/images/fake_image_01.jpg",
+        &[],
+        serde_json::json!({"access_token": "test-token"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // 5) Traversal attacks -> 404, never a file outside the export root.
+    for path in [
+        "/api/v1/media/../token.txt",
+        "/api/v1/media/10001/images/..%2F..%2Fsecret",
+        "/api/v1/media/..%2F..%2F..%2Fqqflow-server.json",
+    ] {
+        let (s, _v) = common::get_json(
+            app.clone(),
+            &format!("{path}?access_token=test-token"),
+            &[],
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "traversal blocked: {path}");
+    }
+
+    // 6) Unknown media_type -> 404.
+    let (s, _v) = common::get_json(
+        app.clone(),
+        "/api/v1/media/10001/other/fake_image_01.jpg?access_token=test-token",
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
 /// Manual-sync path: `AccountSync::poll_once` picks up rows appended to
 /// the database between calls and broadcasts SSE events for them (this is
 /// what `POST /api/v1/sync` drives).
@@ -360,6 +592,8 @@ async fn client_registers_account_with_key_and_db_path() {
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
+        export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
     });
     let app = build_router(state.clone());
 
@@ -548,6 +782,177 @@ fn real_db_groundtruth() {
                     )
                     .unwrap();
                 println!("[GT] {table} {label}Phrases={c}");
+            }
+            // Structured 40800 decode on real blobs (arbitrates
+            // parser::proto): media segments (content type 2/4/5) with
+            // their metadata, and how often the "45812" local path exists
+            // on disk (absolute vs relative tells us the serving strategy).
+            {
+                let mut media_segs = 0i64;
+                let mut with_local = 0i64;
+                let mut local_exists = 0i64;
+                let mut samples = 0usize;
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT \"40800\" FROM {table} WHERE \"40800\" IS NOT NULL ORDER BY rowid DESC LIMIT 500"
+                    ))
+                    .unwrap();
+                let blobs = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
+                for b in blobs.flatten() {
+                    for seg in qqflow_server::parser::proto::parse_msg_body(&b) {
+                        if matches!(seg.content_type, Some(2) | Some(4) | Some(5)) {
+                            if let Some(m) = &seg.media {
+                                media_segs += 1;
+                                if let Some(p) = &m.local_path {
+                                    with_local += 1;
+                                    if std::path::Path::new(p).exists() {
+                                        local_exists += 1;
+                                    }
+                                }
+                                if samples < 5 {
+                                    println!(
+                                        "[GT] {table} media sample: ct={:?} subtype={:?} uuid={:?} md5={:?} name={:?} size={:?} dims=({:?}x{:?}) localPath={:?} urls={:?}",
+                                        seg.content_type, seg.media_subtype, m.uuid, m.md5_hex, m.file_name, m.size, m.width, m.height, m.local_path, m.urls
+                                    );
+                                    samples += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "[GT] {table} 40800 structured: mediaSegments={media_segs} withLocalPath={with_local} localExistsOnDisk={local_exists}"
+                );
+            }
+        }
+
+        // ---- spec-derived columns (arbitrates store::index 40013/40050/40090)
+        // QQDecrypt/nt_msg_db_util field analysis: 40013 = message direction
+        // (0 other / 1,2 self / 3 system), 40050 = unix send time (seconds),
+        // 40090 = sender group card (group table). Each statistic gates the
+        // corresponding column in store::index — absent columns degrade.
+        for (table, is_group) in [("group_msg_table", true), ("c2c_msg_table", false)] {
+            let cols: BTreeSet<String> = conn
+                .prepare(&format!("PRAGMA table_info(\"{table}\")"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .flatten()
+                .collect();
+            for cand in ["40013", "40050", "40090"] {
+                println!("[GT] {table} has {cand}: {}", cols.contains(cand));
+            }
+            if !cols.contains("40013") {
+                continue;
+            }
+            // 40013 distribution: must be ⊆ {0,1,2,3} with 0 or 1 present —
+            // arbitrates the is_send mapping (0->0, 1/2->1, 3->0).
+            let mut hist: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT \"40013\", count(*) FROM {table} WHERE \"40013\" IS NOT NULL GROUP BY \"40013\""
+                    ))
+                    .unwrap();
+                for r in stmt
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                    .unwrap()
+                    .flatten()
+                {
+                    hist.insert(r.0, r.1);
+                }
+            }
+            let total_dir: i64 = hist.values().sum();
+            println!("[GT] {table} 40013 histogram: {hist:?}");
+            if total_dir > 0 {
+                // Spec pins 0/1/2/3; the real DB also shows a bitmask-like
+                // value (32761 = 0x7FF9, observed with system messages) —
+                // production maps anything not 1/2 to is_send 0, so unknown
+                // values are printed here, not asserted away.
+                let unknown: Vec<i64> = hist
+                    .keys()
+                    .filter(|k| !(0..=3).contains(*k))
+                    .copied()
+                    .collect();
+                if !unknown.is_empty() {
+                    println!("[GT] {table} 40013 unknown values (mapped to is_send 0): {unknown:?}");
+                }
+                assert!(
+                    hist.contains_key(&0) || hist.contains_key(&1),
+                    "{table}: 40013 lacks 0/1 values: {hist:?}"
+                );
+            }
+            // 40050 vs seq>>32 agreement: the explicit column must match the
+            // packed timestamp; wholesale mismatch means 40050 has a
+            // different semantic and must NOT be adopted as authoritative.
+            if cols.contains("40050") {
+                let mut max_diff = 0i64;
+                let mut over = 0i64;
+                let mut n = 0i64;
+                {
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT \"40001\", \"40050\" FROM {table} \
+                             WHERE \"40050\" IS NOT NULL AND \"40050\" > 0 ORDER BY rowid LIMIT 2000"
+                        ))
+                        .unwrap();
+                    let rows = stmt
+                        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                        .unwrap();
+                    for r in rows.flatten() {
+                        let diff = (seq_to_time(r.0) - r.1).abs();
+                        max_diff = max_diff.max(diff);
+                        if diff > 2 {
+                            over += 1;
+                        }
+                        n += 1;
+                    }
+                }
+                println!("[GT] {table} 40050-vs-seq>>32: n={n} maxDiff={max_diff} diff>2={over}");
+            }
+            // 40090: sender group card (group table only) — non-empty rate,
+            // plus the SAME rows' 40093 nickname so a noisy 40090 (e.g.
+            // synthesized "name(qq)" strings) can be told apart from a real
+            // card before it wins the display preference.
+            if is_group && cols.contains("40090") {
+                let (total, nonempty): (i64, i64) = conn
+                    .query_row(
+                        &format!("SELECT count(*), count(CASE WHEN \"40090\" != '' THEN 1 END) FROM {table}"),
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                println!("[GT] {table} 40090 nonEmpty={nonempty}/{total}");
+                if nonempty > 0 {
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT DISTINCT \"40090\", \"40093\" FROM {table} WHERE \"40090\" != '' LIMIT 5"
+                        ))
+                        .unwrap();
+                    let samples: Vec<(String, String)> = stmt
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .unwrap()
+                        .flatten()
+                        .collect();
+                    for (card, nick) in &samples {
+                        println!("[GT] {table} 40090-vs-40093: card={card:?} nick={nick:?}");
+                    }
+                    // Decisive test: 40090 is the SENDER's card iff one group
+                    // has multiple distinct values (a group name would be
+                    // one value per group).
+                    let max_distinct_per_group: i64 = conn
+                        .query_row(
+                            &format!(
+                                "SELECT max(per_group) FROM (SELECT \"40021\", \
+                                 count(DISTINCT \"40090\") AS per_group FROM {table} \
+                                 WHERE \"40090\" != '' GROUP BY \"40021\")"
+                            ),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    println!("[GT] {table} 40090 maxDistinctPerGroup={max_distinct_per_group}");
+                }
             }
         }
 

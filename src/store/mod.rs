@@ -7,6 +7,7 @@
 //! poller — a single source of truth for both HTTP queries and SSE events.
 
 pub mod index;
+pub mod media_export;
 pub mod names;
 pub mod query;
 
@@ -67,6 +68,14 @@ pub struct NameMaps {
     pub group_remark: HashMap<String, String>,
 }
 
+/// One fetchable media file (served by /api/v1/media/{id}).
+#[derive(Debug, Clone)]
+pub struct MediaEntry {
+    /// Local cache path ("45812") — absolute, or relative to `media_root`.
+    pub local_path: String,
+    pub file_name: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Store {
     pub convs: HashMap<String, Conversation>,
@@ -74,6 +83,11 @@ pub struct Store {
     pub uid_names: HashMap<String, String>,
     /// uid/群 name maps from the mapping sources (see `names`).
     pub names: NameMaps,
+    /// Media lookup: md5 hex / uuid -> local cache file, built from the
+    /// structured media metadata at index time (first-wins).
+    pub media: HashMap<String, MediaEntry>,
+    /// `nt_data` root of the account — relative "45812" paths resolve here.
+    pub media_root: Option<std::path::PathBuf>,
     /// Highest rowid seen per table (poller watermark).
     pub watermark_group: i64,
     pub watermark_c2c: i64,
@@ -158,6 +172,11 @@ pub struct AppState {
     pub sync: Arc<sync::SyncEngine>,
     /// Client-driven account registry (paths, watch config, shutdown).
     pub init: crate::server::AccountRegistry,
+    /// Media export root (`media=1` on /api/v1/messages copies here, WeFlow
+    /// exportPath semantics); `--media-export-dir`, default `<data-dir>/api-media`.
+    pub export_root: Arc<std::path::PathBuf>,
+    /// Base URL for exported media links (`http://{host}:{port}`).
+    pub base_url: Arc<String>,
 }
 
 #[cfg(test)]

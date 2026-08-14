@@ -96,6 +96,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/health", get(health::handler).post(health::handler))
         .route("/api/v1/accounts", post(accounts::handler))
         .route("/api/v1/messages", get(messages::handler).post(messages::handler))
+        .route("/api/v1/media/{id}", get(media::handler))
+        .route(
+            "/api/v1/media/{talker}/{media_type}/{file}",
+            get(media::exported_handler).post(media::exported_handler),
+        )
         .route("/api/v1/sessions", get(sessions::handler).post(sessions::handler))
         .route("/api/v1/sessions/{id}/messages", get(chatlab_pull::handler))
         .route("/api/v1/contacts", get(contacts::handler).post(contacts::handler))
@@ -199,6 +204,9 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
             &key_for_build,
             &store::names::KnownKeys::from_store(&st),
         );
+        // Media root: <root>/<qq>/nt_qq/nt_db -> <root>/<qq>/nt_qq/nt_data;
+        // relative "45812" local cache paths resolve against it.
+        st.media_root = nt_db_dir.parent().map(|p| p.join("nt_data"));
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         install_index(&store, &tx, st);
         Ok((Arc::new(Mutex::new(reader)), count))
@@ -285,6 +293,12 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         fallback: (cfg.watch_fallback_ms > 0)
             .then(|| std::time::Duration::from_millis(cfg.watch_fallback_ms)),
     };
+    let export_root = Arc::new(
+        cfg.media_export_dir
+            .clone()
+            .unwrap_or_else(|| data_dir.join("api-media")),
+    );
+    let base_url = Arc::new(format!("http://{}:{}", cfg.host, cfg.port));
     let state = Arc::new(AppState {
         store: store.clone(),
         events: tx.clone(),
@@ -293,6 +307,8 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
         token: Arc::new(token.clone()),
         sync: sync_engine.clone(),
         init: AccountRegistry::new(accounts, watch_cfg, shutdown_rx.clone()),
+        export_root,
+        base_url,
     });
     update_ready(&state);
 
@@ -341,6 +357,8 @@ mod tests {
                 crate::sync::watch::WatchConfig::default(),
                 shutdown_rx,
             ),
+            export_root: Arc::new(std::path::PathBuf::from(".")),
+            base_url: Arc::new("http://127.0.0.1:5032".into()),
         })
     }
 
