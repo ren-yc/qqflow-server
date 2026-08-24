@@ -409,11 +409,15 @@ pub fn read_new(
 
 /// Apply records read by `read_new` to the store (single write-lock critical
 /// section; callers write the watermarks in the same section). Takes the
-/// Vec by value — each record is moved into the store, no deep clone per
-/// appended row.
-pub fn apply_records(store: &mut Store, records: Vec<MessageRecord>) {
+/// slice by reference: the sync pass builds its SSE events AFTER applying,
+/// so each row's own media registration is visible to the event's `mediaId`
+/// filter — the caller therefore needs the records back for iteration. The
+/// per-row clone here is cheap (small strings; the heavy full-scan path in
+/// `scan_table` keeps the move-based `apply_record` and never goes through
+/// this wrapper).
+pub fn apply_records(store: &mut Store, records: &[MessageRecord]) {
     for rec in records {
-        apply_record(store, rec);
+        apply_record(store, rec.clone());
     }
 }
 

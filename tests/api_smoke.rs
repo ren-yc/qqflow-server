@@ -511,6 +511,7 @@ fn event_json_shape() {
         "你好".into(),
         1782835200,
         None,
+        None,
     );
     let v: Value = serde_json::to_value(&ev).unwrap();
     assert_eq!(v["event"], "message.new");
@@ -520,10 +521,24 @@ fn event_json_shape() {
     assert_eq!(v["groupName"], "项目群");
     assert!(v.get("lastRowidGroup").is_none(), "new events must not carry sync fields");
     assert!(v.get("media").is_none(), "no media -> key absent");
+    assert!(v.get("mediaId").is_none(), "no media -> no mediaId");
 }
 
 #[test]
 fn event_json_carries_media() {
+    // The raw "45812" local path is fake but PRESENT in the parsed media —
+    // it must still never appear in the pushed event: paths are
+    // machine-local, mostly stale, and leak host layout downstream.
+    let info = MediaInfo::from(qqflow_server::parser::proto::MediaSegment {
+        uuid: Some("R020-test".into()),
+        md5_hex: Some("aabbccddeeff00112233445566778899".into()),
+        file_name: Some("aabb.png".into()),
+        size: Some(1234),
+        width: Some(640),
+        height: Some(480),
+        local_path: Some(r"C:\SomeUser\nt_qq\nt_data\Pic\2026-08\aabb.png".into()),
+        urls: vec![],
+    });
     let ev = Event::message_new(
         ChatType::Group,
         "10001".into(),
@@ -532,22 +547,44 @@ fn event_json_carries_media() {
         Some("李四".into()),
         "[image]".into(),
         1782835200,
-        Some(MediaInfo::from(qqflow_server::parser::proto::MediaSegment {
-            uuid: Some("R020-test".into()),
-            md5_hex: Some("aabbccddeeff00112233445566778899".into()),
-            file_name: Some("aabb.png".into()),
-            size: Some(1234),
-            width: Some(640),
-            height: Some(480),
-            local_path: None,
-            urls: vec![],
-        })),
+        Some(info),
+        Some("aabbccddeeff00112233445566778899".into()), // registered -> fetchable
     );
     let v: Value = serde_json::to_value(&ev).unwrap();
     assert_eq!(v["media"]["md5"], "aabbccddeeff00112233445566778899");
     assert_eq!(v["media"]["uuid"], "R020-test");
     assert_eq!(v["media"]["width"], 640);
-    assert!(v["media"].get("localPath").is_none(), "absent optional field skipped");
+    assert!(
+        v["media"].get("localPath").is_none(),
+        "the raw QQ cache path must never be pushed"
+    );
+    assert_eq!(v["mediaId"], "aabbccddeeff00112233445566778899");
+}
+
+#[test]
+fn event_json_media_id_omitted_when_not_fetchable() {
+    // The media object rides along, but without a registered live path the
+    // event must not promise a servable /api/v1/media/{id} — same rule as
+    // the REST mediaId filter, applied to the push channel too.
+    let info = MediaInfo::from(qqflow_server::parser::proto::MediaSegment {
+        md5_hex: Some("aabbccddeeff00112233445566778899".into()),
+        local_path: None,
+        ..Default::default()
+    });
+    let ev = Event::message_new(
+        ChatType::Group,
+        "10001".into(),
+        Some("项目群".into()),
+        44,
+        Some("王五".into()),
+        "[image]".into(),
+        1782835200,
+        Some(info),
+        None, // not registered -> no mediaId
+    );
+    let v: Value = serde_json::to_value(&ev).unwrap();
+    assert!(v["media"]["md5"].is_string(), "media object still rides along");
+    assert!(v.get("mediaId").is_none(), "mediaId omitted when not fetchable");
 }
 
 #[test]

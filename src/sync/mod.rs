@@ -184,9 +184,12 @@ impl AccountSync {
         let (new_wm_g, new_g) = index::read_new(conn, ChatType::Group, wm_g)?;
         let (new_wm_c, new_c) = index::read_new(conn, ChatType::C2c, wm_c)?;
 
-        // Apply phase: one write-lock critical section — build the SSE
-        // events and response rows here (apply moves the records into the
-        // store, no clone), append both tables, advance both watermarks.
+        // Apply phase: one write-lock critical section — apply both tables
+        // FIRST so this batch's own media registrations are visible to the
+        // SSE mediaId filter below (a row that rescues its media through the
+        // cache-index fallback must advertise the same fetchable id in its
+        // own event), then build the SSE events and response rows (the
+        // records are borrowed — see apply_records), advance watermarks.
         let (events, outs): (Vec<Event>, Vec<MessageOut>) = {
             let mut guard = self.store.write();
             // Media root may predate the account (sync can run before the
@@ -194,6 +197,10 @@ impl AccountSync {
             if guard.media_root.is_none() {
                 guard.media_root = crate::store::media::media_root_of(&self.db_dir);
             }
+            index::apply_records(&mut guard, &new_g);
+            index::apply_records(&mut guard, &new_c);
+            guard.watermark_group = new_wm_g;
+            guard.watermark_c2c = new_wm_c;
             let events: Vec<Event> = new_g
                 .iter()
                 .chain(&new_c)
@@ -215,6 +222,14 @@ impl AccountSync {
                             r.ts,
                         )
                     } else {
+                        // mediaId filtered by the same rule as the REST rows
+                        // (registered live path only) — the media object is
+                        // the path-free PushMedia view.
+                        let media_id = r
+                            .parsed
+                            .media
+                            .as_ref()
+                            .and_then(|m| crate::store::query::fetchable_media_id(&guard, m));
                         Event::message_new(
                             r.chat_type,
                             r.talker.clone(),
@@ -224,6 +239,7 @@ impl AccountSync {
                             r.parsed.content.clone(),
                             r.ts,
                             r.parsed.media.clone(),
+                            media_id,
                         )
                     }
                 })
@@ -236,10 +252,6 @@ impl AccountSync {
                 .map(MessageOut::from_record)
                 .map(|o| crate::store::query::with_fetchable_media_id(&guard, o))
                 .collect();
-            index::apply_records(&mut guard, new_g);
-            index::apply_records(&mut guard, new_c);
-            guard.watermark_group = new_wm_g;
-            guard.watermark_c2c = new_wm_c;
             (events, outs)
         };
         for ev in events {

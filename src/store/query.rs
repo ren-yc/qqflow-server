@@ -1,6 +1,6 @@
 //! Read-side queries over the in-memory index (WeFlow-compatible shapes).
 
-use crate::parser::types::ChatType;
+use crate::parser::types::{ChatType, MediaInfo};
 use crate::store::Store;
 
 /// WeFlow-style session row.
@@ -82,6 +82,15 @@ pub fn with_fetchable_media_id(store: &Store, mut row: MessageOut) -> MessageOut
         row.media_id = None;
     }
     row
+}
+
+/// The single fetchability rule behind every `mediaId` in the API: a media
+/// key is advertised only when the store has registered a live local path
+/// for it (REST rows via [`with_fetchable_media_id`], SSE events directly).
+/// One rule, two channels — an advertised key is always servable.
+pub(crate) fn fetchable_media_id(store: &Store, m: &MediaInfo) -> Option<String> {
+    let key = m.key()?;
+    store.media.contains_key(key).then(|| key.to_string())
 }
 
 pub struct MessageQuery<'a> {
