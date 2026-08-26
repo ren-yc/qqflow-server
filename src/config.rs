@@ -5,7 +5,7 @@
 //! (30000). Account database paths and SQLCipher keys are NOT configuration
 //! — downstream clients register them at runtime via `POST /api/v1/accounts`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
@@ -38,6 +38,8 @@ pub struct Config {
     /// Default: derived from `--host`/`--port` (0.0.0.0 / :: fall back to
     /// 127.0.0.1 — bind-all addresses are not reachable as URLs).
     pub base_url: Option<String>,
+    /// Print the stored API token (from the OS credential store) and exit.
+    pub show_token: bool,
 }
 
 impl Default for Config {
@@ -50,6 +52,7 @@ impl Default for Config {
             watch_fallback_ms: 30_000,
             media_export_dir: None,
             base_url: None,
+            show_token: false,
         }
     }
 }
@@ -68,6 +71,7 @@ fn help() -> String {
        --media-export-dir <dir>  媒体导出根目录（默认 <data-dir>/api-media）\n\
        --base-url <url>          媒体导出链接 base URL（默认 http://<host>:<port>，\n\
                                  绑定 0.0.0.0/:: 时回退 127.0.0.1；局域网访问请显式指定）\n\
+       --show-token              打印已存的 API token 并退出\n\
        -h, --help                显示本帮助\n\
      \n\
      账号与密钥不在命令行提供：启动后由客户端 POST /api/v1/accounts\n\
@@ -92,6 +96,11 @@ pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
         if flag == "-h" || flag == "--help" {
             println!("{}", help());
             return Ok(None);
+        }
+        if flag == "--show-token" {
+            cfg.show_token = true;
+            i += 1;
+            continue;
         }
         let value = args
             .get(i + 1)
@@ -142,21 +151,55 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Load the persisted token, or generate + persist a new one.
-pub fn load_or_create_token(data_dir: &Path) -> Result<String> {
-    let path = data_dir.join("token.txt");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        let t = t.trim();
-        if !t.is_empty() {
-            return Ok(t.to_string());
+const TOKEN_SERVICE: &str = "qqflow-server";
+const TOKEN_USER: &str = "http-api-token";
+
+/// Load the API token from the OS credential store (Windows 凭据管理器 /
+/// macOS 钥匙串 / Linux Secret Service), or generate + store a new one.
+///
+/// The token value is logged **only when it is first generated** (or when
+/// no credential store is available and the token is per-session). Use the
+/// `--show-token` flag to retrieve it on demand.
+pub fn load_or_create_token() -> Result<String> {
+    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
+    match entry.get_password() {
+        Ok(t) if !t.is_empty() => Ok(t),
+        Ok(_) | Err(keyring::Error::NoEntry) => {
+            let token = new_token();
+            entry
+                .set_password(&token)
+                .map_err(|e| anyhow::anyhow!("凭据库写入失败: {e}"))?;
+            tracing::info!("[init] 生成新 API token: {token}（已存入系统凭据库）");
+            Ok(token)
+        }
+        Err(e) => {
+            // 无凭据库平台：会话级 token，随 warn 打印
+            let token = new_token();
+            tracing::warn!(
+                "[init] 凭据库不可用 ({e})；API token 为会话级（重启后变化）: {token}"
+            );
+            Ok(token)
         }
     }
+}
+
+/// Read the stored token without generating one; `None` when none exists.
+/// Used by `--show-token`.
+pub fn show_token() -> Result<Option<String>> {
+    let entry = keyring::Entry::new(TOKEN_SERVICE, TOKEN_USER)
+        .map_err(|e| anyhow::anyhow!("凭据库初始化失败: {e}"))?;
+    match entry.get_password() {
+        Ok(t) if !t.is_empty() => Ok(Some(t)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("凭据库读取失败: {e}")),
+    }
+}
+
+fn new_token() -> String {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    std::fs::write(&path, &token).with_context(|| format!("write token file {}", path.display()))?;
-    tracing::info!("[init] generated new API token (persisted to {})", path.display());
-    Ok(token)
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Constant-time string equality (avoids timing side channels for token checks).
@@ -200,6 +243,17 @@ mod tests {
         assert_eq!(cfg.log, "debug");
         assert_eq!(cfg.watch_debounce_ms, 500);
         assert_eq!(cfg.watch_fallback_ms, 0);
+    }
+
+    #[test]
+    fn show_token_switch_parses_without_value() {
+        let cfg = parse_args(["--show-token"].iter().map(|s| s.to_string()).collect())
+            .unwrap()
+            .expect("config");
+        assert!(cfg.show_token, "--show-token must set the flag");
+        // and normal startup keeps it off
+        let cfg = parse_args(vec![]).unwrap().expect("config");
+        assert!(!cfg.show_token);
     }
 
     #[test]

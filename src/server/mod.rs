@@ -284,13 +284,22 @@ pub async fn serve() -> Result<()> {
     let Some(cfg) = config::load()? else {
         return Ok(()); // help printed
     };
+    if cfg.show_token {
+        return match config::show_token()? {
+            Some(t) => {
+                println!("{t}");
+                Ok(())
+            }
+            None => anyhow::bail!("尚未生成 API token（先启动一次服务以生成）"),
+        };
+    }
     crate::logging::init(&cfg.log);
     run_with(cfg).await
 }
 
 pub async fn run_with(cfg: config::Config) -> Result<()> {
     let data_dir = config::data_dir()?;
-    let token = config::load_or_create_token(&data_dir)?;
+    let token = config::load_or_create_token()?;
 
     // ---- accounts: platform scan for discovery only ----------------------
     // Zero accounts is a valid start state — a client will register them
@@ -350,7 +359,7 @@ pub async fn run_with(cfg: config::Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
-    tracing::info!("[init] 服务启动: http://{addr}  (token 已生成/加载)");
+    tracing::info!("[init] 服务启动: http://{addr}  (API token 存于系统凭据库; 仅首次生成时打印; --show-token 获取)");
     tracing::info!("[init] 等待客户端注册账号: POST /api/v1/accounts {{\"qq\", \"key\", \"db_path\"}}");
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {

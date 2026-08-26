@@ -16,7 +16,7 @@ Headless HTTP API + SSE service that reads **local QQ NT chat records** (`nt_msg
 - 严禁把 `qqflow-server.json` 的真实值（qq / key / db_path）写入任何仓库文件——它们只存在于内存（`keystore`）与 gitignored 的本地配置
 - 代码、测试、文档一律使用虚构数据或占位符（`FAKE_QQ=335663881`、`FAKE_KEY=0123456789abcdef`、`<QQ号>`、`<16字节密钥>`）
 - 测试中的文件路径用虚构路径（如 `C:\SomeUser\nt_qq\nt_db\nt_msg.db`），绝不复制本机真实路径
-- 真实 token 只存在于 `<data-dir>/token.txt`（仓库外），启动日志只打印路径不打印值
+- 真实 token 只存在于 `<data-dir>/系统凭据库（--show-token 获取）`（仓库外），启动日志只打印路径不打印值
 
 ## Commands
 
@@ -51,7 +51,7 @@ Accounts are **client-driven**: startup only scans platform paths for discovery 
 - `db_path` (optional) is a direct `nt_msg.db` file or a Tencent Files-style root (`<dir>/<qq>/nt_qq/nt_db/nt_msg.db`); omitting it reuses the scanned path.
 - Keys are validated (16 printable-ASCII bytes) and kept **in memory only** — never persisted. A wrong key puts the account in `error` state (recoverable by re-registering); the process never exits over key problems.
 
-Default `127.0.0.1:5032` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/token.txt`; the startup log prints the file path, not the token value. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
+Default `127.0.0.1:5032` (same port as WeFlow). API token is auto-generated (32B hex) and persisted to `<data-dir>/系统凭据库（--show-token 获取）`; the startup log prints the file path, not the token value. Data dir: `%LOCALAPPDATA%\qqflow-server` on Windows, `~/.local/share/qqflow-server` on Linux, `~/Library/Application Support/qqflow-server` on macOS.
 
 ## Architecture
 

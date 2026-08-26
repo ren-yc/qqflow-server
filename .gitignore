@@ -6,7 +6,6 @@
 
 # Local data (keys/token created at runtime)
 keys.json
-token.txt
 
 # IDE / editor
 .idea/
