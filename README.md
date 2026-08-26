@@ -22,6 +22,19 @@
 
 构建需源码编译 SQLCipher + OpenSSL，故要求 C 工具链与 perl；wrapper 会自动定位 MSVC 环境与 Perl/nasm（Windows 专属），并透传全部 cargo 参数（`test`/`clippy`/`build --release` 等同理）。工具链由 `rust-toolchain.toml` 锁定。
 
+## 发布
+
+版本号以 `Cargo.toml` 为唯一来源，不要在其他文件里再写一遍版本号。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
+自动在 Windows / Linux / macOS 三平台构建 release 二进制，校验 tag 与 `Cargo.toml` 版本一致后，
+打包为 `qqflow-server-<版本>-<平台目标>` 归档并附 `SHA256SUMS` 发布到 GitHub Release。
+
+```bash
+cargo install cargo-edit            # 一次性；提供 cargo set-version
+cargo set-version 0.3.0             # 或手动编辑 Cargo.toml 的 version 字段
+git commit -am "chore: release v0.3.0"
+git tag v0.3.0 && git push origin master --tags   # tag 触发自动发布
+```
+
 ## 运行
 
 ```powershell
