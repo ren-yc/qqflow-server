@@ -149,11 +149,18 @@ jobs:
 
       - name: Generate SHA256SUMS
         working-directory: artifacts
-        run: sha256sum * > SHA256SUMS
+        # artifacts/ also contains the unpacked staging directories
+        # (qqflow-server-<v>-<target>/), so hash only the archives.
+        run: |
+          shopt -s nullglob
+          sha256sum *.zip *.tar.gz > SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true
