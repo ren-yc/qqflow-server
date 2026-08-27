@@ -166,7 +166,7 @@ fn scan_unix(root: &Path) -> Result<Vec<DbInfo>> {
             }
         }
         let chosen = if exact.is_file() {
-            exact
+            Some(exact)
         } else {
             candidates.sort_by(|a, b| b.0.cmp(&a.0));
             candidates.into_iter().next().map(|(_, p)| p)
