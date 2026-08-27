@@ -16,15 +16,11 @@ pub struct DbInfo {
     pub path: PathBuf,
 }
 
+/// Windows documents dir; only `scan_windows` calls this (Unix targets
+/// never reach it, so the fn is cfg'd out there to keep dead code out).
+#[cfg(target_os = "windows")]
 fn documents_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        dirs::document_dir().unwrap_or_else(|| PathBuf::from("."))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        PathBuf::from(".")
-    }
+    dirs::document_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Enumerate accounts: scan `<documents>/Tencent Files/<digits>/nt_qq/nt_db/nt_msg.db`
