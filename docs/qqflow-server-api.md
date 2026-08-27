@@ -110,17 +110,35 @@ POST /api/v1/accounts
 **响应**
 
 ```json
-{ "success": true, "qq": "1234567890", "state": "accepted" }
+{
+  "success": true,
+  "qq": "1234567890",
+  "state": "accepted",
+  "status": "indexing",
+  "db_path": "C:\\SomeUser\\Documents\\Tencent Files\\1234567890\\nt_qq\\nt_db\\nt_msg.db"
+}
 ```
 
-| `state` | 说明 |
-| ------- | ---- |
-| `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） |
-| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII） |
-| `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` |
-| `unknown_qq` | 未扫描到该账号且未提供 `db_path` |
-| `already_ready` | 账号已就绪（幂等无操作） |
-| `in_progress` | 账号正在索引 |
+| 字段 | 说明 |
+| ---- | ---- |
+| `state` | **本次注册请求的结果**（见下表） |
+| `status` | **账号当前状态机值** ∈ `awaiting_key \| indexing \| ready \| error`，与 `/health` 的 `accounts[].state` 同一枚举；账号此前从未出现过时省略 |
+| `db_path` | 服务端**实际解析到的** `nt_msg.db` 路径；无法解析时省略 |
+
+| `state` | 说明 | 伴随的 `status` |
+| ------- | ---- | ---- |
+| `accepted` | 参数合法，后台开始初始化（`/health` 可见 `indexing` → `ready`） | `indexing` |
+| `invalid_key` | 密钥未通过校验（非 16 字节可打印 ASCII） | 账号原状态（未变） |
+| `invalid_db_path` | `db_path` 不存在或目录下无 `nt_msg.db` | 账号原状态（未变） |
+| `unknown_qq` | 未扫描到该账号且未提供 `db_path` | 账号原状态（未变） |
+| `already_ready` | 账号已就绪（幂等无操作） | `ready` |
+| `in_progress` | 账号正在索引 | `indexing` |
+
+`status` 的用途是免去注册后立刻再打一次 `/health`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**——例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
+
+**`status: "indexing"` 不代表密钥正确**：本接口只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health` 等到 `ready`。
+
+`db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
 
 密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`/health` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
 

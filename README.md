@@ -59,6 +59,8 @@ curl -X POST http://127.0.0.1:5032/api/v1/accounts \
 
 `db_path` 可为 `nt_msg.db` 文件路径或 Tencent Files 风格目录（省略则复用扫描到的路径）；密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
+响应形如 `{"success":true,"qq":"<QQ号>","state":"accepted","status":"indexing","db_path":"<解析到的 nt_msg.db>"}`：`state` 是本次注册的结果、`status` 是账号状态机当前值（与 `/health` 同枚举）、`db_path` 是服务端实际解析到的库文件。注意 `status:"indexing"` 只表示密钥**格式**合法、后台构建已启动，真正的解密验证在构建中完成，客户端仍需轮询 `/health` 到 `ready`。
+
 默认 `http://127.0.0.1:5032`，token 生成后存入**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service），**仅首次生成时**打印到启动日志；之后可用 `--show-token` 随时获取。完整接口文档见 `docs/qqflow-server-api.md`。
 
 ## API（与 WeFlow 契约对齐）

@@ -151,6 +151,16 @@ async fn downstream_client_real_db() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "accepted", "registration accepted: {v}");
+    assert_eq!(v["status"], "indexing", "state machine value rides along");
+    // The request passed a Tencent Files-style ROOT; the echo must be the
+    // resolved nt_msg.db file under it — that resolve is the whole point of
+    // returning db_path. Shape-level only (the real path is host-specific
+    // and must never be printed or hard-coded).
+    // (`root` may be a root dir OR a direct nt_msg.db per resolve_inputs, so
+    // the assertion covers both: extends the dir, or equals the file.)
+    let resolved = v["db_path"].as_str().expect("db_path echoed");
+    assert!(resolved.ends_with("nt_msg.db"), "db_path resolves to the database file");
+    assert!(resolved.len() >= root.len(), "resolved path extends the supplied root");
 
     // ---- 1. health: ready after the background index build --------------
     let indexed = wait_ready(&app, &qq).await;

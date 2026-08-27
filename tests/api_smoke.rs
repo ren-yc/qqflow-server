@@ -768,16 +768,32 @@ async fn accounts_validation_and_idempotency() {
         message_count: 2,
         error: None,
     });
-    // A scanned-style entry for 10002, so key validation is reachable
-    // (resolve succeeds without a db_path).
-    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
-        qq: "10002".into(),
-        path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
+    // An account left in `error` by an earlier failed registration, so the
+    // reject-branch `status` (account unchanged, still broken) is reachable.
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10003".into(),
+        state: AccountStatus::Error,
+        message_count: 0,
+        error: Some("解密失败".into()),
     });
+    // Scanned-style entries for 10002/10003, so key validation is reachable
+    // (resolve succeeds without a db_path).
+    state.init.accounts_db.lock().extend([
+        qqflow_server::db::scan::DbInfo {
+            qq: "10002".into(),
+            path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
+        },
+        qqflow_server::db::scan::DbInfo {
+            qq: "10003".into(),
+            path: std::env::temp_dir().join("qqflow_smoke_10003.db"),
+        },
+    ]);
     let app = build_router(state);
     let tok = "test-token-123456";
 
-    // Malformed key -> invalid_key (not an HTTP error).
+    // Malformed key -> invalid_key (not an HTTP error). The path resolved
+    // from the registry, so db_path rides along; the account never had a
+    // state entry, so `status` is omitted.
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/accounts",
@@ -786,8 +802,13 @@ async fn accounts_validation_and_idempotency() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "invalid_key");
+    assert!(v["status"].is_null(), "unknown account -> status omitted: {v}");
+    assert!(
+        v["db_path"].as_str().unwrap().ends_with("qqflow_smoke_10002.db"),
+        "resolved db_path echoed: {v}"
+    );
 
-    // Ready account -> idempotent no-op.
+    // Ready account -> idempotent no-op, status mirrors /health.
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/accounts",
@@ -796,8 +817,9 @@ async fn accounts_validation_and_idempotency() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "already_ready");
+    assert_eq!(v["status"], "ready");
 
-    // Unknown qq without a db_path -> unknown_qq.
+    // Unknown qq without a db_path -> unknown_qq, no path to echo.
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/accounts",
@@ -806,6 +828,8 @@ async fn accounts_validation_and_idempotency() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "unknown_qq");
+    assert!(v["status"].is_null(), "unknown account -> status omitted: {v}");
+    assert!(v["db_path"].is_null(), "unresolved -> db_path omitted: {v}");
 
     // Unresolvable db_path -> invalid_db_path.
     let (s, v) = post_json(
@@ -816,6 +840,20 @@ async fn accounts_validation_and_idempotency() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "invalid_db_path");
+    assert!(v["db_path"].is_null(), "unresolved -> db_path omitted: {v}");
+
+    // Re-registering a previously failed account with a malformed key: the
+    // reject leaves the account untouched, so `status` still reports `error`
+    // ("this call was rejected AND the account is still broken").
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": tok, "qq": "10003", "key": "short"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "invalid_key");
+    assert_eq!(v["status"], "error");
 
     // Missing qq / key -> 400 envelope.
     let (s, v) = post_json(app, "/api/v1/accounts", json!({"access_token": tok})).await;

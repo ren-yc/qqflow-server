@@ -64,7 +64,24 @@ pub async fn handler(
         return Err(ApiError::bad_request("缺少必填参数 key"));
     };
 
-    let reply = |state_name: &str| Json(json!({ "success": true, "qq": qq, "state": state_name }));
+    // `state` = this registration's outcome; `status` = the account's state
+    // machine value (same enum /health reports), so a client learns whether
+    // the account is usable without a second /health round-trip. `db_path`
+    // echoes the database the server actually resolved — the request's own
+    // db_path is loose (file, Tencent Files-style root, or omitted → the
+    // startup scan), so the resolved path is what tells the client which
+    // database is in play. Both are omitted when unknown.
+    let reply = |state_name: &str, status: Option<AccountStatus>, db_path: Option<&Path>| {
+        let mut out = json!({ "success": true, "qq": qq, "state": state_name });
+        let obj = out.as_object_mut().expect("json! object literal");
+        if let Some(st) = status {
+            obj.insert("status".into(), json!(st));
+        }
+        if let Some(p) = db_path {
+            obj.insert("db_path".into(), json!(p.to_string_lossy()));
+        }
+        Json(out)
+    };
 
     // Idempotent guards for accounts already past the waiting stage. Check
     // before resolving the path so a ready account's reply wins over
@@ -73,38 +90,64 @@ pub async fn handler(
         let accs = state.accounts.read();
         accs.iter().find(|a| a.qq == qq).map(|a| a.state)
     };
+    // For the idempotent replies the registry path is the one the running
+    // account was built from — NOT the (ignored) db_path of this request.
+    let registered = || state.init.find_db(qq).map(|i| i.path);
     match current {
-        Some(AccountStatus::Ready) => return Ok(reply("already_ready")),
-        Some(AccountStatus::Indexing) => return Ok(reply("in_progress")),
+        Some(AccountStatus::Ready) => {
+            return Ok(reply("already_ready", current, registered().as_deref()))
+        }
+        Some(AccountStatus::Indexing) => {
+            return Ok(reply("in_progress", current, registered().as_deref()))
+        }
         _ => {} // awaiting_key / error / unknown -> accept
     }
 
     let Some(info) = resolve_db_path(&state, qq, params.db_path.as_deref()) else {
-        // An explicit path that does not resolve, or an unknown qq.
+        // An explicit path that does not resolve, or an unknown qq. `current`
+        // (awaiting_key / error / None) is this account's unchanged status.
         let state_name = if params.db_path.as_deref().is_some_and(|p| !p.is_empty()) {
             "invalid_db_path"
         } else {
             "unknown_qq"
         };
-        return Ok(reply(state_name));
+        return Ok(reply(state_name, current, None));
     };
 
     if validate_key(key).is_err() {
-        return Ok(reply("invalid_key"));
+        // Rejected before any state change: the path resolved, the status is
+        // still awaiting_key / error / unknown.
+        return Ok(reply("invalid_key", current, Some(&info.path)));
     }
 
     // Flip to indexing atomically with the guard: a concurrent duplicate
     // registration serializes here and observes the new state instead of
     // spawning a second initialization.
     match begin_indexing(&state, qq) {
-        Some(AccountStatus::Ready) => return Ok(reply("already_ready")),
-        Some(AccountStatus::Indexing) => return Ok(reply("in_progress")),
+        Some(AccountStatus::Ready) => {
+            return Ok(reply("already_ready", Some(AccountStatus::Ready), registered().as_deref()))
+        }
+        Some(AccountStatus::Indexing) => {
+            return Ok(reply(
+                "in_progress",
+                Some(AccountStatus::Indexing),
+                registered().as_deref(),
+            ))
+        }
         _ => {}
     }
+
+    // Build the reply BEFORE spawning: `begin_indexing` just set `indexing`,
+    // and re-reading the state after the spawn would race the background
+    // build (which may already have reached ready/error). Note `indexing`
+    // does NOT mean the key is correct — only its format was checked here;
+    // the real decrypt verification happens in `init_account`, so a client
+    // still has to watch /health for ready.
+    let out = reply("accepted", Some(AccountStatus::Indexing), Some(&info.path));
 
     // Kick off the background build.
     let state_for_init = state.clone();
     let key_owned = key.to_string();
     tokio::spawn(async move { init_account(&state_for_init, info, key_owned).await });
-    Ok(reply("accepted"))
+    Ok(out)
 }

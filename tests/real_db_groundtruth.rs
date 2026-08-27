@@ -754,6 +754,11 @@ async fn client_registers_account_with_key_and_db_path() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "accepted");
+    // accepted always reports the freshly-set indexing status plus the
+    // resolved database — `indexing` is NOT a claim that the key is good
+    // (this very registration is about to fail its decrypt check).
+    assert_eq!(v["status"], "indexing");
+    assert_eq!(v["db_path"], db_path);
     let v = common::wait_account_state(&app, FAKE_QQ, "error", Duration::from_secs(15)).await;
     let err = v["accounts"].as_array().unwrap()[0]["error"].as_str().unwrap().to_string();
     println!("[GT] expected init failure: {err}");
@@ -769,9 +774,27 @@ async fn client_registers_account_with_key_and_db_path() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "accepted");
+    assert_eq!(v["status"], "indexing");
+    assert_eq!(v["db_path"], db_path);
     let v = common::wait_account_state(&app, FAKE_QQ, "ready", Duration::from_secs(15)).await;
     assert_eq!(v["status"], "ok");
+
     assert_eq!(v["accounts"].as_array().unwrap()[0]["message_count"], 8);
+
+    // Idempotent re-registration of the now-ready account: status mirrors
+    // /health and db_path echoes the running account's own path (this
+    // request omits db_path, so the echo proves it came from the registry).
+    let (s, v) = common::post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        &[],
+        json!({"access_token": "test-token", "qq": FAKE_QQ, "key": FAKE_KEY}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "already_ready");
+    assert_eq!(v["status"], "ready");
+    assert_eq!(v["db_path"], db_path);
 
     // The registered account serves queries.
     let resp = app
