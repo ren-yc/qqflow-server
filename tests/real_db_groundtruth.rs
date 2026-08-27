@@ -632,14 +632,37 @@ fn manual_sync_picks_up_new_rows() {
     common::append_group_row(&writer, 7, "手动同步新增");
     common::materialize_source(&nt_db);
 
+    // Sync rows carry senderName like the messages query does — the row is
+    // from u_a in group 10001, whose card ("40090") this batch itself just
+    // registered, so the field proves resolution happens after the apply
+    // phase and not against a stale store.
+    let group_row = first.iter().find(|m| m.sender_username == "u_a").unwrap();
+    assert_eq!(
+        group_row.sender_name, "张三群名片",
+        "sync rows resolve the in-group card, same as /api/v1/messages"
+    );
+    let c2c_row = first.iter().find(|m| m.sender_username == "u_12345").unwrap();
+    assert_eq!(
+        c2c_row.sender_name, "王五",
+        "c2c has no card in scope -> the message nick (40093)"
+    );
+
     let second = account.poll_once().unwrap();
     assert_eq!(second.len(), 1, "second poll returns only the new row");
     assert_eq!(second[0].content, "手动同步新增");
+    assert_eq!(second[0].sender_name, "张三群名片", "incremental rows too");
 
     // The new row must also be broadcast as an SSE event.
     let ev = rx.try_recv().unwrap();
     assert_eq!(ev.event, "message.new");
     assert_eq!(ev.content, "手动同步新增");
+    // SSE `sourceName` and the response row's `senderName` are the same
+    // resolution — a client mixing the two channels sees one name per sender.
+    assert_eq!(
+        ev.source_name.as_deref(),
+        Some(second[0].sender_name.as_str()),
+        "SSE sourceName agrees with the sync row's senderName"
+    );
 
     drop(writer);
 }

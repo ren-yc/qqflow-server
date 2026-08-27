@@ -174,7 +174,7 @@ GET /api/v1/push/messages
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
 | `avatarUrl` | v1 恒省略（序列化时跳过该字段） |
-| `sourceName` | 发送者显示名（群聊：本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID；私聊：备注 > 最新昵称 > 档案昵称 > UID——群名片只在所属群内显示，不会泄漏进私聊/联系人） |
+| `sourceName` | 发送者显示名，与 §3 的 `senderName` 同一解析链路、同一取值（群聊：本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID；私聊无群名片，从备注起算——群名片只在所属群内显示，不会泄漏进私聊/联系人）。混用推送与 REST 的客户端，同一发送者在两个通道拿到的名字一致 |
 | `groupName` | 会话显示名（群聊：群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊：备注 > 对方昵称（会话名） > 档案昵称 > UID）；仅 `message.new` / `message.revoke` 携带，缺失时省略该字段 |
 | `content` | 消息内容 |
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
@@ -248,7 +248,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | `localType` | 消息类型码（见下表） |
 | `createTime` | 秒级 Unix 时间戳（优先 `40050` 列，缺列时回退 seq 高位） |
 | `isSend` | 方向：`1`=本人发送，`0`=他人/系统（来自 `40013` 列；QQ 版本缺列或值非 1/2 时恒 `0`） |
-| `senderUsername` | 发送者 UID |
+| `senderUsername` | 发送者 UID（稳定标识，客户端据此去重） |
+| `senderName` | 发送者显示名，按**本会话**解析：群聊为本群群名片（`40090`）> 备注（`20009`）> 最新昵称（`40093`）> 档案昵称（`20002`）> UID；私聊无群名片，从备注起算。同一 UID 在不同会话可得不同显示名（群名片只在本群生效，不会外泄到私聊或联系人列表）。回退链末端是 UID 本身，故 `senderUsername` 非空时该字段必非空；系统消息等无发送者的行 `senderUsername` 为空，此字段同为空串（真实账号抽样 2568 条中 369 条属此类）。**有此字段后，客户端无需为显示名再调用 `/api/v1/contacts` 与 `/api/v1/group-members`** |
 | `content` / `rawContent` / `parsedContent` | v1 三者相同，为解析后文本 |
 | `mediaType` | 仅图片/语音/视频消息：`image` / `voice` / `video` |
 | `media` | 仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略） |
@@ -286,6 +287,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "createTime": 1782864000,
       "isSend": 0,
       "senderUsername": "u_a",
+      "senderName": "张三（群名片）",
       "content": "[image]",
       "rawContent": "[image]",
       "parsedContent": "[image]",
@@ -308,6 +310,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "createTime": 1782863900,
       "isSend": 0,
       "senderUsername": "u_b",
+      "senderName": "李四",
       "content": "你好",
       "rawContent": "你好",
       "parsedContent": "你好"
@@ -322,8 +325,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
 - `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
-- `members[].platformId`、`members[].accountName`（群聊：本群群名片 > 备注 > 最新昵称 > 档案昵称 > UID；私聊同链路无卡片）、`members[].groupNickname`（群聊群名片，私聊恒空）、`members[].avatar`（恒空）
-- `messages[].sender`、`messages[].accountName`（同上，群聊群名片优先）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+- `members[].platformId`、`members[].accountName`（即 §3 的 `senderName`，同一解析链路）、`members[].groupNickname`（同 `accountName`）、`members[].avatar`（恒空）
+- `messages[].sender`、`messages[].accountName`（同上）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
 
 ---
 
@@ -438,6 +441,8 @@ GET /api/v1/sessions/{id}/messages
 
 ### 响应
 
+`members[].accountName` 与 `messages[].accountName` 与 §3 的 `senderName` 同一解析链路、同一取值（群聊含本群群名片）；`members[].groupNickname` 群聊同 `accountName`、私聊恒为空串。
+
 ```json
 {
   "chatlab": {
@@ -499,8 +504,13 @@ GET /api/v1/contacts
 
 ### 响应字段（按 `(displayName, username)` 排序）
 
-**必须翻页**：`limit` 默认 100，不传就只拿到前 100 条，截断外的联系人在下游会
-退化为显示 UID。按 `offset` 递增直到 `hasMore=false`：
+> 仅为「显示消息发送者名字」而调用本接口已无必要：§3 的每条消息自带
+> `senderName`，且它按会话解析、含本群群名片，比本接口的 `displayName`（全局，
+> 无群名片）更准。本接口留给需要**完整通讯录**的场景（例如列出无聊天记录的联系人、
+> 读取 `alias`/QQ 号）。
+
+**必须翻页**：`limit` 默认 100，不传就只拿到前 100 条，静默丢掉其余联系人。
+按 `offset` 递增直到 `hasMore=false`：
 
 - `total` 为过滤后总数，与 `offset` 无关；`count` 是本页条数；
 - 排序加了 `username` 次键——显示名不唯一，仅按显示名排序时并列项在多次请求间
@@ -526,6 +536,9 @@ GET /api/v1/contacts
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
 v1 成员来源：该群消息中出现过的发送者 UID + 昵称（无独立群成员库）。
+
+> 同 §5：只为显示发送者名字不必调用本接口，§3 每条消息的 `senderName` 已是同一条
+> 解析链路（含本群群名片）。本接口留给需要成员名单本身的场景（发言数统计等）。
 
 **请求**
 
@@ -595,7 +608,7 @@ POST /api/v1/sync
   "synced": 3,
   "hasMore": false,
   "messages": [
-    { "localId": 1234567890123, "serverId": "1234567890123", "localType": 0, "createTime": 1782864000, "isSend": 0, "senderUsername": "u_a", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
+    { "localId": 1234567890123, "serverId": "1234567890123", "localType": 0, "createTime": 1782864000, "isSend": 0, "senderUsername": "u_a", "senderName": "张三（群名片）", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
   ]
 }
 ```

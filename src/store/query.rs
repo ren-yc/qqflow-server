@@ -24,6 +24,12 @@ pub struct MessageOut {
     pub create_time: i64,
     pub is_send: i64,
     pub sender_username: String,
+    /// Resolved sender display name (WeFlow `senderName`): group card ("40090")
+    /// for THIS conversation > remark ("20009") > message nick > profile nick >
+    /// UID. Needs the name maps, so only [`shape_record`] fills it;
+    /// `from_record` leaves it empty. Saves every client from rebuilding the
+    /// same mapping out of /api/v1/contacts + /api/v1/group-members.
+    pub sender_name: String,
     pub content: String,
     pub raw_content: String,
     pub parsed_content: String,
@@ -56,6 +62,10 @@ impl MessageOut {
             // when the QQ version lacks it.
             is_send: r.direction.map(crate::parser::types::direction_to_is_send).unwrap_or(0),
             sender_username: r.from_uid.clone(),
+            // Left empty here: resolving it needs the store's name maps, which
+            // a plain record conversion has no access to. `shape_record` fills
+            // it, and every emitting path goes through that.
+            sender_name: String::new(),
             content: r.parsed.content.clone(),
             raw_content: r.parsed.content.clone(),
             parsed_content: r.parsed.content.clone(),
@@ -67,6 +77,22 @@ impl MessageOut {
             media_local_path: None,
         }
     }
+}
+
+/// The one way a record becomes an API row: convert, then apply every
+/// store-dependent field (`mediaId` fetchability, `senderName`).
+///
+/// Both emitting paths — the messages query and the manual-sync response —
+/// call this, so neither can advertise an unfetchable `mediaId` nor return an
+/// empty `senderName` while the other fills it.
+///
+/// `senderName` resolves against `(rec.chat_type, rec.talker)`, the record's
+/// own conversation key (see `index::apply_record`), because the group card
+/// ("40090") is scoped to one group and must not leak across conversations.
+pub fn shape_record(store: &Store, rec: &crate::parser::types::MessageRecord) -> MessageOut {
+    let mut row = with_fetchable_media_id(store, MessageOut::from_record(rec));
+    row.sender_name = store.display_sender(rec.chat_type, &rec.talker, &row.sender_username);
+    row
 }
 
 /// `mediaId` advertises a fetchable /api/v1/media/{id} — the store only
@@ -143,7 +169,7 @@ pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool
             has_more = true;
             break;
         }
-        out.push(with_fetchable_media_id(store, MessageOut::from_record(m)));
+        out.push(shape_record(store, m));
     }
     (out, has_more)
 }

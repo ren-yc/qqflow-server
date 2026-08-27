@@ -391,6 +391,136 @@ async fn post_body_booleans_for_media_params() {
     assert_eq!(v["chatlab"]["generator"], "qqflow-server");
 }
 
+/// `test_state` plus the three name sources that compete for `senderName`,
+/// all set to different values so priority is observable rather than
+/// coincidental: u_a gets a group card in 10001 AND a global remark; u_b gets
+/// only a remark. A c2c conversation with u_a mirrors the group so the card's
+/// scope can be checked — the same uid must NOT show its card there.
+fn state_with_names() -> Arc<AppState> {
+    let state = test_state();
+    {
+        let mut store = state.store.write();
+        store
+            .group_cards
+            .entry(conv_key(ChatType::Group, "10001"))
+            .or_default()
+            .insert("u_a".into(), "张三群名片".into());
+        store.names.uid_remark.insert("u_a".into(), "张三备注".into());
+        store.names.uid_remark.insert("u_b".into(), "李四备注".into());
+        // Same sender, private chat, no card in scope.
+        let c2c = Conversation {
+            chat_type: ChatType::C2c,
+            talker: "u_a".into(),
+            name: "张三".into(),
+            msgs: vec![MessageRecord {
+                rowid: 3,
+                seq: 0x6771A6B70003,
+                ts: seq_to_time(0x6771A6B70003),
+                chat_type: ChatType::C2c,
+                talker: "u_a".into(),
+                from_uid: "u_a".into(),
+                from_nick: "张三".into(),
+                card: None,
+                direction: Some(0),
+                parsed: ParsedMessage {
+                    msg_type: MsgType::Text,
+                    content: "私聊".into(),
+                    media: None,
+                },
+            }],
+            dirty: false,
+        };
+        store.convs.insert(conv_key(ChatType::C2c, "u_a"), c2c);
+    }
+    state
+}
+
+/// `senderName` rides on every message so clients never rebuild the name
+/// mapping from /api/v1/contacts + /api/v1/group-members. Priority is card >
+/// remark > nick, and the card is scoped to its own group.
+#[tokio::test]
+async fn messages_carry_resolved_sender_name() {
+    let app = build_router(state_with_names());
+    let (s, v) = call(
+        app.clone(),
+        "/api/v1/messages?talker=10001&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // newest first: rowid 2 (u_b, remark only), rowid 1 (u_a, card + remark).
+    assert_eq!(v["messages"][1]["senderUsername"], "u_a");
+    assert_eq!(
+        v["messages"][1]["senderName"], "张三群名片",
+        "in a group the card (40090) outranks the global remark"
+    );
+    assert_eq!(
+        v["messages"][0]["senderName"], "李四备注",
+        "no card -> remark (20009) outranks the message nick"
+    );
+
+    // Same uid in a private chat: the group's card must not follow it.
+    let (s, v) = call(
+        app,
+        "/api/v1/messages?talker=u_a&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        v["messages"][0]["senderName"], "张三备注",
+        "c2c falls back to the remark — a group card never leaks out of its group"
+    );
+}
+
+/// The card is a display name, not an identity: `senderName` may change per
+/// conversation but `senderUsername` is the stable key clients dedupe on.
+#[tokio::test]
+async fn sender_name_is_per_conversation_but_username_is_stable() {
+    let state = state_with_names();
+    let store = state.store.read();
+    let group = query_messages(
+        &store,
+        &MessageQuery { talker: "10001", limit: 10, offset: 0, start: None, end: None, keyword: None },
+    )
+    .0;
+    let private = query_messages(
+        &store,
+        &MessageQuery { talker: "u_a", limit: 10, offset: 0, start: None, end: None, keyword: None },
+    )
+    .0;
+    let g = group.iter().find(|m| m.sender_username == "u_a").unwrap();
+    let c = &private[0];
+    assert_eq!(g.sender_username, c.sender_username, "identity is stable");
+    assert_ne!(g.sender_name, c.sender_name, "display name is per conversation");
+}
+
+/// `senderName` must not depend on which endpoint produced the row: the
+/// chatlab view resolves the same names as the WeFlow-shaped one.
+#[tokio::test]
+async fn chatlab_sender_name_matches_weflow_shape() {
+    let app = build_router(state_with_names());
+    let (_, weflow) = call(
+        app.clone(),
+        "/api/v1/messages?talker=10001&access_token=test-token-123456",
+    )
+    .await;
+    let (s, chatlab) = call(
+        app,
+        "/api/v1/messages?talker=10001&chatlab=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // chatlab is chronological, the WeFlow shape newest-first.
+    assert_eq!(chatlab["messages"][0]["accountName"], weflow["messages"][1]["senderName"]);
+    assert_eq!(chatlab["messages"][0]["accountName"], "张三群名片");
+    let member = chatlab["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["platformId"] == "u_a")
+        .expect("u_a in members");
+    assert_eq!(member["accountName"], "张三群名片", "members agree with messages");
+}
+
 #[tokio::test]
 async fn contacts_and_group_members() {
     let (s, v) = get("/api/v1/contacts?access_token=test-token-123456", false).await;

@@ -244,13 +244,14 @@ impl AccountSync {
                     }
                 })
                 .collect();
-            // Response rows: shaped under the lock so the mediaId filter
-            // sees the store (same contract as the messages query).
+            // Response rows: shaped under the lock so the store-dependent
+            // fields (mediaId fetchability, senderName) see this batch's own
+            // registrations — same single shaping function as the messages
+            // query, so the two paths cannot drift.
             let outs: Vec<MessageOut> = new_g
                 .iter()
                 .chain(&new_c)
-                .map(MessageOut::from_record)
-                .map(|o| crate::store::query::with_fetchable_media_id(&guard, o))
+                .map(|r| crate::store::query::shape_record(&guard, r))
                 .collect();
             (events, outs)
         };

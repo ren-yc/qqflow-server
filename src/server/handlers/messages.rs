@@ -188,19 +188,19 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
     let name = conv
         .map(|c| store.display_name(c.chat_type, &c.talker))
         .unwrap_or_else(|| talker.to_string());
-    // members: uid -> name seen in this session (remark preferred; in a
-    // group the sender's per-conversation card (40090) wins — it never
-    // leaks into c2c or the global contact lists).
+    // members: uid -> name seen in this session. `senderName` is already
+    // resolved per row (remark preferred; in a group the sender's
+    // per-conversation card (40090) wins and never leaks into c2c or the
+    // global contact lists), so reuse it rather than resolving it twice.
     let members: Vec<Value> = items
         .iter()
         .filter_map(|m| {
             let uid = &m.sender_username;
-            let nick = store.display_sender(chat_type, talker, uid);
             if uid.is_empty() { None } else {
                 Some(json!({
                     "platformId": uid,
-                    "accountName": nick,
-                    "groupNickname": nick,
+                    "accountName": m.sender_name,
+                    "groupNickname": m.sender_name,
                     "avatar": "",
                 }))
             }
@@ -211,7 +211,7 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
         .rev() // chatlab is chronological
         .map(|m| json!({
             "sender": m.sender_username,
-            "accountName": store.display_sender(chat_type, talker, &m.sender_username),
+            "accountName": m.sender_name,
             "timestamp": m.create_time,
             "type": m.local_type,
             "content": m.content,
