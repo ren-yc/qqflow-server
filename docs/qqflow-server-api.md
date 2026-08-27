@@ -497,10 +497,20 @@ GET /api/v1/contacts
 | `limit`   | number | 否   | 默认 `100`，范围 `1~10000`    |
 | `offset`  | number | 否   | 分页偏移，默认 `0`            |
 
-### 响应字段（按 displayName 排序）
+### 响应字段（按 `(displayName, username)` 排序）
+
+**必须翻页**：`limit` 默认 100，不传就只拿到前 100 条，截断外的联系人在下游会
+退化为显示 UID。按 `offset` 递增直到 `hasMore=false`：
+
+- `total` 为过滤后总数，与 `offset` 无关；`count` 是本页条数；
+- 排序加了 `username` 次键——显示名不唯一，仅按显示名排序时并列项在多次请求间
+  顺序不定，offset 翻页会漏行/重复行；
+- `offset` 超出末尾返回空页且 `hasMore=false`。
 
 - `success`
-- `count`
+- `count`（本页条数）
+- `total`（过滤后总数）
+- `hasMore`（`offset + count < total`）
 - `contacts[].username`（UID）
 - `contacts[].displayName`（备注 > 消息昵称 > 档案昵称 > UID）
 - `contacts[].nickname`（档案昵称 > 消息昵称；均无时为空串）

@@ -59,11 +59,22 @@ pub async fn handler(
     }
     let limit = params.limit.clamp(1, 10000);
     let store = state.store.read();
-    let contacts = crate::store::query::query_contacts(&store, params.keyword.as_deref(), limit, params.offset);
+    let (contacts, total) = crate::store::query::query_contacts(
+        &store,
+        params.keyword.as_deref(),
+        limit,
+        params.offset,
+    );
     let count = contacts.len();
+    // `total` / `hasMore` let clients page deterministically instead of
+    // inferring the end from "page shorter than limit" — which silently breaks
+    // if the server-side default limit ever changes.
+    let has_more = params.offset.saturating_add(count) < total;
     let body = json!({
         "success": true,
         "count": count,
+        "total": total,
+        "hasMore": has_more,
         "contacts": contacts,
     });
     Ok(Json(body))

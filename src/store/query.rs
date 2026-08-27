@@ -185,7 +185,10 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
 /// uid with no chat history appears too — that is the point of the
 /// mapping), with nickname (profile > message-derived), remark, and the
 /// QQ number exposed in the WeFlow `alias` slot.
-pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<crate::server::handlers::contacts::ContactOut> {
+///
+/// Returns `(page, total_after_filter)`: the caller needs the pre-pagination
+/// count to answer `hasMore` without running the query twice.
+pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> (Vec<crate::server::handlers::contacts::ContactOut>, usize) {
     let kw = keyword.map(|k| k.to_lowercase());
     let mut uid_set: std::collections::BTreeSet<&String> = store.uid_names.keys().collect();
     uid_set.extend(store.names.uid_remark.keys());
@@ -214,8 +217,17 @@ pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset
             }
         })
         .collect();
-    rows.sort_by_key(|a| a.display_name.to_lowercase());
-    rows.into_iter()
+    // Sort by (display_name, username): display names are not unique, so a
+    // display-name-only key leaves ties in arbitrary order between requests and
+    // offset paging would skip or repeat those rows.
+    rows.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+            .then_with(|| a.username.cmp(&b.username))
+    });
+    let filtered: Vec<_> = rows
+        .into_iter()
         .filter(|c| {
             if let Some(k) = &kw {
                 c.username.to_lowercase().contains(k.as_str())
@@ -225,9 +237,12 @@ pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset
                 true
             }
         })
-        .skip(offset)
-        .take(limit)
-        .collect()
+        .collect();
+    let total = filtered.len();
+    (
+        filtered.into_iter().skip(offset).take(limit).collect(),
+        total,
+    )
 }
 
 /// Distinguish group ids from peer uids: groups are all-digit QQ group
