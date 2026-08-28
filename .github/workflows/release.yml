@@ -85,20 +85,20 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/build.sh build --release --locked
 
-      # qqflow-server has no `--version` CLI flag yet; smoke-test `--help`
-      # (prints usage and exits 0) to confirm the binary runs.
-      - name: Smoke test --help
+      # Smoke-test `--version` (prints "qqflow-server <Cargo.toml version>"
+      # and exits 0) to confirm the binary runs and is the built version.
+      - name: Smoke test --version
         shell: bash
         run: |
           set -euo pipefail
           BIN="target/release/qqflow-server"
           [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
-          OUT="$("${BIN}" --help)"
+          OUT="$("${BIN}" --version)"
           echo "${OUT}"
           case "${OUT}" in
-            "qqflow-server"*) ;;
+            "qqflow-server ${{ needs.guard.outputs.version }}") ;;
             *)
-              echo "::error::unexpected --help output: ${OUT}"
+              echo "::error::unexpected --version output: ${OUT}"
               exit 1
               ;;
           esac

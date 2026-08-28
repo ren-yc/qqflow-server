@@ -22,6 +22,27 @@
 
 构建需源码编译 SQLCipher + OpenSSL，故要求 C 工具链与 perl；wrapper 会自动定位 MSVC 环境与 Perl/nasm（Windows 专属），并透传全部 cargo 参数（`test`/`clippy`/`build --release` 等同理）。工具链由 `rust-toolchain.toml` 锁定。
 
+## 隐私检查钩子
+
+本仓库的隐私扫描通过 git pre-commit 钩子执行。`.git/hooks/` 不受版本控制，
+因此**克隆后需手动装一次**（可重复执行，幂等）：
+
+```powershell
+powershell -File scripts\install-hooks.ps1   # Windows
+bash scripts/install-hooks.sh                # Linux/macOS
+```
+
+钩子在每次 `git commit` 前运行 `scripts/check-privacy.sh`，扫描暂存内容中的
+本机特定信息（QQ 号、数据库密钥、账号路径、用户名）。命中即中止提交并列出文件。
+手动单次执行：
+
+```bash
+bash scripts/check-privacy.sh
+```
+
+若 bash 不可用，钩子会**报错并阻止提交**（而非放行），以免扫描被静默跳过。
+确有需要绕过时用 `git commit --no-verify`。
+
 ## 发布
 
 版本号以 `Cargo.toml` 为唯一来源，不要在其他文件里再写一遍版本号。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
@@ -75,10 +96,10 @@ curl -X POST http://127.0.0.1:5032/api/v1/accounts \
 | `GET/POST /api/v1/contacts` | 联系人（消息中出现过的 UID ∪ 档案/映射 UID；`alias` 承载 QQ 号） |
 | `GET/POST /api/v1/group-members` | 群成员（`chatroomId`，`includeMessageCounts`） |
 | `GET/POST /api/v1/media/{id}`、`/api/v1/media/{talker}/{mediaType}/{file}` | 媒体直服（本地缓存）/ 导出文件服务 |
-| `GET/POST /api/v1/push/messages` | SSE：`sync`（基线，含水位线）→ `message.new` / `message.revoke`；媒体消息携带 `media` 元数据（**无本地路径**）与可直取的 `mediaId` |
+| `GET/POST /api/v1/push/messages` | SSE：`ready`（就绪基线）→ `sync`（含水位线）→ `message.new` / `message.revoke`（帧带 `id:` 序号，断线重连可 `Last-Event-ID` 回放最近 1000 条 / 10 分钟）；媒体消息携带 `media` 元数据（**无本地路径**）与可直取的 `mediaId` |
 | `GET/POST /api/v1/sync` | 手动同步（增量读取 + 名称映射刷新，返回新增消息） |
 
-鉴权三方式：`Authorization: Bearer <token>` / `?access_token=`（SSE 推荐）/ POST JSON Body。
+鉴权五方式：`Authorization: Bearer <token>` / `X-Api-Key: <token>` / `?access_token=`（SSE 推荐）/ `?token=` / POST JSON Body 的 `access_token`|`token`。
 
 ```bash
 curl -H "Authorization: Bearer <token>" "http://127.0.0.1:5032/api/v1/sessions"

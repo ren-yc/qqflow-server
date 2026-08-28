@@ -329,6 +329,8 @@ async fn fake_db_media_endpoint_serves_bytes() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
 
@@ -420,6 +422,8 @@ async fn fake_db_media_fallback_registers_and_serves() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
     let resp = app
@@ -516,6 +520,8 @@ async fn fake_db_media_export_serves_exported_bytes() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(export_root.clone()),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
 
@@ -760,6 +766,8 @@ async fn client_registers_account_with_key_and_db_path() {
         ),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
 
@@ -989,10 +997,11 @@ fn real_db_groundtruth() {
                 let blobs = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
                 for b in blobs.flatten() {
                     for seg in qqflow_server::parser::proto::parse_msg_body(&b) {
-                        if matches!(seg.content_type, Some(2) | Some(4) | Some(5)) {
-                            if let Some(m) = &seg.media {
-                                media_segs += 1;
-                                if let Some(p) = &m.local_path {
+                        if matches!(seg.content_type, Some(2) | Some(4) | Some(5))
+                            && let Some(m) = &seg.media
+                        {
+                            media_segs += 1;
+                            if let Some(p) = &m.local_path {
                                     with_local += 1;
                                     if std::path::Path::new(p).exists() {
                                         local_exists += 1;
@@ -1005,7 +1014,6 @@ fn real_db_groundtruth() {
                                     );
                                     samples += 1;
                                 }
-                            }
                         }
                     }
                 }
@@ -1283,13 +1291,11 @@ fn real_db_groundtruth() {
                 for tbl in ["group_msg_table", "c2c_msg_table"] {
                     if let Ok(mut st) = conn.prepare(&format!(
                         "SELECT \"40093\" FROM {tbl} WHERE \"40020\" = ?1 AND \"40093\" != '' LIMIT 1"
-                    )) {
-                        if let Ok(mut rows) = st.query_map([uid], |r| r.get::<_, String>(0)) {
-                            if let Some(Ok(n)) = rows.next() {
-                                msg_nick = n;
-                                break;
-                            }
-                        }
+                    )) && let Ok(mut rows) = st.query_map([uid], |r| r.get::<_, String>(0))
+                        && let Some(Ok(n)) = rows.next()
+                    {
+                        msg_nick = n;
+                        break;
                     }
                 }
                 if msg_nick.is_empty() {

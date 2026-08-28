@@ -23,7 +23,7 @@ pub struct Params {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 
@@ -141,7 +141,17 @@ pub async fn handler(
         "sync": {
             "hasMore": has_more,
             "nextSince": if has_more { next_since } else { watermark },
-            "nextOffset": if has_more { start.saturating_add(page.len()) } else { 0 },
+            // Both cursors are meant to be echoed back verbatim, so they must
+            // not skip the same rows twice. `nextSince` is exclusive and the
+            // page ends on a complete ts group, so re-filtering with it drops
+            // exactly the rows already served — leaving the next unseen row at
+            // offset 0. `nextOffset` therefore only carries weight in the
+            // degenerate case where the timestamp could not advance at all.
+            "nextOffset": if has_more && next_since <= since.unwrap_or(i64::MIN) {
+                start.saturating_add(page.len())
+            } else {
+                0
+            },
             "watermark": watermark,
         }
     })))

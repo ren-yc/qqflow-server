@@ -433,7 +433,7 @@ mod tests {
         let p = extract_message(&body);
         assert_eq!(p.msg_type, MsgType::Image, "media type wins");
         assert_eq!(p.content, "看这个", "caption kept as content");
-        assert_eq!(p.media.as_ref().and_then(MediaInfo::key).as_deref(), Some("aabbccddeeff00112233445566778899"));
+        assert_eq!(p.media.as_ref().and_then(MediaInfo::key), Some("aabbccddeeff00112233445566778899"));
     }
 
     #[test]

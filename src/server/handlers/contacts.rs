@@ -21,7 +21,7 @@ pub struct Params {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 

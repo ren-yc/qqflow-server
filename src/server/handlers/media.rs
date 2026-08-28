@@ -24,7 +24,7 @@ use crate::server::error::ApiError;
 
 #[derive(Debug, Default, Deserialize, serde::Serialize)]
 pub struct Params {
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 

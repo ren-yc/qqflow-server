@@ -262,7 +262,7 @@ mod tests {
     fn resolve_relative_path_under_root_and_rejects_dotdot() {
         let root = temp_dir("resolve");
         let media_root = root.join("nt_data");
-        std::fs::create_dir_all(&media_root.join("Pic")).unwrap();
+        std::fs::create_dir_all(media_root.join("Pic")).unwrap();
         let f = media_root.join("Pic").join("x.png");
         std::fs::write(&f, b"x").unwrap();
         // canonicalize may return a \\?\ verbatim prefix on Windows.

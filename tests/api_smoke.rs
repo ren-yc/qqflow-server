@@ -42,6 +42,8 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
             std::env::temp_dir().join(format!("qqflow_smoke_export_{}", unique_suffix())),
         ),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
     })
 }
 
@@ -175,6 +177,70 @@ async fn auth_required() {
 async fn sync_no_auth() {
     let (s, _) = get("/api/v1/sync", false).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
+}
+
+/// All five documented auth transports must be accepted (weflow-server
+/// parity). `X-Api-Key` and the `token` query/body spelling were previously
+/// rejected, so a client written against the shared contract got a 401 on two
+/// of the five forms the docs promise.
+#[tokio::test]
+async fn every_auth_transport_is_accepted() {
+    const TOKEN: &str = "test-token-123456";
+
+    // 1. Authorization: Bearer  2. X-Api-Key
+    for (name, value) in [("authorization", format!("Bearer {TOKEN}")), ("x-api-key", TOKEN.into())] {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions")
+                    .method("GET")
+                    .header(name, value.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "header transport {name} rejected");
+    }
+
+    // 3. ?access_token=   4. ?token=
+    for key in ["access_token", "token"] {
+        let (s, _) = call(
+            build_router(test_state()),
+            &format!("/api/v1/sessions?{key}={TOKEN}"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "query transport ?{key}= rejected");
+    }
+
+    // 5. the same two keys inside a POST JSON body
+    for key in ["access_token", "token"] {
+        let (s, _) = post_json(
+            build_router(test_state()),
+            "/api/v1/sessions",
+            json!({ key: TOKEN }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body transport {key} rejected");
+    }
+
+    // A wrong token on any transport must still be a 401.
+    let (s, _) = call(build_router(test_state()), "/api/v1/sessions?token=wrong").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong ?token= must not pass");
+    let app = build_router(test_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/sessions")
+                .method("GET")
+                .header("x-api-key", "wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong X-Api-Key must not pass");
 }
 
 #[tokio::test]
@@ -803,6 +869,51 @@ async fn chatlab_pull_boundary_second_pages_cleanly() {
             .collect()
     };
     assert!(ids(msgs1).is_disjoint(&ids(msgs2)), "pages must not overlap");
+}
+
+/// A client that echoes BOTH cursors back verbatim must still see every row.
+///
+/// `chatlab_pull_boundary_second_pages_cleanly` resumes with `nextSince`
+/// alone, so it cannot observe this: when `nextOffset` also advanced, the
+/// exclusive `since` filter already dropped the served rows and the offset
+/// then skipped the same count a second time — silently losing every row in
+/// between. Driving the documented cursor pair is the only shape that catches
+/// it, so this test paginates at `limit=1` and asserts a full drain.
+#[tokio::test]
+async fn chatlab_pull_drains_when_client_echoes_both_cursors() {
+    let app = build_router(ts_boundary_state());
+    let mut since: Option<i64> = None;
+    let mut offset: u64 = 0;
+    let mut ids: Vec<String> = Vec::new();
+    let mut pages = 0;
+
+    loop {
+        pages += 1;
+        assert!(pages <= 10, "cursor must terminate; looped {pages} times");
+        let mut url = format!(
+            "/api/v1/sessions/10001/messages?limit=1&offset={offset}&access_token=test-token-123456"
+        );
+        if let Some(s) = since {
+            url.push_str(&format!("&since={s}"));
+        }
+        let (status, v) = call(app.clone(), &url).await;
+        assert_eq!(status, StatusCode::OK);
+
+        for m in v["messages"].as_array().unwrap() {
+            ids.push(m["platformMessageId"].as_str().unwrap().to_string());
+        }
+        if !v["sync"]["hasMore"].as_bool().unwrap() {
+            assert_eq!(v["sync"]["nextOffset"], 0, "drained cursor resets offset");
+            break;
+        }
+        since = Some(v["sync"]["nextSince"].as_i64().unwrap());
+        offset = v["sync"]["nextOffset"].as_u64().unwrap();
+    }
+
+    // The fixture holds 7 rows: 5 sharing one second, then 2 in the next.
+    assert_eq!(ids.len(), 7, "every row served exactly once, got {ids:?}");
+    let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), 7, "no duplicates across pages: {ids:?}");
 }
 
 #[tokio::test]

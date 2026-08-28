@@ -210,6 +210,12 @@ pub struct AppState {
     pub export_root: Arc<std::path::PathBuf>,
     /// Base URL for exported media links (`http://{host}:{port}`).
     pub base_url: Arc<String>,
+    /// SSE replay history for Last-Event-ID (1000 items / 10 min TTL).
+    pub history: Arc<parking_lot::Mutex<crate::server::HistoryBuf>>,
+    /// Shutdown broadcast. Live SSE streams subscribe so they can end
+    /// themselves rather than holding the graceful drain open for the whole
+    /// grace period.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(test)]
@@ -339,14 +345,14 @@ mod tests {
         store.uid_names.insert("u_a".into(), "张三".into());
         store
             .group_cards
-            .insert(conv_key(ChatType::Group, "10001").into(), {
+            .insert(conv_key(ChatType::Group, "10001"), {
                 let mut m = HashMap::new();
                 m.insert("u_a".to_string(), "1群名片".to_string());
                 m
             });
         store
             .group_cards
-            .insert(conv_key(ChatType::Group, "10002").into(), {
+            .insert(conv_key(ChatType::Group, "10002"), {
                 let mut m = HashMap::new();
                 m.insert("u_a".to_string(), "2群名片".to_string());
                 m

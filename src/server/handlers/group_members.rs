@@ -29,7 +29,7 @@ pub struct Params {
     pub with_counts: Option<String>, // alias
     #[serde(default)]
     pub force_refresh: Option<String>,
-    #[serde(default, rename = "access_token")]
+    #[serde(default, rename = "access_token", alias = "token")]
     pub access_token: Option<String>,
 }
 

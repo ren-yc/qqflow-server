@@ -23,7 +23,7 @@ pub struct Params {
     pub offset: usize,
     #[serde(default)]
     pub format: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 

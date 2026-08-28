@@ -16,11 +16,13 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 ## 鉴权规范
 
-除健康检查接口外，所有 `/api/v1/*` 接口均受 Token 保护。支持三种传参方式（任选其一）：
+除健康检查接口外，所有 `/api/v1/*` 接口均受 Token 保护。支持五种传参方式（任选其一）：
 
 1. **HTTP Header (推荐)**: `Authorization: Bearer <您的Token>`
-2. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
-3. **JSON Body**: `{"access_token": "<您的Token>"}`（仅限 POST 请求；SSE 接口除外，仅支持前两种）
+2. **HTTP Header**: `X-Api-Key: <您的Token>`
+3. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
+4. **Query 参数**: `?token=<您的Token>`（与 3 等价，别名）
+5. **JSON Body**: `{"access_token": "<您的Token>"}` 或 `{"token": "<您的Token>"}`（仅限 POST 请求；SSE 接口除外，仅支持前四种 Header/Query 方式）
 
 ## 接口列表
 
@@ -84,7 +86,7 @@ GET /api/v1/health
 
 ## 1.1 注册账号（POST /api/v1/accounts）
 
-客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（三通道）；**不受就绪门控**。
+客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（五通道）；**不受就绪门控**。
 
 **请求**
 
@@ -159,9 +161,11 @@ GET /api/v1/push/messages
 ### 说明
 
 - 响应类型为 `text/event-stream`
-- 连接建立后**先收到一个 `sync` 事件**（qqflow-server 扩展，携带当前 rowid 水位线），之后是 `message.new` / `message.revoke`
-- KeepAlive 每 15 秒发送 `ping`
+- 连接建立后**先收到一个 `ready` 事件**（`{"status":"ok"}`，表示流已就绪，对齐 WeFlow 契约），随后重放断线期间错过的事件（见下），再收到 `sync` 事件（qqflow-server 扩展，携带当前 rowid 水位线），之后是 `message.new` / `message.revoke`
+- **断线续传（Last-Event-ID 重放）**：每个 `message.new` / `message.revoke` 帧都带 `id:`（服务端单调递增序号）。客户端重连时携带 `Last-Event-ID: <序号>` 请求头（或 `?last_event_id=<序号>` 查询参数——浏览器 `EventSource` 无法设置自定义头），服务端重放序号之后、10 分钟 TTL 窗口内的历史事件；窗口外/无序号则从当前水位线重新开始。事件缓冲上限 1000 条
+- KeepAlive 每 25 秒发送 `ping`
 - 订阅端落后于广播缓冲（1024 条）时会重新收到 `sync` 事件对齐
+- 进程收到退出信号（Ctrl+C）时，服务端主动结束所有 SSE 流——客户端看到连接正常关闭，不会等到 3 秒宽限期超时
 - 建议接收端按 `event + rawid` 去重
 - **媒体路径不出现在推送里**：`media` 对象为无路径元数据视图（`localPath` 永不下发——QQ 缓存路径多为本机失效路径且无下游可用性）；媒体字节一律经 `GET /api/v1/media/{id}` 获取，键取 `mediaId`（仅当服务端已注册可读取的本地缓存时携带，与 messages 的 `mediaId` 同一规则，见 §3/§3.1）
 
@@ -169,7 +173,7 @@ GET /api/v1/push/messages
 
 | 字段 | 说明 |
 | ---- | ---- |
-| `event` | `sync` / `message.new` / `message.revoke` |
+| `event` | `ready` / `sync` / `message.new` / `message.revoke`（`ready` 仅携带 `status`） |
 | `sessionId` | 会话 ID：群聊为群号，私聊为对方 UID（`u_` 前缀） |
 | `sessionType` | `group` 或 `private` |
 | `rawid` | 消息 rowid（字符串） |
@@ -189,9 +193,13 @@ curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=YOUR_TOKEN"
 ```
 
 ```text
+event: ready
+data: {"status":"ok"}
+
 event: sync
 data: {"event":"sync","sessionId":"","sessionType":"","rawid":"","content":"","timestamp":1782864000,"lastRowidGroup":1234567890123,"lastRowidC2c":9876543210987}
 
+id: 1
 event: message.new
 data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupName":"10001","rawid":"1234567890123","sourceName":"张三","content":"你好","timestamp":1782864123}
 ```

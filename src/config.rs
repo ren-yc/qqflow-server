@@ -73,6 +73,7 @@ fn help() -> String {
                                  绑定 0.0.0.0/:: 时回退 127.0.0.1；局域网访问请显式指定）\n\
        --show-token              打印已存的 API token 并退出\n\
        -h, --help                显示本帮助\n\
+       -V, --version             打印版本号\n\
      \n\
      账号与密钥不在命令行提供：启动后由客户端 POST /api/v1/accounts\n\
      传入 {qq, key, db_path} 注册账号。"
@@ -80,21 +81,34 @@ fn help() -> String {
 }
 
 /// Parse command-line arguments (skip the program name).
-/// `Ok(None)` when `-h`/`--help` was given (help already printed; the
-/// caller should exit 0).
+/// `Ok(None)` when `-h`/`--help`/`-V`/`--version` was given (help/version
+/// already printed; the caller should exit 0).
 pub fn load() -> Result<Option<Config>> {
     parse_args(std::env::args().skip(1).collect())
 }
 
-/// Parse `--flag value` pairs (separate from `load` so tests can drive it).
-/// `Ok(None)` when `-h`/`--help` was given (help already printed to stdout).
+/// Parse `--flag value` / `--flag=value` pairs (separate from `load` so
+/// tests can drive it with an explicit argv instead of the process
+/// environment). `Ok(None)` when `-h`/`--help`/`-V`/`--version` was given
+/// (already printed; the caller should exit 0).
 pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
     let mut cfg = Config::default();
     let mut i = 0;
     while i < args.len() {
-        let flag = args[i].clone();
+        let arg = args[i].clone();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (arg, None),
+        };
+
+        // Value-less switches first, so `--show-token` never consumes the
+        // following argument.
         if flag == "-h" || flag == "--help" {
             println!("{}", help());
+            return Ok(None);
+        }
+        if flag == "-V" || flag == "--version" {
+            println!("qqflow-server {}", env!("CARGO_PKG_VERSION"));
             return Ok(None);
         }
         if flag == "--show-token" {
@@ -102,10 +116,33 @@ pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
             i += 1;
             continue;
         }
-        let value = args
-            .get(i + 1)
-            .ok_or_else(|| anyhow::anyhow!("参数 {flag} 缺少值\n{}", help()))?
-            .clone();
+
+        // Everything else takes a value. A missing value is an error rather
+        // than a silent fall back to the default: `--port` with nothing after
+        // it used to start the server on 5032 as if nothing were wrong.
+        let value = match inline {
+            Some(v) => {
+                if v.is_empty() {
+                    bail!("参数 {flag} 的值为空\n{}", help());
+                }
+                i += 1;
+                v
+            }
+            None => {
+                let next = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("参数 {flag} 缺少值\n{}", help()))?
+                    .clone();
+                // A flag-shaped value almost always means the real value was
+                // forgotten (`--host --log debug` would set host="--log").
+                if next.starts_with("--") {
+                    bail!("参数 {flag} 缺少值（其后紧跟的是另一个参数 {next}）\n{}", help());
+                }
+                i += 2;
+                next
+            }
+        };
+
         match flag.as_str() {
             "--port" => {
                 cfg.port = value
@@ -133,7 +170,6 @@ pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
             "--base-url" => cfg.base_url = Some(value),
             other => bail!("未知参数: {other}\n{}", help()),
         }
-        i += 2;
     }
     Ok(Some(cfg))
 }
@@ -246,20 +282,47 @@ mod tests {
     }
 
     #[test]
+    fn inline_value_syntax_supported() {
+        // weflow parity: `--flag=value` must work alongside `--flag value`.
+        let cfg = parse_args(
+            ["--port=6001", "--log=warn"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .unwrap()
+        .expect("config");
+        assert_eq!(cfg.port, 6001);
+        assert_eq!(cfg.log, "warn");
+    }
+
+    #[test]
     fn show_token_switch_parses_without_value() {
-        let cfg = parse_args(["--show-token"].iter().map(|s| s.to_string()).collect())
-            .unwrap()
-            .expect("config");
+        // The switch must not swallow the argument that follows it.
+        let cfg = parse_args(
+            ["--show-token", "--port", "6002"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .unwrap()
+        .expect("config");
         assert!(cfg.show_token, "--show-token must set the flag");
+        assert_eq!(cfg.port, 6002, "--show-token must not consume --port");
         // and normal startup keeps it off
         let cfg = parse_args(vec![]).unwrap().expect("config");
         assert!(!cfg.show_token);
     }
 
     #[test]
-    fn help_prints_and_returns_none_without_exiting() {
-        let args: Vec<String> = ["--help"].iter().map(|s| s.to_string()).collect();
-        assert!(parse_args(args).unwrap().is_none(), "--help must not start the server");
+    fn help_and_version_print_and_return_none_without_exiting() {
+        for flag in ["--help", "-h", "--version", "-V"] {
+            let args: Vec<String> = [flag].iter().map(|s| s.to_string()).collect();
+            assert!(
+                parse_args(args).unwrap().is_none(),
+                "{flag} must not start the server"
+            );
+        }
     }
 
     #[test]
@@ -276,5 +339,34 @@ mod tests {
 
         let args: Vec<String> = ["--port"].iter().map(|s| s.to_string()).collect();
         assert!(parse_args(args).is_err(), "missing value must be an error");
+    }
+
+    #[test]
+    fn missing_value_is_an_error_not_a_silent_default() {
+        // Trailing flag with nothing after it.
+        let args: Vec<String> = ["--port"].iter().map(|s| s.to_string()).collect();
+        let err = parse_args(args).unwrap_err();
+        assert!(format!("{err:#}").contains("缺少值"), "got: {err:#}");
+        // Empty inline value.
+        let args: Vec<String> = ["--host="].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(args).is_err(), "--host= must be rejected");
+    }
+
+    #[test]
+    fn flag_shaped_value_is_rejected() {
+        // `--host --log debug` must not silently set host to "--log".
+        for args in [
+            // Would swallow `--log` as host's value and exit successfully.
+            vec!["--host", "--log"],
+            // Would swallow `--log`, then drift into "--log"'s value slot.
+            vec!["--host", "--log", "debug"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let err = parse_args(args).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("缺少值"),
+                "got: {err:#} — a flag-shaped value must be an error"
+            );
+        }
     }
 }

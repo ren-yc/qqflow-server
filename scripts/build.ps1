@@ -25,9 +25,21 @@ if (-not $vcvars) {
         }
     }
 }
+# Legacy fallback: vswhere is missing on some installs (and absent entirely
+# for VS build-tools-only layouts), so probe the default install paths.
+# Newest first, both Program Files roots, all editions (weflow-server parity).
 if (-not $vcvars) {
-    $fallback = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-    if (Test-Path $fallback) { $vcvars = $fallback }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+    foreach ($root in $roots) {
+        foreach ($ver in @("18", "2022", "17", "2019", "16")) {
+            foreach ($ed in @("Community", "Professional", "Enterprise", "BuildTools", "Preview")) {
+                $candidate = Join-Path $root "Microsoft Visual Studio\$ver\$ed\VC\Auxiliary\Build\vcvars64.bat"
+                if (Test-Path $candidate) { $vcvars = $candidate; break }
+            }
+            if ($vcvars) { break }
+        }
+        if ($vcvars) { break }
+    }
 }
 if (-not $vcvars) {
     throw "vcvars64.bat not found. Install Visual Studio with the 'Desktop development with C++' workload, or set QQFLOW_VCVARS to your vcvars64.bat."

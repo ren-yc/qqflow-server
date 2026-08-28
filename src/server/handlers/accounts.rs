@@ -29,7 +29,7 @@ pub struct Params {
     pub qq: Option<String>,
     pub key: Option<String>,
     pub db_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 

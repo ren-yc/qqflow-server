@@ -24,7 +24,7 @@ use super::{authorized, merge_body};
 pub struct Params {
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 

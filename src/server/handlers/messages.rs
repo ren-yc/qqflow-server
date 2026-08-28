@@ -53,7 +53,7 @@ pub struct Params {
     /// Recognized but inert in v1: QQ emoji carry display text, no files.
     #[serde(default)]
     pub emoji: FlexBool,
-    #[serde(default)]
+    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 

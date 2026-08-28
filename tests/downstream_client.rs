@@ -85,6 +85,8 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
         ),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_client_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
     Some((app, state, qq, root, key))
@@ -251,10 +253,10 @@ async fn downstream_client_real_db() {
         // Structured media rides on image/voice/video messages; mediaId is
         // present ONLY when the store registered a local cache path (the
         // "fetchable" promise — absent means /api/v1/media/{id} would 404).
-        if m.get("media").is_some() {
-            if let Some(id) = m["mediaId"].as_str() {
-                assert!(!id.is_empty(), "mediaId non-empty when present");
-            }
+        if m.get("media").is_some()
+            && let Some(id) = m["mediaId"].as_str()
+        {
+            assert!(!id.is_empty(), "mediaId non-empty when present");
         }
         assert!(
             m["mediaId"].is_null() || !m["media"].is_null(),

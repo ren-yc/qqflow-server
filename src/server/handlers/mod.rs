@@ -85,8 +85,12 @@ pub fn parse_time_bound(s: &str, is_end: bool) -> Option<i64> {
     s.parse::<i64>().ok()
 }
 
-/// Verify the token from any transport; SSE and POST use `?access_token=`
-/// or JSON body, plain requests may use the Authorization header.
+/// Verify the token from any of the five accepted transports (see
+/// [`crate::server::auth`]): the `Authorization: Bearer` / `X-Api-Key`
+/// headers, or `access_token` / `token` in the query string or POST JSON
+/// body. `query_token` is whichever of the latter the caller's `Params`
+/// resolved — `#[serde(alias = "token")]` folds the two key spellings into
+/// one field, and `merge_body` folds query and body into one struct.
 pub fn authorized(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> bool {
     let header_token = crate::server::auth::from_headers(headers);
     [query_token, header_token.as_deref()]
@@ -125,6 +129,14 @@ where
                 m.insert(k.clone(), val.clone());
             }
         }
+        // Drop the None-defaults (`access_token: null`, ...) that the query
+        // struct serialized. With `#[serde(alias = "token")]`, leaving them
+        // in makes a body `{"token": "abc"}` collide with the null
+        // `access_token` key and serde rejects the merge as a duplicate
+        // field — the exact 400 the body-transport test caught. Query keys
+        // are never null (absent keys serialize as null only for `Option`
+        // defaults; body nulls are skipped above), so this is lossless.
+        m.retain(|_, v| !v.is_null());
     }
     serde_json::from_value(merged).map_err(|e| ApiError::bad_request(format!("body 参数无效: {e}")))
 }

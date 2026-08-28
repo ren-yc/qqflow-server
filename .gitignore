@@ -1,11 +1,15 @@
 # Rust build artifacts
 /target
+/dist
 
 # Build logs
 *.log
 
 # Local data (keys/token created at runtime)
+# all_keys.json is the map shape the real-db tests accept; ignored so a copy
+# dropped in the repo root can never be committed.
 keys.json
+all_keys.json
 
 # IDE / editor
 .idea/
@@ -23,3 +27,7 @@ Desktop.ini
 
 # Config files
 qqflow-server.json
+
+# Editor/tool leftovers
+*.bak
+*.json.tmp
