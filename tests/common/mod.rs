@@ -436,20 +436,45 @@ pub async fn post_json(
     (status, json)
 }
 
-/// Poll /health until account `qq` reports state `want`; returns the whole
-/// health JSON. Panics when the account hits `error` (with its reason) or
-/// the deadline passes.
+/// DELETE through `app` with optional extra headers; returns (status, json).
+/// No body — the deregistration route takes its parameters from the path and
+/// the query string (its POST alias is what carries a JSON body).
+pub async fn delete_json(
+    app: axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().uri(uri).method("DELETE");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let resp = app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 << 20).await.unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+/// Poll `GET /api/v1/accounts` until account `qq` reports state `want`;
+/// returns the whole detail JSON. Panics when the account hits `error`
+/// (with its reason) or the deadline passes.
+///
+/// Per-account state lives behind the token: `/health` reports only a
+/// coarse `account` phase and never names an account.
 pub async fn wait_account_state(
     app: &axum::Router,
+    token: &str,
     qq: &str,
     want: &str,
     timeout: Duration,
 ) -> Value {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let (status, v) = get_json(app.clone(), "/health", &[]).await;
-        assert_eq!(status, StatusCode::OK);
-        for a in v["accounts"].as_array().unwrap() {
+        let (status, v) =
+            get_json(app.clone(), "/api/v1/accounts", &[("authorization", &format!("Bearer {token}"))])
+                .await;
+        assert_eq!(status, StatusCode::OK, "account detail: {v}");
+        for a in v["accounts"].as_array().expect("accounts array") {
             if a["qq"] != qq {
                 continue;
             }
@@ -463,4 +488,14 @@ pub async fn wait_account_state(
         assert!(std::time::Instant::now() < deadline, "account {qq} did not reach {want}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// The single account entry for `qq` from a `wait_account_state` result.
+pub fn account_entry<'a>(detail: &'a Value, qq: &str) -> &'a Value {
+    detail["accounts"]
+        .as_array()
+        .expect("accounts array")
+        .iter()
+        .find(|a| a["qq"] == qq)
+        .unwrap_or_else(|| panic!("account {qq} missing from {detail}"))
 }

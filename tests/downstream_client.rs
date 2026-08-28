@@ -92,17 +92,10 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
     Some((app, state, qq, root, key))
 }
 
-/// Poll /health until the account is ready; returns its indexed message count.
-async fn wait_ready(app: &axum::Router, qq: &str) -> usize {
-    let v = common::wait_account_state(app, qq, "ready", Duration::from_secs(120)).await;
-    v["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["qq"] == qq)
-        .unwrap()["message_count"]
-        .as_u64()
-        .unwrap() as usize
+/// Poll the account detail endpoint until ready; returns the indexed count.
+async fn wait_ready(app: &axum::Router, token: &str, qq: &str) -> usize {
+    let v = common::wait_account_state(app, token, qq, "ready", Duration::from_secs(120)).await;
+    common::account_entry(&v, qq)["message_count"].as_u64().unwrap() as usize
 }
 
 /// Downstream-client GET (optional extra headers, e.g. Bearer auth).
@@ -136,12 +129,13 @@ async fn downstream_client_real_db() {
     };
     let token = state.token.as_str();
 
-    // ---- 0. boot state: zero accounts, not ready ------------------------
+    // ---- 0. boot state: nothing bound, not ready ------------------------
     let (s, v) = client_get(app.clone(), "/health", &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["status"], "starting");
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["accounts"].as_array().unwrap().len(), 0);
+    assert_eq!(v["account"], "unregistered");
+    assert!(v.get("accounts").is_none(), "/health must not list accounts");
 
     // ---- 0.1 register the account (client-driven startup) ---------------
     let (s, v) = client_post(
@@ -165,18 +159,43 @@ async fn downstream_client_real_db() {
     assert!(resolved.len() >= root.len(), "resolved path extends the supplied root");
 
     // ---- 1. health: ready after the background index build --------------
-    let indexed = wait_ready(&app, &qq).await;
+    let indexed = wait_ready(&app, token, &qq).await;
     assert!(indexed > 0, "real db must have messages");
     println!("[CLIENT] indexed {indexed} messages");
     let (s, v) = client_get(app.clone(), "/health", &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["status"], "ok");
+    assert_eq!(v["account"], "ready");
+    // Unauthenticated: no account identity, no counts, no paths.
+    let health = v.to_string();
+    assert!(!health.contains(&qq), "/health must not disclose the account");
+    assert_eq!(v.as_object().unwrap().len(), 3, "/health carries exactly status+version+account");
+
+    // ---- 1.1 account detail (token-protected) ---------------------------
+    let (s, v) = client_get(
+        app.clone(),
+        "/api/v1/accounts",
+        &[("authorization", &format!("Bearer {token}"))],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["success"], true);
     let accounts = v["accounts"].as_array().unwrap();
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0]["qq"], qq);
     assert_eq!(accounts[0]["state"], "ready");
     assert!(accounts[0].get("error").is_none());
     assert_eq!(accounts[0]["message_count"].as_u64().unwrap() as usize, indexed);
+    assert!(
+        accounts[0]["db_path"].as_str().unwrap().ends_with("nt_msg.db"),
+        "detail echoes the resolved database"
+    );
+
+    // Same endpoint without a token: 401, no detail.
+    let (s, v) = client_get(app.clone(), "/api/v1/accounts", &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["success"], false);
+    assert!(v.get("accounts").is_none());
 
     // ---- 2. auth: business endpoints reject missing tokens --------------
     let (s, v) = client_get(app.clone(), "/api/v1/messages?talker=x", &[]).await;

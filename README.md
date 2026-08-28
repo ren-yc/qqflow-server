@@ -70,7 +70,7 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 
 命令行参数：`--port`（默认 5032）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）/ `--media-export-dir`（`media=1` 的媒体导出根目录，默认 `<data-dir>/api-media`）/ `--base-url`（`mediaUrl` 链接的 base URL，默认 `http://<host>:<port>`；绑定 `0.0.0.0`/`::` 时自动回退 `127.0.0.1`，局域网客户端请显式指定）。
 
-**账号为客户端驱动**：启动后服务以空账号状态运行（`/health` 列出平台扫描发现的账号，状态 `awaiting_key`）；密钥不由配置提供，由客户端运行时注册（仅内存保存，不持久化）：
+**账号为客户端驱动**：启动后服务以空账号状态运行（`/health` 报 `account: "unregistered"`；账号明细走需鉴权的 `GET /api/v1/accounts`）；密钥不由配置提供，由客户端运行时注册（仅内存保存，不持久化）：
 
 ```bash
 curl -X POST http://127.0.0.1:5032/api/v1/accounts \
@@ -80,7 +80,9 @@ curl -X POST http://127.0.0.1:5032/api/v1/accounts \
 
 `db_path` 可为 `nt_msg.db` 文件路径或 Tencent Files 风格目录（省略则复用扫描到的路径）；密钥错误时账号进入 `error` 状态，重新注册即可恢复。
 
-响应形如 `{"success":true,"qq":"<QQ号>","state":"accepted","status":"indexing","db_path":"<解析到的 nt_msg.db>"}`：`state` 是本次注册的结果、`status` 是账号状态机当前值（与 `/health` 同枚举）、`db_path` 是服务端实际解析到的库文件。注意 `status:"indexing"` 只表示密钥**格式**合法、后台构建已启动，真正的解密验证在构建中完成，客户端仍需轮询 `/health` 到 `ready`。
+响应形如 `{"success":true,"qq":"<QQ号>","state":"accepted","status":"indexing","db_path":"<解析到的 nt_msg.db>"}`：`state` 是本次注册的结果、`status` 是账号状态机当前值（与 `GET /api/v1/accounts` 同枚举）、`db_path` 是服务端实际解析到的库文件。注意 `status:"indexing"` 只表示密钥**格式**合法、后台构建已启动，真正的解密验证在构建中完成，客户端仍需轮询到 `ready`。
+
+**同时只能绑定一个账号**（内存索引没有账号维度）：第二个账号注册返回 `state: "account_conflict"` 而不是覆写，换账号需先注销 —— `DELETE /api/v1/accounts/{qq}`（路径里的 qq 是安全联锁；`?purge_media=1` 才会删除已导出的媒体，且只删服务自己写的 `<exportPath>/<talker>/<images|voices|videos|emojis>`）。`error` 状态不释放绑定，但同一账号可直接重试注册。
 
 默认 `http://127.0.0.1:5032`，token 生成后存入**系统凭据库**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service），**仅首次生成时**打印到启动日志；之后可用 `--show-token` 随时获取。完整接口文档见 `docs/qqflow-server-api.md`。
 
@@ -88,8 +90,10 @@ curl -X POST http://127.0.0.1:5032/api/v1/accounts \
 
 | 端点 | 说明 |
 |---|---|
-| `GET/POST /health`、`/api/v1/health` | 健康检查（免鉴权） |
+| `GET/POST /health`、`/api/v1/health` | 健康检查（免鉴权，标量：`status` + `version` + `account`） |
 | `POST /api/v1/accounts` | 注册账号：`qq` + `key` + 可选 `db_path`（客户端驱动启动） |
+| `GET /api/v1/accounts` | 账号明细（需鉴权）：`qq` / `state` / `message_count` / `error` / `db_path` |
+| `DELETE /api/v1/accounts/{qq}` | 注销账号，恢复未注册状态（别名 `POST /api/v1/accounts/{qq}/deregister`；`purge_media` 默认 false） |
 | `GET/POST /api/v1/messages` | `talker` 必填；`limit/offset/start/end/keyword/chatlab/format`；`media`/`meiti` 触发媒体导出，`image`/`tupian`/`voice`/`vioce`/`video`/`emoji` 子开关 |
 | `GET/POST /api/v1/sessions` | 会话列表（`format=chatlab` 输出 ChatLab 形态） |
 | `GET /api/v1/sessions/{id}/messages` | ChatLab Pull 增量同步（`since/end/limit/offset` + `sync` 块） |

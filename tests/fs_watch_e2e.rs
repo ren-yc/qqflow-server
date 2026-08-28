@@ -30,6 +30,7 @@ async fn watch_event_drives_sse_push() {
     let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
     let account = Arc::new(AccountSync::new(
+        FAKE_QQ.into(),
         reader,
         store,
         tx,
@@ -92,6 +93,7 @@ fn fallback_changed_detects_wal_writes() {
     let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
     let account = Arc::new(AccountSync::new(
+        FAKE_QQ.into(),
         reader,
         store,
         tx,
@@ -115,6 +117,116 @@ fn fallback_changed_detects_wal_writes() {
     let rows = account.poll_once().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].content, "兜底轮询新增");
+
+    drop(writer);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deregistration must actually stop the watch task, not just unbind the
+/// account. Registering spawns a watch task that holds an `Arc<AccountSync>`
+/// pointing at the store; if it survived, a later write to the source would
+/// still drive a sync into the store the deregistration had just cleared, and
+/// SSE subscribers would keep receiving messages for an account the server
+/// reports as unregistered.
+///
+/// Goes through the HTTP surface deliberately: the task under test is the one
+/// `POST /api/v1/accounts` spawned, so nothing here can accidentally test a
+/// hand-built watcher instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deregister_stops_the_watch_task() {
+    let dir = std::env::temp_dir().join(format!("qqflow_dereg_watch_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let nt_db = dir.join("nt_db");
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    let src = nt_db.join("nt_msg.db");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(qqflow_server::store::AppState {
+        store: Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default())),
+        events: tokio::sync::broadcast::channel::<Event>(256).0,
+        accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        token: Arc::new("test-token-123456".into()),
+        sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
+        init: qqflow_server::server::AccountRegistry::new(
+            Vec::new(),
+            // Short debounce, no fallback poll: a surviving watch task must be
+            // caught by the file event, and the fallback timer would otherwise
+            // muddy which mechanism fired.
+            WatchConfig { debounce: Duration::from_millis(100), fallback: None },
+            shutdown_rx,
+        ),
+        export_root: Arc::new(dir.join("export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: shutdown_tx,
+    });
+    let app = qqflow_server::server::build_router(state.clone());
+    let auth: &[(&str, &str)] = &[("Authorization", "Bearer test-token-123456")];
+
+    let (s, v) = common::post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        auth,
+        serde_json::json!({"qq": FAKE_QQ, "key": FAKE_KEY, "db_path": src.to_string_lossy()}),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::OK, "registration: {v}");
+    assert_eq!(v["state"], "accepted", "registration: {v}");
+    common::wait_account_state(&app, "test-token-123456", FAKE_QQ, "ready", Duration::from_secs(60))
+        .await;
+    // Let the watcher backend thread attach before the first write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Prove the watch is live first, so the negative assertion below cannot
+    // pass just because the plumbing never worked.
+    let mut rx = state.events.subscribe();
+    common::append_group_row(&writer, 7, "注销前新增-7");
+    common::materialize_source(&nt_db);
+    let ev = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.event == "message.new" {
+                return ev;
+            }
+        }
+    })
+    .await
+    .expect("the watch task is live before deregistration");
+    assert!(ev.content.contains("注销前新增"), "got: {}", ev.content);
+
+    let (s, v) = common::delete_json(
+        app.clone(),
+        &format!("/api/v1/accounts/{FAKE_QQ}"),
+        auth,
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::OK, "deregistration: {v}");
+    assert_eq!(v["state"], "deregistered");
+    assert_eq!(v["index_cleared"], true, "a ready account had an index: {v}");
+    assert!(state.store.read().convs.is_empty(), "index dropped");
+
+    // A fresh subscriber, so the reset baseline the deregistration already
+    // broadcast is not in this receiver's queue.
+    let mut rx = state.events.subscribe();
+    common::append_group_row(&writer, 8, "注销后新增-8");
+    common::materialize_source(&nt_db);
+    // 2 s is ~20x the debounce: a surviving watcher would have fired by now.
+    let leaked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.event == "message.new" {
+                return ev;
+            }
+        }
+    })
+    .await;
+    assert!(
+        leaked.is_err(),
+        "a deregistered account still pushed messages: {:?}",
+        leaked.map(|e| e.content)
+    );
+    assert!(state.store.read().convs.is_empty(), "and wrote nothing into the cleared store");
 
     drop(writer);
     let _ = std::fs::remove_dir_all(&dir);

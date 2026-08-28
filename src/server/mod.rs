@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -23,7 +23,8 @@ use crate::sync;
 use crate::sync::Event;
 use crate::store::{self, index, AppState, Store};
 
-/// Per-account readiness state (serialized as-is into /health).
+/// Per-account readiness state (serialized as-is into the token-protected
+/// `GET /api/v1/accounts`; `/health` reports the coarser [`AccountPhase`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
@@ -43,7 +44,8 @@ impl AccountStatus {
     }
 }
 
-/// Per-account readiness (exposed via /health and used for startup gating).
+/// Per-account readiness (exposed via the authenticated account detail
+/// endpoint and used for startup gating).
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountState {
     pub qq: String,
@@ -51,6 +53,67 @@ pub struct AccountState {
     pub message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// What `/health` may disclose about the bound account — deliberately NOT
+/// [`AccountStatus`].
+///
+/// `/health` is unauthenticated, so it must not reveal which QQ accounts
+/// exist on this machine, how many there are, or where their databases live.
+/// The startup scan seeds one `AwaitingKey` entry per account directory it
+/// finds, which makes the *count* of those entries a disclosure in itself.
+/// This enum has no `AwaitingKey` variant at all, so leaking discovery
+/// results through `/health` is a type error rather than a review item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountPhase {
+    /// No account is bound (nothing registered, or it was deregistered).
+    Unregistered,
+    /// The bound account is building its index.
+    Indexing,
+    /// The bound account is serving.
+    Ready,
+    /// The bound account failed to initialize; re-registering it recovers.
+    Error,
+}
+
+impl From<AccountStatus> for AccountPhase {
+    fn from(s: AccountStatus) -> Self {
+        match s {
+            // Unreachable via `bound_account` (which filters AwaitingKey out),
+            // but mapping it to `Unregistered` keeps the invariant true by
+            // construction for any future caller.
+            AccountStatus::AwaitingKey => Self::Unregistered,
+            AccountStatus::Indexing => Self::Indexing,
+            AccountStatus::Ready => Self::Ready,
+            AccountStatus::Error => Self::Error,
+        }
+    }
+}
+
+/// The one account this server instance is bound to, if any.
+///
+/// The store is a single global index with no account dimension: one set of
+/// conversations, one pair of sync watermarks, one media root. Binding a
+/// second account would overwrite the first one's index and cross-contaminate
+/// watermarks (the two databases have independent rowid spaces), so at most
+/// one account may be past `AwaitingKey` at a time — an invariant the
+/// registration handler enforces by rejecting a second qq.
+///
+/// `AwaitingKey` entries are startup-scan discoveries, not bindings.
+pub fn bound_account(accounts: &[AccountState]) -> Option<&AccountState> {
+    accounts.iter().find(|a| a.state != AccountStatus::AwaitingKey)
+}
+
+/// Outcome of claiming the single account binding — see [`begin_indexing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindOutcome {
+    /// The binding is now held by this qq and `indexing` was set.
+    Bound,
+    /// This same qq is already registered; nothing changed.
+    SameQq(AccountStatus),
+    /// A different qq holds the binding; nothing changed.
+    Occupied { qq: String, status: AccountStatus },
 }
 
 /// One buffered SSE event (WeFlow contract: replay cap 1000, TTL 10 min).
@@ -86,6 +149,18 @@ impl HistoryBuf {
         self.last_id
     }
 
+    /// Drop every buffered event while KEEPING the id counter.
+    ///
+    /// Used by deregistration: the buffered events describe an account that
+    /// no longer exists, so replaying them would hand a reconnecting client
+    /// messages the server can no longer serve. The counter must survive —
+    /// ids are what `Last-Event-ID` resumes from, so restarting at 1 would
+    /// leave a client holding `last-event-id: 500` silently receiving nothing
+    /// until the next 500 events had accumulated.
+    pub fn clear_items(&mut self) {
+        self.items.clear();
+    }
+
     /// Events with id > `since`, still within the TTL window.
     pub fn replay_since(&self, since: u64) -> Vec<(u64, String, serde_json::Value)> {
         let now = std::time::Instant::now();
@@ -101,6 +176,18 @@ impl HistoryBuf {
 pub struct AccountRegistry {
     /// All known accounts: platform-scan results plus client registrations.
     pub accounts_db: Mutex<Vec<DbInfo>>,
+    /// Accounts the STARTUP SCAN found, as opposed to ones a client
+    /// introduced with an explicit `db_path`. Deregistration resets the
+    /// former to `awaiting_key` (the platform will still find them next
+    /// boot, so pretending otherwise until a restart would be a lie) and
+    /// removes the latter outright (nothing on this machine knows about them
+    /// once the client's registration is gone).
+    pub scanned: std::collections::HashSet<String>,
+    /// Bumped by every deregistration. An `init_account` already in flight
+    /// compares the value it started with and abandons its work if it
+    /// changed, so a build cannot install its index into a store that was
+    /// cleared while it ran.
+    pub epoch: std::sync::atomic::AtomicU64,
     /// Watch behavior handed to deferred watch tasks.
     pub watch_cfg: crate::sync::watch::WatchConfig,
     /// Shutdown signal receiver (cloned per deferred watch task).
@@ -115,7 +202,27 @@ impl AccountRegistry {
         watch_cfg: crate::sync::watch::WatchConfig,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
-        Self { accounts_db: Mutex::new(accounts), watch_cfg, shutdown }
+        // Derived here rather than taken as a parameter: the scan results ARE
+        // this argument, so every existing construction site stays correct
+        // without a signature change.
+        let scanned = accounts.iter().map(|a| a.qq.clone()).collect();
+        Self {
+            accounts_db: Mutex::new(accounts),
+            scanned,
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            watch_cfg,
+            shutdown,
+        }
+    }
+
+    /// True when the startup scan discovered this account by itself.
+    pub fn is_scanned(&self, qq: &str) -> bool {
+        self.scanned.contains(qq)
+    }
+
+    /// Forget one client-registered account's database location.
+    pub fn remove_db(&self, qq: &str) {
+        self.accounts_db.lock().retain(|a| a.qq != qq);
     }
 
     /// Account location known for `qq` (startup scan or earlier registration).
@@ -138,7 +245,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health::handler).post(health::handler))
         .route("/api/v1/health", get(health::handler).post(health::handler))
-        .route("/api/v1/accounts", post(accounts::handler))
+        .route("/api/v1/accounts", get(accounts::list_handler).post(accounts::handler))
+        .route("/api/v1/accounts/{qq}", delete(accounts::delete_handler))
+        // POST alias for clients (and proxies) that cannot issue DELETE.
+        .route("/api/v1/accounts/{qq}/deregister", post(accounts::delete_handler))
         .route("/api/v1/messages", get(messages::handler).post(messages::handler))
         .route("/api/v1/media/{id}", get(media::handler).post(media::handler))
         .route(
@@ -166,9 +276,23 @@ fn install_index(store: &Arc<RwLock<Store>>, tx: &broadcast::Sender<Event>, st: 
     let _ = tx.send(Event::sync(wm_g, wm_c, chrono::Utc::now().timestamp()));
 }
 
-/// Insert or update one account's health state entry.
+/// Insert or update one account's state entry, unconditionally.
+///
+/// Test-only: every production write goes through
+/// [`set_account_state_if_current`], which cannot resurrect a deregistered
+/// account.
+#[cfg(test)]
 fn set_account_state(state: &AppState, qq: &str, status: AccountStatus, count: usize, error: Option<String>) {
-    let mut accs = state.accounts.write();
+    write_account_state(&mut state.accounts.write(), qq, status, count, error);
+}
+
+fn write_account_state(
+    accs: &mut Vec<AccountState>,
+    qq: &str,
+    status: AccountStatus,
+    count: usize,
+    error: Option<String>,
+) {
     match accs.iter_mut().find(|a| a.qq == qq) {
         Some(a) => {
             a.state = status;
@@ -184,31 +308,66 @@ fn set_account_state(state: &AppState, qq: &str, status: AccountStatus, count: u
     }
 }
 
-/// Flip an account to `indexing` atomically with the idempotency guard: a
-/// concurrent duplicate registration serializes here and observes the new
-/// state instead of spawning a second initialization. Returns the status
-/// that blocked (already ready / already indexing).
-fn begin_indexing(state: &AppState, qq: &str) -> Option<AccountStatus> {
+/// `set_account_state`, unless a deregistration happened since `epoch` was
+/// read. Returns false when the write was skipped.
+///
+/// The epoch load and the write share one lock acquisition so a
+/// deregistration cannot slip between them: otherwise a build finishing at
+/// that exact moment would re-create the account entry that was just removed,
+/// leaving a `ready` account with no index behind it.
+fn set_account_state_if_current(
+    state: &AppState,
+    qq: &str,
+    epoch: u64,
+    status: AccountStatus,
+    count: usize,
+    error: Option<String>,
+) -> bool {
     let mut accs = state.accounts.write();
+    if state.init.epoch.load(Ordering::SeqCst) != epoch {
+        return false;
+    }
+    write_account_state(&mut accs, qq, status, count, error);
+    true
+}
+
+/// Claim the single account binding for `qq` and flip it to `indexing`.
+///
+/// Both the occupancy check and the flip happen inside one write lock, so
+/// two concurrent registrations for different accounts serialize here and
+/// exactly one wins — the loser sees `Occupied` rather than silently
+/// overwriting the winner's index. A duplicate registration of the *same* qq
+/// observes `SameQq` instead of spawning a second initialization.
+///
+/// An account in `Error` still holds the binding: freeing it on failure would
+/// let one transient decrypt error hand the server to a different account
+/// without anyone asking. Re-registering the same qq recovers; switching
+/// accounts requires an explicit deregistration.
+fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
+    let mut accs = state.accounts.write();
+    if let Some(b) = bound_account(&accs) {
+        if b.qq != qq {
+            return BindOutcome::Occupied { qq: b.qq.clone(), status: b.state };
+        }
+        if matches!(b.state, AccountStatus::Ready | AccountStatus::Indexing) {
+            return BindOutcome::SameQq(b.state);
+        }
+        // Same qq in `error` — fall through and retry the build.
+    }
     match accs.iter_mut().find(|a| a.qq == qq) {
-        Some(a) if a.state.is_ready() => Some(AccountStatus::Ready),
-        Some(a) if matches!(a.state, AccountStatus::Indexing) => Some(AccountStatus::Indexing),
         Some(a) => {
             a.state = AccountStatus::Indexing;
             a.message_count = 0;
             a.error = None;
-            None
         }
-        None => {
-            accs.push(AccountState {
-                qq: qq.to_string(),
-                state: AccountStatus::Indexing,
-                message_count: 0,
-                error: None,
-            });
-            None
-        }
+        None => accs.push(AccountState {
+            qq: qq.to_string(),
+            state: AccountStatus::Indexing,
+            message_count: 0,
+            error: None,
+        }),
     }
+    BindOutcome::Bound
 }
 
 /// Base URL for exported media links (`mediaUrl`). An explicit `override`
@@ -256,6 +415,155 @@ pub fn update_ready(state: &AppState) {
     state.ready.store(all_ready, Ordering::SeqCst);
 }
 
+/// Result of a deregistration attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeregisterOutcome {
+    /// The account was bound and is now gone.
+    Deregistered {
+        /// Its state-machine value immediately before the removal.
+        previous: AccountStatus,
+        /// Whether an index actually existed (a `ready` account, or one whose
+        /// build had already installed rows) — false when the account never
+        /// got past `indexing`.
+        index_cleared: bool,
+        /// Directory count removed under the export root (0 when the purge
+        /// was not requested).
+        purged_dirs: usize,
+    },
+    /// Nothing is bound; there is nothing to deregister.
+    NotRegistered,
+    /// A DIFFERENT account is bound. Deliberately not treated as success:
+    /// the qq in the path is a safety interlock, so a client that has drifted
+    /// out of sync with the server learns that rather than believing it just
+    /// removed something.
+    QqMismatch { occupied_by: String, status: AccountStatus },
+}
+
+/// Exported-media subdirectories the server itself creates, per
+/// `<exportRoot>/<talker>/<kind>/<file>` (see `store::media_export`).
+const EXPORT_KINDS: [&str; 4] = ["images", "voices", "videos", "emojis"];
+
+/// Remove the exported-media directories this account produced, and nothing
+/// else. Returns how many were removed.
+///
+/// Scoped deliberately narrowly: only `<export_root>/<talker>/<kind>` for a
+/// talker this account actually had, and only for the four kinds the exporter
+/// writes. `export_root` comes from `--media-export-dir` and may well be a
+/// directory the operator also keeps other things in, so a recursive delete
+/// of the root is never an option; the talker directory itself is removed
+/// only via `remove_dir`, which refuses to touch it unless it is empty.
+fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
+    let mut removed = 0usize;
+    for talker in talkers {
+        // Talkers come from the database, not the request, but they end up as
+        // a path segment — same containment rule as the media route.
+        let bad = talker.is_empty()
+            || talker == "."
+            || talker == ".."
+            || talker.contains('/')
+            || talker.contains('\\');
+        if bad {
+            tracing::warn!("[deregister] 跳过异常 talker 目录名: {talker:?}");
+            continue;
+        }
+        let dir = root.join(talker);
+        for kind in EXPORT_KINDS {
+            let sub = dir.join(kind);
+            match std::fs::remove_dir_all(&sub) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("[deregister] 清理导出媒体失败 {}: {e}", sub.display()),
+            }
+        }
+        // Empty-only: anything the server did not put there survives.
+        let _ = std::fs::remove_dir(&dir);
+    }
+    removed
+}
+
+/// Undo one account's registration: stop its sync, drop its index, and return
+/// the server to the unregistered state it boots in.
+///
+/// Blocking (file IO when `purge_media` is set, plus the store write lock) —
+/// callers run it on the blocking pool.
+///
+/// The step order is load-bearing:
+/// 1. detach and `stop()` the sync BEFORE clearing, so a pass already past
+///    its read phase discards its rows instead of writing them into the
+///    cleared store;
+/// 2. bump the epoch, so an `init_account` still running abandons its build
+///    instead of installing an index for an account that no longer exists;
+/// 3. clear the store, then the SSE history, then broadcast the reset
+///    baseline — broadcasting before the history clear would wipe the very
+///    event a reconnecting client needs to learn its watermarks went to zero.
+pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> DeregisterOutcome {
+    let previous = {
+        let accs = state.accounts.read();
+        match bound_account(&accs) {
+            None => return DeregisterOutcome::NotRegistered,
+            Some(b) if b.qq != qq => {
+                return DeregisterOutcome::QqMismatch { occupied_by: b.qq.clone(), status: b.state }
+            }
+            Some(b) => b.state,
+        }
+    };
+
+    // 1. Retire the sync side. `stop()` is what actually protects the store;
+    // aborting the watch task only stops FUTURE passes, because a pass
+    // already inside `spawn_blocking` runs to completion regardless.
+    let (account, watcher) = state.sync.unregister(qq);
+    if let Some(a) = &account {
+        a.stop();
+    }
+    if let Some(w) = watcher {
+        w.abort();
+    }
+
+    // 2. Invalidate any in-flight initialization.
+    state.init.epoch.fetch_add(1, Ordering::SeqCst);
+
+    // 3. Drop the index, collecting the talkers to purge while we still can.
+    let (talkers, index_cleared) = {
+        let mut guard = state.store.write();
+        let talkers: Vec<String> = if purge_media {
+            guard.convs.values().map(|c| c.talker.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let had_index = !guard.convs.is_empty();
+        *guard = Store::default();
+        (talkers, had_index)
+    };
+    state.history.lock().clear_items();
+    let _ = state.events.send(Event::sync(0, 0, chrono::Utc::now().timestamp()));
+
+    // 4. Reset the account entry. A scanned account reverts to `awaiting_key`
+    // and keeps its db_path (the platform will find it again next boot, so
+    // claiming otherwise would be false); a client-introduced one disappears
+    // entirely, because nothing on this machine knows about it any more.
+    {
+        let mut accs = state.accounts.write();
+        if state.init.is_scanned(qq) {
+            if let Some(a) = accs.iter_mut().find(|a| a.qq == qq) {
+                a.state = AccountStatus::AwaitingKey;
+                a.message_count = 0;
+                a.error = None;
+            }
+        } else {
+            accs.retain(|a| a.qq != qq);
+            state.init.remove_db(qq);
+        }
+    }
+    update_ready(state);
+
+    let purged_dirs =
+        if purge_media { purge_exported_media(&state.export_root, &talkers) } else { 0 };
+    tracing::info!(
+        "[deregister] QQ {qq} 已注销 (原状态 {previous:?}, 索引已清理 {index_cleared}, 清理媒体目录 {purged_dirs})"
+    );
+    DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs }
+}
+
 /// Full per-account initialization: open the LIVE source read-only, verify
 /// the key, build the index (blocking pool), SSE baseline broadcast,
 /// `AccountSync` registration, watch task. No copies, no mirror dir.
@@ -265,12 +573,26 @@ pub fn update_ready(state: &AppState) {
 /// to `indexing` synchronously so /health shows it immediately.
 pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
     let qq = info.qq.clone();
+    // Deregistration bumps this. Checked again at both points where the build
+    // would become visible, so a registration that is cancelled mid-flight
+    // cannot resurrect itself: the decrypt + index of a large account takes
+    // seconds to minutes, which is plenty of time for a client to change its
+    // mind, and without this the build would install its index into a store
+    // the operator had just emptied.
+    let epoch = state.init.epoch.load(Ordering::SeqCst);
+    let cancelled = {
+        let state = state.clone();
+        move || state.init.epoch.load(Ordering::SeqCst) != epoch
+    };
 
     let store = state.store.clone();
     let tx = state.events.clone();
     let info_for_build = info.clone();
     let key_for_build = key.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<(Arc<Mutex<LiveReader>>, usize)> {
+    let cancelled_in_build = cancelled.clone();
+    // `Ok(None)` = cancelled mid-build (deregistered), as distinct from
+    // `Err` = the build genuinely failed.
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<(Arc<Mutex<LiveReader>>, usize)>> {
         let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build.clone());
         reader.open()?; // verify the key now — bad key → error state (unchanged UX)
         let conn = reader.acquire()?;
@@ -291,19 +613,25 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
             &store::names::KnownKeys::from_store(&st),
         );
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
+        // Cancelled during the build (decrypt + index is the slow part) —
+        // drop the freshly built index instead of installing it.
+        if cancelled_in_build() {
+            return Ok(None);
+        }
         install_index(&store, &tx, st);
-        Ok((Arc::new(Mutex::new(reader)), count))
+        Ok(Some((Arc::new(Mutex::new(reader)), count)))
     })
     .await;
 
     match result {
-        Ok(Ok((reader, count))) => {
+        Ok(Ok(Some((reader, count)))) => {
             let watch_dir = info
                 .path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .to_path_buf();
             let account = Arc::new(sync::AccountSync::new(
+                qq.clone(),
                 reader,
                 state.store.clone(),
                 state.events.clone(),
@@ -312,21 +640,62 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
                 key.clone(),
             ));
             state.sync.register(account.clone());
-            tokio::spawn(sync::watch::spawn(
+            // The handle is kept (not dropped as before) so deregistration can
+            // abort the task — otherwise it holds the source database and its
+            // directory handle open for the rest of the process's life.
+            let watcher = tokio::spawn(sync::watch::spawn(
                 account,
                 watch_dir,
                 state.init.watch_cfg.clone(),
                 state.init.shutdown.clone(),
             ));
-            set_account_state(state, &qq, AccountStatus::Ready, count, None);
+            state.sync.attach_watcher(&qq, watcher);
+            // Registering first and checking after means a deregistration that
+            // lands in this window is guaranteed to be noticed by one side or
+            // the other: either it finds the account in the engine and stops
+            // it, or the epoch check below fails and we retire ourselves.
+            if !set_account_state_if_current(state, &qq, epoch, AccountStatus::Ready, count, None) {
+                let (a, w) = state.sync.unregister(&qq);
+                if let Some(a) = a {
+                    a.stop();
+                }
+                if let Some(w) = w {
+                    w.abort();
+                }
+                tracing::info!("[init] QQ {qq} 初始化完成但已被注销，结果丢弃");
+                return;
+            }
             tracing::info!("[init] QQ {qq} 索引完成: {count} 条消息");
         }
+        Ok(Ok(None)) => {
+            tracing::info!("[init] QQ {qq} 初始化中被注销，已放弃本次构建");
+            return;
+        }
         Ok(Err(e)) => {
-            set_account_state(state, &qq, AccountStatus::Error, 0, Some(format!("{e:#}")));
+            if !set_account_state_if_current(
+                state,
+                &qq,
+                epoch,
+                AccountStatus::Error,
+                0,
+                Some(format!("{e:#}")),
+            ) {
+                tracing::info!("[init] QQ {qq} 初始化失败但已被注销，结果丢弃: {e:#}");
+                return;
+            }
             tracing::warn!("[init] QQ {qq} 初始化失败（重新注册可恢复）: {e:#}");
         }
         Err(e) => {
-            set_account_state(state, &qq, AccountStatus::Error, 0, Some(format!("index task panicked: {e}")));
+            if !set_account_state_if_current(
+                state,
+                &qq,
+                epoch,
+                AccountStatus::Error,
+                0,
+                Some(format!("index task panicked: {e}")),
+            ) {
+                return;
+            }
             tracing::error!("[init] QQ {qq} 初始化任务异常: {e}");
         }
     }
@@ -596,17 +965,278 @@ mod tests {
     #[test]
     fn begin_indexing_flips_once_and_guards_duplicates() {
         let state = state_with_account(AccountStatus::AwaitingKey);
-        assert_eq!(begin_indexing(&state, "10001"), None, "first registration proceeds");
+        assert_eq!(begin_indexing(&state, "10001"), BindOutcome::Bound, "first registration proceeds");
         assert_eq!(
             begin_indexing(&state, "10001"),
-            Some(AccountStatus::Indexing),
+            BindOutcome::SameQq(AccountStatus::Indexing),
             "duplicate registration observes indexing"
         );
         set_account_state(&state, "10001", AccountStatus::Ready, 7, None);
         assert_eq!(
             begin_indexing(&state, "10001"),
-            Some(AccountStatus::Ready),
+            BindOutcome::SameQq(AccountStatus::Ready),
             "ready accounts stay ready"
         );
+    }
+
+    /// The store has no account dimension, so a second qq must be rejected
+    /// rather than silently overwriting the first one's index.
+    #[test]
+    fn begin_indexing_rejects_a_second_account() {
+        let state = state_with_accounts(&[
+            ("10001", AccountStatus::Ready),
+            ("10002", AccountStatus::AwaitingKey),
+        ]);
+        assert_eq!(
+            begin_indexing(&state, "10002"),
+            BindOutcome::Occupied { qq: "10001".into(), status: AccountStatus::Ready },
+            "a scanned second account cannot take the binding"
+        );
+        assert_eq!(
+            state.accounts.read().iter().find(|a| a.qq == "10002").map(|a| a.state),
+            Some(AccountStatus::AwaitingKey),
+            "the rejected account's state is untouched"
+        );
+    }
+
+    /// An `error` account keeps the binding: a transient decrypt failure must
+    /// not let a different account take over. The same qq may retry.
+    #[test]
+    fn error_state_keeps_the_binding_but_allows_retry() {
+        let state = state_with_accounts(&[
+            ("10001", AccountStatus::Error),
+            ("10002", AccountStatus::AwaitingKey),
+        ]);
+        assert_eq!(
+            begin_indexing(&state, "10002"),
+            BindOutcome::Occupied { qq: "10001".into(), status: AccountStatus::Error },
+            "error does not free the binding"
+        );
+        assert_eq!(
+            begin_indexing(&state, "10001"),
+            BindOutcome::Bound,
+            "the same qq retries after a failure"
+        );
+    }
+
+    #[test]
+    fn bound_account_ignores_scan_results() {
+        let state = state_with_accounts(&[
+            ("10001", AccountStatus::AwaitingKey),
+            ("10002", AccountStatus::AwaitingKey),
+        ]);
+        assert!(
+            bound_account(&state.accounts.read()).is_none(),
+            "scanned-but-unregistered accounts are not a binding"
+        );
+        set_account_state(&state, "10002", AccountStatus::Indexing, 0, None);
+        assert_eq!(
+            bound_account(&state.accounts.read()).map(|a| a.qq.clone()),
+            Some("10002".into())
+        );
+    }
+
+    /// `/health` must never be able to say "a key is awaited", because the
+    /// only way an account reaches that state is the startup scan finding it.
+    #[test]
+    fn account_phase_never_exposes_awaiting_key() {
+        assert_eq!(AccountPhase::from(AccountStatus::AwaitingKey), AccountPhase::Unregistered);
+        assert_eq!(AccountPhase::from(AccountStatus::Indexing), AccountPhase::Indexing);
+        assert_eq!(AccountPhase::from(AccountStatus::Ready), AccountPhase::Ready);
+        assert_eq!(AccountPhase::from(AccountStatus::Error), AccountPhase::Error);
+    }
+
+    /// `Last-Event-ID` resumes from event ids, so the counter must survive a
+    /// clear. Restarting at 1 would leave a client holding `last-event-id:
+    /// 500` receiving nothing until 500 new events had accumulated.
+    #[test]
+    fn clear_items_drops_events_but_keeps_the_id_counter() {
+        let mut h = HistoryBuf::default();
+        assert_eq!(h.append("message.new".into(), serde_json::json!({"a": 1})), 1);
+        assert_eq!(h.append("message.new".into(), serde_json::json!({"a": 2})), 2);
+        assert_eq!(h.replay_since(0).len(), 2);
+        h.clear_items();
+        assert!(h.replay_since(0).is_empty(), "buffered events are gone");
+        assert_eq!(h.append("sync".into(), serde_json::json!({})), 3, "ids keep climbing");
+    }
+
+    #[tokio::test]
+    async fn deregister_clears_the_index_and_unbinds() {
+        let state = state_with_account(AccountStatus::Ready);
+        state.init.accounts_db.lock().push(DbInfo {
+            qq: "10001".into(),
+            path: std::path::PathBuf::from("C:\\x\\nt_msg.db"),
+        });
+        {
+            let mut st = state.store.write();
+            st.watermark_group = 42;
+            st.watermark_c2c = 7;
+            st.convs.insert(
+                "g:g1".into(),
+                store::Conversation { talker: "g1".into(), ..Default::default() },
+            );
+        }
+        update_ready(&state);
+        assert!(state.ready.load(Ordering::SeqCst));
+        let mut rx = state.events.subscribe();
+
+        let outcome = deregister_account(&state, "10001", false);
+        assert_eq!(
+            outcome,
+            DeregisterOutcome::Deregistered {
+                previous: AccountStatus::Ready,
+                index_cleared: true,
+                purged_dirs: 0,
+            }
+        );
+        assert!(state.store.read().convs.is_empty(), "index dropped");
+        assert_eq!(state.store.read().watermark_group, 0, "watermarks reset");
+        assert!(!state.ready.load(Ordering::SeqCst), "no longer ready");
+        assert!(bound_account(&state.accounts.read()).is_none(), "nothing bound");
+
+        // Subscribers are told their watermarks went back to zero.
+        let ev = rx.try_recv().expect("deregistration broadcasts a reset baseline");
+        assert_eq!(ev.event, "sync");
+        assert_eq!(ev.last_rowid_group, Some(0));
+        assert_eq!(ev.last_rowid_c2c, Some(0));
+
+        // Not scanned -> the account and its db_path are forgotten entirely.
+        assert!(state.accounts.read().is_empty(), "client-registered account removed");
+        assert!(state.init.find_db("10001").is_none(), "db_path forgotten");
+    }
+
+    /// A scanned account keeps its entry and path: the platform will find it
+    /// again on the next boot, so claiming it does not exist would be a lie.
+    #[tokio::test]
+    async fn deregister_resets_scanned_accounts_to_awaiting_key() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let info = DbInfo { qq: "10001".into(), path: std::path::PathBuf::from("C:\\x\\nt_msg.db") };
+        let state = Arc::new(AppState {
+            store: Arc::new(RwLock::new(Store::default())),
+            events: broadcast::channel::<Event>(16).0,
+            accounts: Arc::new(RwLock::new(vec![AccountState {
+                qq: "10001".into(),
+                state: AccountStatus::Ready,
+                message_count: 9,
+                error: None,
+            }])),
+            ready: Arc::new(AtomicBool::new(true)),
+            token: Arc::new("t".into()),
+            sync: Arc::new(sync::SyncEngine::new()),
+            init: AccountRegistry::new(
+                vec![info],
+                crate::sync::watch::WatchConfig::default(),
+                shutdown_rx,
+            ),
+            export_root: Arc::new(std::path::PathBuf::from(".")),
+            base_url: Arc::new("http://127.0.0.1:5032".into()),
+            history: Arc::new(Mutex::new(HistoryBuf::default())),
+            shutdown: shutdown_tx,
+        });
+
+        assert!(state.init.is_scanned("10001"));
+        let outcome = deregister_account(&state, "10001", false);
+        assert!(matches!(outcome, DeregisterOutcome::Deregistered { .. }));
+        let accs = state.accounts.read();
+        assert_eq!(accs.len(), 1, "the scan result survives");
+        assert_eq!(accs[0].state, AccountStatus::AwaitingKey);
+        assert_eq!(accs[0].message_count, 0);
+        assert!(state.init.find_db("10001").is_some(), "scanned db_path is kept");
+    }
+
+    #[tokio::test]
+    async fn deregister_validates_the_qq_interlock() {
+        let state = state_with_accounts(&[
+            ("10001", AccountStatus::Ready),
+            ("20002", AccountStatus::AwaitingKey),
+        ]);
+        assert_eq!(
+            deregister_account(&state, "20002", false),
+            DeregisterOutcome::QqMismatch {
+                occupied_by: "10001".into(),
+                status: AccountStatus::Ready,
+            },
+            "a scanned account is not the bound one"
+        );
+        assert_eq!(
+            deregister_account(&state, "99999", false),
+            DeregisterOutcome::QqMismatch {
+                occupied_by: "10001".into(),
+                status: AccountStatus::Ready,
+            }
+        );
+        // The incumbent is untouched by either rejected call.
+        assert_eq!(bound_account(&state.accounts.read()).map(|a| a.state), Some(AccountStatus::Ready));
+
+        let empty = state_with_account(AccountStatus::AwaitingKey);
+        assert_eq!(
+            deregister_account(&empty, "10001", false),
+            DeregisterOutcome::NotRegistered,
+            "a scan result is not a registration"
+        );
+    }
+
+    /// Deregistering mid-build is allowed and must not be undone by the build
+    /// finishing afterwards.
+    #[tokio::test]
+    async fn deregister_during_indexing_invalidates_the_build() {
+        let state = state_with_account(AccountStatus::Indexing);
+        let epoch = state.init.epoch.load(Ordering::SeqCst);
+
+        let outcome = deregister_account(&state, "10001", false);
+        assert_eq!(
+            outcome,
+            DeregisterOutcome::Deregistered {
+                previous: AccountStatus::Indexing,
+                index_cleared: false,
+                purged_dirs: 0,
+            },
+            "no index existed yet"
+        );
+
+        // The in-flight build now tries to publish its result.
+        assert!(
+            !set_account_state_if_current(&state, "10001", epoch, AccountStatus::Ready, 500, None),
+            "a stale build must not resurrect the account"
+        );
+        assert!(state.accounts.read().is_empty(), "still unbound");
+        // A registration started AFTER the deregistration still works.
+        let fresh = state.init.epoch.load(Ordering::SeqCst);
+        assert!(set_account_state_if_current(&state, "10001", fresh, AccountStatus::Ready, 3, None));
+    }
+
+    /// The purge removes only `<root>/<talker>/<kind>` for the four kinds the
+    /// exporter writes; everything else under the export root survives,
+    /// including files the operator put there (the export root may be a
+    /// directory they also use for other things).
+    #[test]
+    fn purge_exported_media_stays_inside_the_known_layout() {
+        let root = std::env::temp_dir().join(format!("qqflow_purge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (dir, file) in [
+            ("10001/images", "a.jpg"),
+            ("10001/voices", "a.amr"),
+            ("10001/notes", "keep.txt"),
+            ("20002/images", "b.jpg"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join(file), b"x").unwrap();
+        }
+        std::fs::write(root.join("operator-notes.txt"), b"keep me").unwrap();
+
+        let removed = purge_exported_media(&root, &["10001".into(), "../escape".into()]);
+        assert_eq!(removed, 2, "images + voices for the one talker");
+        assert!(!root.join("10001/images").exists());
+        assert!(!root.join("10001/voices").exists());
+        assert!(root.join("10001/notes/keep.txt").exists(), "unknown subdir untouched");
+        assert!(root.join("10001").exists(), "non-empty talker dir survives");
+        assert!(root.join("20002/images/b.jpg").exists(), "other talkers untouched");
+        assert!(root.join("operator-notes.txt").exists(), "export root never wiped");
+
+        // Now that only known-empty dirs remain for 20002, its dir goes too.
+        assert_eq!(purge_exported_media(&root, &["20002".into()]), 1);
+        assert!(!root.join("20002").exists(), "emptied talker dir removed");
+        assert!(root.exists(), "the root itself is never removed");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -25,6 +25,18 @@ fn unique_suffix() -> u64 {
 }
 
 fn state_with(store: Store, ready: bool) -> Arc<AppState> {
+    state_with_scanned(store, ready, Vec::new())
+}
+
+/// `state_with`, but the registry is seeded as if the startup scan had found
+/// `scanned`. `AccountRegistry::new` derives its `is_scanned` set from this
+/// argument only, so pushing into `accounts_db` afterwards (what most tests do)
+/// yields a *client-introduced* account — which deregisters differently.
+fn state_with_scanned(
+    store: Store,
+    ready: bool,
+    scanned: Vec<qqflow_server::db::scan::DbInfo>,
+) -> Arc<AppState> {
     let (tx, _) = tokio::sync::broadcast::channel(1024);
     Arc::new(AppState {
         store: Arc::new(RwLock::new(store)),
@@ -34,7 +46,7 @@ fn state_with(store: Store, ready: bool) -> Arc<AppState> {
         token: Arc::new("test-token-123456".into()),
         sync: Arc::new(qqflow_server::sync::SyncEngine::new()),
         init: qqflow_server::server::AccountRegistry::new(
-            Vec::new(),
+            scanned,
             qqflow_server::sync::watch::WatchConfig::default(),
             tokio::sync::watch::channel(false).1,
         ),
@@ -164,6 +176,105 @@ async fn health_no_auth() {
     let (s, v) = get("/health", false).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["status"], "ok");
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["account"], "unregistered");
+}
+
+/// `/health` is unauthenticated, so it must disclose nothing about which
+/// accounts exist on this machine: no qq, no counts, no database paths, no
+/// failure reasons. Regression guard for the account-enumeration leak — the
+/// old shape embedded the whole `Vec<AccountState>` here, which listed every
+/// QQ profile the startup scan found plus its state.
+#[tokio::test]
+async fn health_discloses_no_account_detail() {
+    let state = state_with(Store::default(), true);
+    state.accounts.write().extend([
+        qqflow_server::server::AccountState {
+            qq: "10001".into(),
+            state: AccountStatus::Ready,
+            message_count: 4242,
+            error: None,
+        },
+        // A second, scanned-but-unregistered profile: its mere presence used
+        // to be observable, which is the disclosure this test forbids.
+        qqflow_server::server::AccountState {
+            qq: "20002".into(),
+            state: AccountStatus::AwaitingKey,
+            message_count: 0,
+            error: None,
+        },
+    ]);
+    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
+        qq: "10001".into(),
+        path: std::path::PathBuf::from("C:\\secret\\path\\nt_msg.db"),
+    });
+    let app = build_router(state);
+
+    let (s, v) = common::get_json(app.clone(), "/health", &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["account"], "ready", "the bound account's phase is disclosed");
+    let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(keys, ["account", "status", "version"], "exactly three fields: {v}");
+    let body = v.to_string();
+    for leak in ["10001", "20002", "4242", "secret", "nt_msg.db", "awaiting_key"] {
+        assert!(!body.contains(leak), "/health leaked {leak:?}: {body}");
+    }
+
+    // The same data IS available behind the token.
+    let (s, v) = common::get_json(
+        app,
+        "/api/v1/accounts",
+        &[("authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    let accounts = v["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 2);
+    assert_eq!(accounts[0]["qq"], "10001");
+    assert_eq!(accounts[0]["state"], "ready");
+    assert_eq!(accounts[0]["message_count"], 4242);
+    assert_eq!(accounts[0]["db_path"], "C:\\secret\\path\\nt_msg.db");
+    assert_eq!(accounts[1]["state"], "awaiting_key");
+    assert!(accounts[1]["db_path"].is_null(), "no registry entry -> no path");
+}
+
+/// The detail endpoint accepts the same five token transports as every other
+/// authenticated route, and refuses the request without one. It is NOT
+/// ready-gated: a client polls it precisely while the account is `indexing`.
+#[tokio::test]
+async fn accounts_detail_auth_channels() {
+    let state = state_with(Store::default(), false);
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Indexing,
+        message_count: 0,
+        error: None,
+    });
+    let app = build_router(state);
+    let tok = "test-token-123456";
+
+    let (s, v) = common::get_json(app.clone(), "/api/v1/accounts", &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "no token: {v}");
+    assert_eq!(v["code"], 401);
+    let (s, _) = common::get_json(
+        app.clone(),
+        "/api/v1/accounts",
+        &[("authorization", "Bearer wrong-token-000000")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong token");
+
+    for (uri, headers) in [
+        ("/api/v1/accounts", vec![("authorization", "Bearer test-token-123456")]),
+        ("/api/v1/accounts", vec![("x-api-key", tok)]),
+        ("/api/v1/accounts?access_token=test-token-123456", vec![]),
+        ("/api/v1/accounts?token=test-token-123456", vec![]),
+    ] {
+        let (s, v) = common::get_json(app.clone(), uri, &headers).await;
+        assert_eq!(s, StatusCode::OK, "transport {uri} {headers:?} rejected: {v}");
+        assert_eq!(v["accounts"][0]["state"], "indexing", "not ready-gated");
+    }
 }
 
 #[tokio::test]
@@ -1000,35 +1111,14 @@ async fn accounts_requires_auth() {
 }
 
 #[tokio::test]
-async fn accounts_validation_and_idempotency() {
+async fn accounts_validation_rejects_bad_input() {
     let state = test_state();
-    // Seed a ready account entry so already_ready can be exercised.
-    state.accounts.write().push(qqflow_server::server::AccountState {
-        qq: "10001".into(),
-        state: AccountStatus::Ready,
-        message_count: 2,
-        error: None,
+    // A scanned-style entry for 10002, so key validation is reachable
+    // (resolve succeeds without a db_path). Nothing is bound yet.
+    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
+        qq: "10002".into(),
+        path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
     });
-    // An account left in `error` by an earlier failed registration, so the
-    // reject-branch `status` (account unchanged, still broken) is reachable.
-    state.accounts.write().push(qqflow_server::server::AccountState {
-        qq: "10003".into(),
-        state: AccountStatus::Error,
-        message_count: 0,
-        error: Some("解密失败".into()),
-    });
-    // Scanned-style entries for 10002/10003, so key validation is reachable
-    // (resolve succeeds without a db_path).
-    state.init.accounts_db.lock().extend([
-        qqflow_server::db::scan::DbInfo {
-            qq: "10002".into(),
-            path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
-        },
-        qqflow_server::db::scan::DbInfo {
-            qq: "10003".into(),
-            path: std::env::temp_dir().join("qqflow_smoke_10003.db"),
-        },
-    ]);
     let app = build_router(state);
     let tok = "test-token-123456";
 
@@ -1048,17 +1138,6 @@ async fn accounts_validation_and_idempotency() {
         v["db_path"].as_str().unwrap().ends_with("qqflow_smoke_10002.db"),
         "resolved db_path echoed: {v}"
     );
-
-    // Ready account -> idempotent no-op, status mirrors /health.
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": tok, "qq": "10001", "key": "0123456789abcdef"}),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["state"], "already_ready");
-    assert_eq!(v["status"], "ready");
 
     // Unknown qq without a db_path -> unknown_qq, no path to echo.
     let (s, v) = post_json(
@@ -1083,21 +1162,482 @@ async fn accounts_validation_and_idempotency() {
     assert_eq!(v["state"], "invalid_db_path");
     assert!(v["db_path"].is_null(), "unresolved -> db_path omitted: {v}");
 
-    // Re-registering a previously failed account with a malformed key: the
-    // reject leaves the account untouched, so `status` still reports `error`
-    // ("this call was rejected AND the account is still broken").
+    // Missing qq / key -> 400 envelope.
+    let (s, v) = post_json(app, "/api/v1/accounts", json!({"access_token": tok})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["code"], 400);
+}
+
+/// Re-registering the SAME account is idempotent, and the reject replies
+/// carry the account's unchanged state-machine value.
+#[tokio::test]
+async fn accounts_idempotent_for_the_bound_account() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 2,
+        error: None,
+    });
+    let app = build_router(state);
+    let tok = "test-token-123456";
+
     let (s, v) = post_json(
         app.clone(),
         "/api/v1/accounts",
-        json!({"access_token": tok, "qq": "10003", "key": "short"}),
+        json!({"access_token": tok, "qq": "10001", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "already_ready");
+    assert_eq!(v["status"], "ready");
+}
+
+/// An account left in `error` by a failed registration keeps the binding and
+/// may retry: a malformed retry key is rejected without changing the state,
+/// so `status` still reports `error` ("this call was rejected AND the account
+/// is still broken").
+#[tokio::test]
+async fn accounts_error_state_echoes_status_on_reject() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10003".into(),
+        state: AccountStatus::Error,
+        message_count: 0,
+        error: Some("解密失败".into()),
+    });
+    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
+        qq: "10003".into(),
+        path: std::env::temp_dir().join("qqflow_smoke_10003.db"),
+    });
+    let app = build_router(state);
+
+    let (s, v) = post_json(
+        app,
+        "/api/v1/accounts",
+        json!({"access_token": "test-token-123456", "qq": "10003", "key": "short"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "invalid_key");
     assert_eq!(v["status"], "error");
+}
 
-    // Missing qq / key -> 400 envelope.
-    let (s, v) = post_json(app, "/api/v1/accounts", json!({"access_token": tok})).await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert_eq!(v["code"], 400);
+/// The store is a single global index with no account dimension, so a second
+/// account must be REJECTED rather than silently overwriting the first one's
+/// data. Before this, registering a second qq replaced the whole index and
+/// cross-contaminated the sync watermarks (the two databases have independent
+/// rowid spaces), while both accounts reported `ready`.
+#[tokio::test]
+async fn accounts_rejects_a_second_account() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 2,
+        error: None,
+    });
+    // Resolvable, so a conflict reply cannot be confused with unknown_qq.
+    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
+        qq: "10002".into(),
+        path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
+    });
+    let app = build_router(state.clone());
+
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": "test-token-123456", "qq": "10002", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "account_conflict");
+    assert_eq!(v["qq"], "10002", "the rejected request's own account");
+    assert_eq!(v["occupied_by"], "10001");
+    assert_eq!(v["occupied_status"], "ready");
+
+    // The incumbent is untouched and the loser gained no state entry.
+    let accs = state.accounts.read();
+    assert_eq!(accs.len(), 1, "the rejected account must not be recorded: {accs:?}");
+    assert_eq!(accs[0].qq, "10001");
+    assert_eq!(accs[0].state, AccountStatus::Ready);
+    assert_eq!(accs[0].message_count, 2);
+}
+
+/// An account in `error` still holds the binding: a transient decrypt failure
+/// must not hand the server to a different account behind the operator's back.
+#[tokio::test]
+async fn accounts_conflict_survives_error_state() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Error,
+        message_count: 0,
+        error: Some("解密失败".into()),
+    });
+    state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
+        qq: "10002".into(),
+        path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
+    });
+    let app = build_router(state);
+
+    let (s, v) = post_json(
+        app,
+        "/api/v1/accounts",
+        json!({"access_token": "test-token-123456", "qq": "10002", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "account_conflict");
+    assert_eq!(v["occupied_by"], "10001");
+    assert_eq!(v["occupied_status"], "error");
+}
+
+/// Two different accounts registering concurrently: exactly one wins. The
+/// occupancy decision lives inside `begin_indexing`'s write lock, so the loser
+/// cannot slip past the handler's fast-path check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accounts_concurrent_different_qq_one_winner() {
+    let state = test_state();
+    let dir = std::env::temp_dir().join(format!("qqflow_smoke_race_{}", unique_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Both resolvable: whichever loses must lose on occupancy, not on paths.
+    // The files are not real databases, so the winner's background build
+    // fails into `error` — irrelevant here, the race is decided before that.
+    let mut entries = Vec::new();
+    for qq in ["10001", "10002"] {
+        let path = dir.join(format!("{qq}.db"));
+        std::fs::write(&path, b"not a database").unwrap();
+        entries.push(qqflow_server::db::scan::DbInfo { qq: qq.into(), path });
+    }
+    state.init.accounts_db.lock().extend(entries);
+    let app = build_router(state.clone());
+
+    let a = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": "test-token-123456", "qq": "10001", "key": "0123456789abcdef"}),
+    );
+    let b = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": "test-token-123456", "qq": "10002", "key": "0123456789abcdef"}),
+    );
+    let ((sa, va), (sb, vb)) = tokio::join!(a, b);
+    assert_eq!(sa, StatusCode::OK);
+    assert_eq!(sb, StatusCode::OK);
+
+    let states = [va["state"].as_str().unwrap(), vb["state"].as_str().unwrap()];
+    let accepted = states.iter().filter(|s| **s == "accepted").count();
+    let conflicts = states.iter().filter(|s| **s == "account_conflict").count();
+    assert_eq!(accepted, 1, "exactly one registration wins: {va} / {vb}");
+    assert_eq!(conflicts, 1, "the other is rejected as a conflict: {va} / {vb}");
+
+    // Only the winner is bound; the loser left no trace.
+    let bound: Vec<_> = state
+        .accounts
+        .read()
+        .iter()
+        .filter(|a| a.state != AccountStatus::AwaitingKey)
+        .map(|a| a.qq.clone())
+        .collect();
+    assert_eq!(bound.len(), 1, "exactly one account is bound: {bound:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deregistration destroys the index, so an unauthenticated caller must not
+/// reach it — on either the DELETE route or its POST alias.
+#[tokio::test]
+async fn deregister_requires_a_token() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 2,
+        error: None,
+    });
+    let app = build_router(state.clone());
+
+    let (s, _) = common::delete_json(app.clone(), "/api/v1/accounts/10001", &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "DELETE without a token");
+    let (s, _) =
+        common::delete_json(app.clone(), "/api/v1/accounts/10001?access_token=wrong", &[]).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "DELETE with a wrong token");
+    let (s, _) = post_json(app.clone(), "/api/v1/accounts/10001/deregister", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "the POST alias is gated too");
+
+    // Every rejected attempt left the binding and the index alone.
+    assert_eq!(
+        state.accounts.read().first().map(|a| a.state),
+        Some(AccountStatus::Ready),
+        "still bound"
+    );
+    assert!(!state.store.read().convs.is_empty(), "index intact");
+}
+
+/// Nothing bound -> `not_registered`, HTTP 200. Idempotent by design: a client
+/// retrying a deregistration it already completed must not have to special-case
+/// an error response.
+#[tokio::test]
+async fn deregister_unbound_is_idempotent() {
+    let app = build_router(state_with(Store::default(), false));
+    let (s, v) = common::delete_json(
+        app,
+        "/api/v1/accounts/10001",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["state"], "not_registered");
+    assert_eq!(v["qq"], "10001");
+    assert_eq!(v["index_cleared"], false);
+    assert_eq!(v["purged_dirs"], 0);
+}
+
+/// The path `qq` is a safety interlock, not a selector: naming the wrong
+/// account reports `qq_mismatch` and leaves the incumbent completely untouched,
+/// rather than deregistering whatever happens to be bound.
+#[tokio::test]
+async fn deregister_enforces_the_qq_interlock() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 2,
+        error: None,
+    });
+    let app = build_router(state.clone());
+
+    let (s, v) = common::delete_json(
+        app.clone(),
+        "/api/v1/accounts/99999",
+        &[("X-Api-Key", "test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "a business verdict, not an HTTP error");
+    assert_eq!(v["state"], "qq_mismatch");
+    assert_eq!(v["occupied_by"], "10001");
+    assert_eq!(v["occupied_status"], "ready");
+    assert_eq!(v["index_cleared"], false);
+
+    assert_eq!(state.accounts.read().first().map(|a| a.state), Some(AccountStatus::Ready));
+    assert!(!state.store.read().convs.is_empty(), "the incumbent's index survives");
+    assert!(state.ready.load(std::sync::atomic::Ordering::SeqCst), "still ready");
+}
+
+/// The full round trip through HTTP: a ready account deregisters, and every
+/// observable surface agrees the server is back at its unregistered boot state
+/// — `/health` scalar, the detail endpoint, and the readiness-gated business
+/// endpoints. Then a re-registration is accepted, proving the unbind is not a
+/// one-way door.
+#[tokio::test]
+async fn deregister_returns_the_server_to_its_boot_state() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 2,
+        error: None,
+    });
+    // Client-introduced (not in `AccountRegistry::new`), so the entry and its
+    // db_path should be forgotten entirely.
+    let db = std::env::temp_dir().join(format!("qqflow_smoke_dereg_{}.db", unique_suffix()));
+    std::fs::write(&db, b"not a database").unwrap();
+    state
+        .init
+        .accounts_db
+        .lock()
+        .push(qqflow_server::db::scan::DbInfo { qq: "10001".into(), path: db.clone() });
+    let app = build_router(state.clone());
+
+    // Baseline: ready, serving, disclosing the account.
+    let (s, v) = call(app.clone(), "/health").await;
+    assert_eq!((s, &v["status"], &v["account"]), (StatusCode::OK, &json!("ok"), &json!("ready")));
+    let (s, _) = common::get_json(
+        app.clone(),
+        "/api/v1/sessions",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "business endpoints serve while ready");
+
+    let (s, v) = common::delete_json(
+        app.clone(),
+        "/api/v1/accounts/10001",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["state"], "deregistered");
+    assert_eq!(v["previous_status"], "ready", "what it was when the request landed");
+    assert_eq!(v["index_cleared"], true);
+    assert_eq!(v["purged_media"], false, "purge_media defaults to false");
+    assert_eq!(v["purged_dirs"], 0);
+
+    // `/health` is scalar again, and readiness dropped.
+    let (s, v) = call(app.clone(), "/health").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["status"], "starting");
+    assert_eq!(v["account"], "unregistered");
+
+    // The detail endpoint forgot the client-introduced account outright.
+    let (s, v) = common::get_json(
+        app.clone(),
+        "/api/v1/accounts",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["accounts"].as_array().map(|a| a.len()), Some(0), "no entry left: {v}");
+
+    // Readiness-gated endpoints stop serving the dropped index.
+    let (s, _) = common::get_json(
+        app.clone(),
+        "/api/v1/sessions",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "the index is gone");
+    assert!(state.store.read().convs.is_empty());
+
+    // And the binding is free: a fresh registration is accepted (its
+    // background build then fails on the fake db file, which is fine — the
+    // point is that the occupancy check no longer rejects it).
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts",
+        json!({"access_token": "test-token-123456", "qq": "10002",
+               "key": "0123456789abcdef", "db_path": db.to_string_lossy()}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "accepted", "the binding was released: {v}");
+
+    let _ = std::fs::remove_file(&db);
+}
+
+/// A scanned account is not forgotten, it reverts to `awaiting_key` and keeps
+/// its `db_path`: the startup scan will find it again next boot, so reporting
+/// it as gone would be a lie the client then has to un-learn.
+#[tokio::test]
+async fn deregister_reverts_a_scanned_account_to_awaiting_key() {
+    let db = std::env::temp_dir().join(format!("qqflow_smoke_scanned_{}.db", unique_suffix()));
+    let state = state_with_scanned(
+        Store::default(),
+        true,
+        vec![qqflow_server::db::scan::DbInfo { qq: "10001".into(), path: db.clone() }],
+    );
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 9,
+        error: None,
+    });
+    let app = build_router(state.clone());
+
+    let (s, v) = common::delete_json(
+        app.clone(),
+        "/api/v1/accounts/10001",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "deregistered");
+    assert_eq!(v["previous_status"], "ready");
+
+    let (s, v) = common::get_json(
+        app,
+        "/api/v1/accounts",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // Panics if the entry is gone, which is the assertion: the scan result survives.
+    let entry = common::account_entry(&v, "10001");
+    assert_eq!(entry["state"], "awaiting_key");
+    assert_eq!(entry["message_count"], 0);
+    assert_eq!(
+        entry["db_path"], json!(db.to_string_lossy()),
+        "a scanned account keeps its path"
+    );
+}
+
+/// `purge_media=1` deletes only the export layout the server itself writes.
+/// The export root comes from `--media-export-dir` and may be a directory the
+/// operator keeps other things in, so anything outside `<talker>/<kind>` must
+/// survive — and the root itself is never removed.
+#[tokio::test]
+async fn deregister_purge_media_stays_inside_the_export_layout() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Ready,
+        message_count: 2,
+        error: None,
+    });
+    // `test_state`'s only conversation has talker "10001".
+    let root = state.export_root.clone();
+    for (dir, file) in [("10001/images", "a.jpg"), ("10001/notes", "keep.txt")] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(root.join(dir).join(file), b"x").unwrap();
+    }
+    std::fs::write(root.join("operator-notes.txt"), b"keep me").unwrap();
+    let app = build_router(state.clone());
+
+    let (s, v) = common::delete_json(
+        app,
+        "/api/v1/accounts/10001?purge_media=1",
+        &[("Authorization", "Bearer test-token-123456")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "deregistered");
+    assert_eq!(v["purged_media"], true, "the flag echoes the request");
+    assert_eq!(v["purged_dirs"], 1, "only images existed: {v}");
+
+    assert!(!root.join("10001/images").exists(), "exported media removed");
+    assert!(root.join("10001/notes/keep.txt").exists(), "unknown subdir untouched");
+    assert!(root.join("operator-notes.txt").exists(), "export root never wiped");
+    assert!(root.exists(), "the root itself survives");
+    let _ = std::fs::remove_dir_all(&*root);
+}
+
+/// The POST alias exists for clients and proxies that cannot issue DELETE, and
+/// it must be the same handler — same verdicts, same body-carried parameters.
+#[tokio::test]
+async fn deregister_post_alias_matches_the_delete_route() {
+    let state = test_state();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Error,
+        message_count: 0,
+        error: Some("解密失败".into()),
+    });
+    let app = build_router(state.clone());
+
+    // An account stuck in `error` still holds the binding, so clearing it is
+    // exactly what the alias has to be able to do. Token and `purge_media`
+    // both arrive in the JSON body here, not the query string.
+    let (s, v) = post_json(
+        app.clone(),
+        "/api/v1/accounts/10001/deregister",
+        json!({"access_token": "test-token-123456", "purge_media": false}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "deregistered");
+    assert_eq!(v["previous_status"], "error", "an error account can be cleared");
+    assert!(qqflow_server::server::bound_account(&state.accounts.read()).is_none());
+
+    // Repeating it is idempotent, same as the DELETE route.
+    let (s, v) = post_json(
+        app,
+        "/api/v1/accounts/10001/deregister",
+        json!({"access_token": "test-token-123456"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "not_registered");
 }

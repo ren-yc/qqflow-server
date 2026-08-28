@@ -37,12 +37,19 @@ pub use events::Event;
 /// manual sync endpoint and the poll loop can share it) plus everything
 /// needed to run a sync pass.
 pub struct AccountSync {
+    /// Owning account — the key `SyncEngine` unregisters by.
+    pub qq: String,
     pub reader: Arc<Mutex<LiveReader>>,
     pub store: Arc<RwLock<Store>>,
     pub tx: broadcast::Sender<Event>,
     /// Set when a sync failed; the poll loop then retries even though the
     /// reader state is unchanged.
     retry: AtomicBool,
+    /// Set by deregistration. A pass already inside `poll_once` cannot be
+    /// cancelled — `spawn_blocking` work runs to completion even after its
+    /// awaiting task is aborted — so the flag is what stops it from writing
+    /// into a store that no longer belongs to this account.
+    stopped: AtomicBool,
     /// Source main db path — derives the `-wal` path the fallback stats.
     db_path: PathBuf,
     /// `nt_db` directory — sibling group-info databases live here (name maps).
@@ -55,7 +62,9 @@ pub struct AccountSync {
 }
 
 impl AccountSync {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        qq: String,
         reader: Arc<Mutex<LiveReader>>,
         store: Arc<RwLock<Store>>,
         tx: broadcast::Sender<Event>,
@@ -64,15 +73,26 @@ impl AccountSync {
         key: String,
     ) -> Self {
         Self {
+            qq,
             reader,
             store,
             tx,
             retry: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             db_path,
             db_dir,
             key,
             last_wal: Mutex::new(None),
         }
+    }
+
+    /// Retire this account's sync: no further pass may write to the store.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Re-read name maps (备注/群名) from nt_msg.db + sibling databases.
@@ -192,6 +212,17 @@ impl AccountSync {
         // records are borrowed — see apply_records), advance watermarks.
         let (events, outs): (Vec<Event>, Vec<MessageOut>) = {
             let mut guard = self.store.write();
+            // Deregistration check, deliberately the first thing inside the
+            // critical section rather than at `poll_once`'s entry: the read
+            // phase above holds no store lock, so a pass that started before
+            // the deregistration would otherwise reach this point and write
+            // this account's rows (and watermarks) into the cleared store —
+            // resurrecting data the operator just removed. Checking under the
+            // same lock deregistration takes makes the two mutually exclusive.
+            if self.is_stopped() {
+                tracing::debug!(qq = %self.qq, "sync pass discarded: account deregistered");
+                return Ok(Vec::new());
+            }
             // Media root may predate the account (sync can run before the
             // index build in edge paths); resolve it lazily once.
             if guard.media_root.is_none() {
@@ -267,15 +298,43 @@ impl AccountSync {
 /// finish building.
 pub struct SyncEngine {
     accounts: Mutex<Vec<Arc<AccountSync>>>,
+    /// Per-account watch task handles, so deregistration can abort the task
+    /// that would otherwise keep the source database and its directory
+    /// handle open for the rest of the process's life. Previously the handle
+    /// was dropped at spawn time, which detached the task permanently.
+    watchers: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<Result<()>>>>,
 }
 
 impl SyncEngine {
     pub fn new() -> Self {
-        Self { accounts: Mutex::new(Vec::new()) }
+        Self { accounts: Mutex::new(Vec::new()), watchers: Mutex::new(Default::default()) }
     }
 
     pub fn register(&self, account: Arc<AccountSync>) {
         self.accounts.lock().push(account);
+    }
+
+    /// Track one account's watch task (replacing any previous handle, which a
+    /// re-registration after a failure produces).
+    pub fn attach_watcher(&self, qq: &str, handle: tokio::task::JoinHandle<Result<()>>) {
+        if let Some(old) = self.watchers.lock().insert(qq.to_string(), handle) {
+            old.abort();
+        }
+    }
+
+    /// Remove `qq` from the registry and return its sync handle plus its
+    /// watch task, if it was registered. The caller stops them — this only
+    /// detaches them from the engine so no later pass can pick them up.
+    pub fn unregister(
+        &self,
+        qq: &str,
+    ) -> (Option<Arc<AccountSync>>, Option<tokio::task::JoinHandle<Result<()>>>) {
+        let account = {
+            let mut accs = self.accounts.lock();
+            accs.iter().position(|a| a.qq == qq).map(|i| accs.remove(i))
+        };
+        let watcher = self.watchers.lock().remove(qq);
+        (account, watcher)
     }
 
     pub fn snapshot(&self) -> Vec<Arc<AccountSync>> {
@@ -290,6 +349,13 @@ impl SyncEngine {
     pub fn sync_all(&self) -> Vec<MessageOut> {
         let mut out = Vec::new();
         for account in self.snapshot() {
+            // A deregistration concurrent with this call may already have
+            // stopped the account after `snapshot` cloned it; `poll_once`
+            // would bail out anyway, but `refresh_media_fallback` writes to
+            // the store without that check, so skip the whole account.
+            if account.is_stopped() {
+                continue;
+            }
             account.refresh_media_fallback();
             match account.poll_once() {
                 Ok(messages) => {

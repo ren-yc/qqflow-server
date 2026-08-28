@@ -619,6 +619,7 @@ fn manual_sync_picks_up_new_rows() {
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
     let account = qqflow_server::sync::AccountSync::new(
+        FAKE_QQ.into(),
         reader,
         store,
         tx,
@@ -689,6 +690,7 @@ fn failed_sync_leaves_store_untouched() {
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
     let (tx, _rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
     let account = qqflow_server::sync::AccountSync::new(
+        FAKE_QQ.into(),
         reader,
         store.clone(),
         tx,
@@ -771,9 +773,16 @@ async fn client_registers_account_with_key_and_db_path() {
     });
     let app = build_router(state.clone());
 
-    // Boot state: account discovered, awaiting a key.
-    let v = common::wait_account_state(&app, FAKE_QQ, "awaiting_key", Duration::from_secs(15)).await;
-    assert_eq!(v["status"], "starting");
+    // Boot state: account discovered, awaiting a key. A scan result is not a
+    // binding, so /health still reports `unregistered`.
+    let v =
+        common::wait_account_state(&app, "test-token", FAKE_QQ, "awaiting_key", Duration::from_secs(15))
+            .await;
+    assert_eq!(v["success"], true);
+    let (s, h) = common::get_json(app.clone(), "/health", &[]).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h["status"], "starting");
+    assert_eq!(h["account"], "unregistered");
 
     // Wrong key (valid format, wrong content) -> accepted, then error.
     let (s, v) = common::post_json(
@@ -790,10 +799,15 @@ async fn client_registers_account_with_key_and_db_path() {
     // (this very registration is about to fail its decrypt check).
     assert_eq!(v["status"], "indexing");
     assert_eq!(v["db_path"], db_path);
-    let v = common::wait_account_state(&app, FAKE_QQ, "error", Duration::from_secs(15)).await;
-    let err = v["accounts"].as_array().unwrap()[0]["error"].as_str().unwrap().to_string();
+    let v =
+        common::wait_account_state(&app, "test-token", FAKE_QQ, "error", Duration::from_secs(15)).await;
+    let err = common::account_entry(&v, FAKE_QQ)["error"].as_str().unwrap().to_string();
     println!("[GT] expected init failure: {err}");
     assert!(err.contains("解密") || err.contains("密钥"), "error must explain: {err}");
+    // The reason is behind the token; /health only admits the phase.
+    let (_, h) = common::get_json(app.clone(), "/health", &[]).await;
+    assert_eq!(h["account"], "error");
+    assert!(h.get("error").is_none(), "/health must not carry the failure reason");
 
     // Corrected key -> accepted, then ready and serving.
     let (s, v) = common::post_json(
@@ -807,10 +821,14 @@ async fn client_registers_account_with_key_and_db_path() {
     assert_eq!(v["state"], "accepted");
     assert_eq!(v["status"], "indexing");
     assert_eq!(v["db_path"], db_path);
-    let v = common::wait_account_state(&app, FAKE_QQ, "ready", Duration::from_secs(15)).await;
-    assert_eq!(v["status"], "ok");
+    let v =
+        common::wait_account_state(&app, "test-token", FAKE_QQ, "ready", Duration::from_secs(15)).await;
+    assert_eq!(common::account_entry(&v, FAKE_QQ)["message_count"], 8);
+    assert_eq!(common::account_entry(&v, FAKE_QQ)["db_path"], db_path);
 
-    assert_eq!(v["accounts"].as_array().unwrap()[0]["message_count"], 8);
+    let (_, h) = common::get_json(app.clone(), "/health", &[]).await;
+    assert_eq!(h["status"], "ok");
+    assert_eq!(h["account"], "ready");
 
     // Idempotent re-registration of the now-ready account: status mirrors
     // /health and db_path echoes the running account's own path (this
