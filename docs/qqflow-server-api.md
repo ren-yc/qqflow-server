@@ -482,6 +482,9 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 `meta.type` 按标准只有 `group`/`private` 两个取值，公众号/订阅号等会归入
 `private`。需要更细的会话分类请用 §4 `/api/v1/sessions` 的 `type`。
 
+不输出的可选字段（`meta.groupAvatar`、`members[].aliases`、`messages[].mediaPath`、
+`messages[].replyToMessageId`）与本面同样适用，清单见 §4.1"与标准 / 安装版的已知差异"。
+
 ---
 
 ## 3.1 获取媒体文件（GET|POST /api/v1/media/{id}）
@@ -656,6 +659,16 @@ GET /api/v1/sessions/{id}/messages
 
 **`6` 在标准中未分配，任何情况下都不会出现。**
 
+**本项目实际只产出 `0` / `1` / `2` / `3` / `80` / `81` / `99` 七个码。** 上表是标准
+全集，其余码位（`4` FILE、`5` EMOJI、`7` LINK、`8` LOCATION、`24` SHARE、`25`
+REPLY、`27` CONTACT）在 QQ 侧没有对应的解析：没有引用关系抽取，也没有名片 / 位置 /
+链接的细分识别，这些消息统一落到 `99` OTHER。
+
+⚠️ **与 weflow-server 的覆盖面不对等。** weflow-server 能输出
+`0/1/2/3/4/5/7/8/24/25/27/80/81/99`。同一个逻辑消息在两个平台上可能一边是 `25`
+REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 `99` 兜底，不要假设两个
+上游的枚举分布一致。
+
 ⚠️ 这与 §3 `/api/v1/messages` 的 `localType` 是**两套独立编码**：同一张图片在
 本节是 `type: 1`，在 §3 是 `localType: 3`。`localType` 是平台原生码、下游已按
 它分支，两者不可互换使用。
@@ -674,6 +687,18 @@ GET /api/v1/sessions/{id}/messages
 滤掉本页所有行、下一条未读行正好落在 offset 0。此时再叠加一个累计 offset 会
 二次跳过同样的行（double-skip）。两个游标照文档原样回传即可，不需要客户端做
 特殊处理。
+
+### 与标准 / 安装版的已知差异
+
+以下是有意不实现或受数据限制的部分，下游不要依赖这些字段存在：
+
+| 字段 | 标准 | 安装版 | 本项目 | 原因 |
+| ---- | ---- | ------ | ------ | ---- |
+| `meta.groupAvatar` | 可选，要求 Data URL | 字段清单里有 | **不输出** | QQ 侧没有可用的群头像来源 |
+| `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 多来源名字已收敛进 `accountName`（备注 > `uid_names` > 昵称 > UID） |
+| `members[].avatar` | 可选，要求 Data URL | 真实 URL | **恒为空串** | QQ 侧没有可用的头像来源；字段保留以满足形状 |
+| `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 媒体字节请走 §3 `/api/v1/messages` 的媒体导出 |
+| `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 `format=chatlab` 面有 | **两个面都不输出** | QQ 侧没有引用关系抽取，无数据可填 |
 
 ---
 
@@ -827,7 +852,9 @@ POST /api/v1/sync
 | `503` | 索引构建中（"服务正在建立索引，请稍后重试"） |
 | `500` | 内部错误 |
 
-> 说明：非 JSON 的 POST Body 会被忽略（仅记录日志），请求沿用 Query 参数，不会报 400；`start`/`end` 无法解析时该过滤条件被忽略。Query 参数类型错误（如 `limit=abc`）由框架直接拒绝，返回 `400` 空响应体，不走本信封。
+> 说明：非 JSON 的 POST Body 会被忽略（仅记录日志），请求沿用 Query 参数，不会报 400；`start`/`end` 无法解析时该过滤条件被忽略。
+>
+> Query 数值参数类型错误（如 `limit=abc`）在**多数接口**上由框架直接拒绝，返回 `400` 空响应体，不走本信封 —— 适用于 `/api/v1/messages`、`/api/v1/sessions`、`/api/v1/contacts`。**例外是 ChatLab 拉取** `/api/v1/sessions/{id}/messages`：该接口的 `limit` / `offset` 为容错解析，非法值退化为默认值而不报错（见 §4.1），因为 WeFlow 的 Pull 契约对分页参数没有 400 语义。
 
 ---
 
