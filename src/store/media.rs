@@ -220,22 +220,49 @@ pub fn media_root_of(db_dir: &Path) -> Option<PathBuf> {
     db_dir.parent().map(|p| p.join("nt_data"))
 }
 
-/// Resolve a local cache path to an absolute filesystem path: absolute
-/// "45812" paths are used as-is (they come from QQ's own DB); relative
-/// paths resolve against the account's `nt_data` root, rejecting any `..`
-/// component at join time. None when unresolvable or the file is missing.
+/// Resolve a local cache path ("45812") to an absolute filesystem path, then
+/// assert it stayed inside the account's `nt_data` root. None when
+/// unresolvable, missing, or out of bounds.
+///
+/// Containment applies to BOTH branches. The absolute branch used to be taken
+/// as-is on the grounds that the value "comes from QQ's own DB" — but 45812 is
+/// decoded from the same 40800 blob as the file name and md5, so that is an
+/// assumption about NTQQ rather than something this process enforces, and the
+/// value feeds a read (`/api/v1/media/{id}`) and a copy (`media=1`).
+///
+/// Measured against a real 34k-row database before tightening this (see the
+/// `real_db_local_path_trust_boundary` probe in `tests/real_db_groundtruth.rs`,
+/// which keeps the numbers honest as an assertion): of 1170 rows carrying a
+/// 45812, zero had a `..` or a control character, and all 100 that still
+/// resolve on disk were already inside `nt_data`. The 984 naming another root
+/// are a dead `QQ Files` install that no longer exists, so they resolve to
+/// nothing either way. Containment therefore rejects no media that works today
+/// — the cost is bounded, and it removes the trust assumption.
+///
+/// A missing `media_root` fails closed rather than skipping the check: without
+/// a root there is nothing to contain against, and silently accepting an
+/// absolute path there would reinstate exactly the branch being removed.
 pub fn resolve_local_path(local_path: &str, media_root: Option<&Path>) -> Option<PathBuf> {
     let raw = Path::new(local_path);
+    let root = media_root?;
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
-        let root = media_root?;
         if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return None;
         }
         root.join(raw)
     };
-    joined.canonicalize().ok()
+    let resolved = joined.canonicalize().ok()?;
+    // The lexical `..` check above is not enough on its own: it cannot see a
+    // symlink or junction inside the cache, and it does not cover the absolute
+    // branch at all. `canonicalize` has already run, so compare the resolved
+    // file itself against the canonical root.
+    if !crate::pathsafe::is_contained_resolved(root, &resolved) {
+        tracing::debug!("[media] local path outside media root, ignored: {local_path:?}");
+        return None;
+    }
+    Some(resolved)
 }
 
 #[cfg(test)]
@@ -272,6 +299,54 @@ mod tests {
         );
         assert!(resolve_local_path("Pic/../secret", Some(&media_root)).is_none(), ".. rejected");
         assert!(resolve_local_path("missing.png", Some(&media_root)).is_none(), "missing file -> None");
+    }
+
+    #[test]
+    fn resolve_contains_the_absolute_branch() {
+        let root = temp_dir("abs");
+        let media_root = root.join("nt_data");
+        std::fs::create_dir_all(media_root.join("Pic")).unwrap();
+        let inside = media_root.join("Pic").join("ok.png");
+        std::fs::write(&inside, b"x").unwrap();
+        // An absolute path inside the root still resolves...
+        assert_eq!(
+            resolve_local_path(&inside.to_string_lossy(), Some(&media_root)),
+            Some(inside.canonicalize().unwrap())
+        );
+
+        // ...but one outside it no longer does, even though it exists. This is
+        // the branch that used to be taken on trust.
+        let outside = root.join("secret.png");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(
+            resolve_local_path(&outside.to_string_lossy(), Some(&media_root)).is_none(),
+            "absolute path outside media_root must be rejected"
+        );
+
+        // No root means nothing to contain against: fail closed, do not accept.
+        assert!(
+            resolve_local_path(&inside.to_string_lossy(), None).is_none(),
+            "absolute path with no media_root must be rejected"
+        );
+    }
+
+    /// QQ writes `::NTOSFull::<absolute path>` for some cached originals. It is
+    /// not attacker syntax, and it is inert: the leading `::` means it is not
+    /// absolute, so it joins under `nt_data` as one ordinary component and then
+    /// fails at `canonicalize` with `InvalidFilename`. Pinned so a future
+    /// "helpfully strip the prefix" change cannot quietly turn a database value
+    /// back into an absolute path.
+    #[test]
+    fn resolve_rejects_qq_ntosfull_marker() {
+        let root = temp_dir("ntos");
+        let media_root = root.join("nt_data");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let outside = root.join("secret.png");
+        std::fs::write(&outside, b"x").unwrap();
+
+        let marker = format!("::NTOSFull::{}", outside.to_string_lossy());
+        assert!(!Path::new(&marker).is_absolute(), "the leading :: makes it relative");
+        assert!(resolve_local_path(&marker, Some(&media_root)).is_none());
     }
 
     // ---- cache-index fallback tests -------------------------------------

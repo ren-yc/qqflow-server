@@ -63,13 +63,19 @@ fn test_state() -> Arc<AppState> {
     let mut store = Store::default();
     // A real temp file backing the image message's localPath, so the media
     // endpoint test can serve actual bytes.
-    let media_file = std::env::temp_dir().join(format!(
-        "qqflow_api_smoke_{}_{}.jpg",
-        std::process::id(),
-        unique_suffix()
-    ));
+    //
+    // It lives under a fake `nt_data` root, and the store carries that root
+    // exactly as `build_index` sets it in production. `resolve_local_path`
+    // contains its result to `media_root`, so a bare temp path with
+    // `media_root: None` resolves to nothing and no media would export.
+    let media_root = std::env::temp_dir()
+        .join(format!("qqflow_api_smoke_{}_{}", std::process::id(), unique_suffix()))
+        .join("nt_data");
+    std::fs::create_dir_all(&media_root).unwrap();
+    let media_file = media_root.join("fake_image.jpg");
     std::fs::write(&media_file, b"\xFF\xD8 fake jpeg bytes \xFF\xD9").unwrap();
     let media_local = media_file.to_string_lossy().into_owned();
+    store.media_root = Some(media_root);
     // group 10001 with two messages
     let conv = Conversation {
         chat_type: ChatType::Group,

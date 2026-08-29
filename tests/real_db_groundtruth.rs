@@ -256,7 +256,10 @@ fn fake_db_index_media_metadata() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    // Media registration needs the account's nt_data root: `resolve_local_path`
+    // contains its result to it, so passing None registers nothing at all.
+    let media_root = qqflow_server::store::media::media_root_of(&nt_db);
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
     drop(reader);
 
     // Media map: md5 key -> local cache file.
@@ -314,7 +317,10 @@ async fn fake_db_media_endpoint_serves_bytes() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    // See `fake_db_index_media_metadata`: without the nt_data root the local
+    // path is contained out and no media registers, so there is nothing to serve.
+    let media_root = qqflow_server::store::media::media_root_of(&nt_db);
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
     drop(reader);
     drop(writer);
 
@@ -503,7 +509,10 @@ async fn fake_db_media_export_serves_exported_bytes() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    // See `fake_db_index_media_metadata`: the export copies FROM the local
+    // cache, so it needs the nt_data root that contains those paths.
+    let media_root = qqflow_server::store::media::media_root_of(&nt_db);
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
     drop(reader);
     drop(writer);
 
@@ -1339,4 +1348,297 @@ fn real_db_groundtruth() {
         drop(reader);
         println!("[GT] qq {} done: live open+queries {:.1}s", info.qq, t0.elapsed().as_secs_f64());
     }
+}
+
+/// [45812] Trust-boundary probe for the local cache path.
+///
+/// `store::media::resolve_local_path` takes an ABSOLUTE "45812" as-is, with no
+/// containment check, on the stated grounds that it "comes from QQ's own DB".
+/// That is an assumption about NTQQ, not something the server enforces: 45812 is
+/// decoded from the same 40800 blob as 45402 (file name) and 45424 (md5), so if a
+/// remote sender's value could survive into the receiver's database, then
+/// `/api/v1/media/{id}` would read, and `media=1` would additionally COPY, an
+/// attacker-chosen absolute path.
+///
+/// This measures the real distribution instead of guessing. Per direction
+/// ("40013": 0 received / 1,2 sent / 3 system) it counts absolute vs relative
+/// values, how many resolve under this account's own `nt_data`, and how many
+/// carry a hostile shape (`..`, a control character, or a `:` past the drive
+/// letter). Received rows are the ones that matter — a value there that points
+/// outside this machine's own cache is the smoking gun.
+///
+/// What this can and cannot establish: it proves what is (or is not) present in
+/// a real database, so a non-zero hostile count is conclusive. Zero is strong
+/// evidence that NTQQ rewrites the field locally, but it is not a protocol
+/// proof — only injecting a crafted message from a peer would be that. Treat a
+/// clean result as "no observed exposure on real data", not "unreachable".
+///
+/// Ignored by default; same env vars as [`real_db_groundtruth`].
+#[test]
+#[ignore]
+fn real_db_local_path_trust_boundary() {
+    let (root, key) = match (std::env::var("QQFLOW_TEST_DB_ROOT"), std::env::var("QQFLOW_TEST_DB_KEY")) {
+        (Ok(r), Ok(k)) => (r, k),
+        _ => {
+            println!("[45812] SKIPPED: QQFLOW_TEST_DB_ROOT / QQFLOW_TEST_DB_KEY not set");
+            return;
+        }
+    };
+
+    #[derive(Default)]
+    struct Stat {
+        rows: u64,
+        with_media: u64,
+        with_path: u64,
+        absolute: u64,
+        relative: u64,
+        under_own_nt_data: u64,
+        outside_own_nt_data: u64,
+        hostile: u64,
+        dotdot: u64,
+        ctrl: u64,
+        stray_colon: u64,
+        ntos_prefix: u64,
+        resolvable: u64,
+        resolvable_outside: u64,
+    }
+    /// QQ's own marker for "the full-resolution original", written by NTQQ ahead
+    /// of an absolute path. It is not attacker syntax, and it is inert: the
+    /// leading `::` means [`Path::is_absolute`] is false, so the value takes the
+    /// RELATIVE branch of `resolve_local_path`, gets joined under `nt_data`
+    /// (no escape — `::NTOSFull::D:\...` is a single ordinary component to
+    /// `Path::join`, not a drive prefix), and then fails closed at `canonicalize`
+    /// with `InvalidFilename` (Windows os error 123). Measured, not assumed.
+    const NTOS_PREFIX: &str = "::NTOSFull::";
+
+    /// A hostile shape for a value that will be fed to the filesystem with no
+    /// containment check. `:` is only legitimate as the drive colon at index 1.
+    /// Returns the reasons separately — an aggregate count cannot distinguish a
+    /// traversal from a benign shape that merely trips one of the tests.
+    ///
+    /// [`NTOS_PREFIX`] is stripped before the colon test: leaving it in makes
+    /// every thumbnail row on a real database look hostile (86 of 1170 here),
+    /// which drowns the signal we are actually looking for. `..` and control
+    /// characters are still tested on the FULL string, so the strip cannot be
+    /// used to smuggle either one past this check.
+    fn hostile(p: &str) -> (bool, bool, bool) {
+        let dotdot = std::path::Path::new(p)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+        let ctrl = p.contains(|c: char| c.is_control());
+        let colon_scan = p.strip_prefix(NTOS_PREFIX).unwrap_or(p);
+        let stray_colon = colon_scan.char_indices().any(|(i, c)| c == ':' && i != 1);
+        (dotdot, ctrl, stray_colon)
+    }
+    /// Case-insensitive prefix test: Windows paths differ only in case here, and
+    /// the real values mix `D:\AppData\...` with QQ's own capitalization.
+    fn under(path: &str, root: &std::path::Path) -> bool {
+        let norm = |s: &str| s.to_ascii_lowercase().replace('/', "\\");
+        norm(path).starts_with(&norm(&root.to_string_lossy()))
+    }
+
+    let accounts = scan::scan_accounts(Some(Path::new(&root))).expect("scan custom root");
+    let mut grand_hostile = 0u64;
+    let mut grand_outside = 0u64;
+    let mut grand_resolvable_outside = 0u64;
+
+    for info in &accounts {
+        let own_nt_data = info
+            .path
+            .parent()
+            .and_then(qqflow_server::store::media::media_root_of)
+            .expect("nt_data root derives from the db dir");
+        // `resolve_local_path` returns canonicalized paths, so containment has to
+        // be judged against a canonicalized root too. Falls back to the plain root
+        // if nt_data does not exist (an account with no cached media yet).
+        let canon_nt_data = own_nt_data.canonicalize().unwrap_or_else(|_| own_nt_data.clone());
+        println!(
+            "[45812] qq {} nt_data root = {} (canonical {})",
+            info.qq,
+            own_nt_data.display(),
+            canon_nt_data.display()
+        );
+
+        let mut reader = LiveReader::new(info.path.clone(), key.clone());
+        reader.open().expect("real DB must open read-only through the offset VFS");
+        let conn = reader.acquire().unwrap();
+
+        // 0 received / 1,2 sent / 3 system / None unknown -> one bucket each.
+        let mut buckets: std::collections::BTreeMap<&'static str, Stat> = Default::default();
+        let mut samples: Vec<String> = Vec::new();
+        let mut hostile_samples: Vec<String> = Vec::new();
+
+        for table in ["group_msg_table", "c2c_msg_table"] {
+            // "40013" and "40800" are not guaranteed present on every schema
+            // revision — introspect before selecting, like the loader does.
+            let cols: BTreeSet<String> = {
+                let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")")).unwrap();
+                let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+                rows.flatten().collect()
+            };
+            if !cols.contains("40800") {
+                println!("[45812] {table}: no 40800 column, skipping");
+                continue;
+            }
+            let has_dir = cols.contains("40013");
+            let sql = if has_dir {
+                format!("SELECT \"40800\", \"40013\" FROM {table}")
+            } else {
+                format!("SELECT \"40800\", NULL FROM {table}")
+            };
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, Option<Vec<u8>>>(0)?, r.get::<_, Option<i64>>(1)?))
+                })
+                .unwrap();
+
+            for (blob, dir) in rows.flatten() {
+                let bucket = match dir {
+                    Some(0) => "received",
+                    Some(1) | Some(2) => "sent",
+                    Some(3) => "system",
+                    _ => "unknown",
+                };
+                let st = buckets.entry(bucket).or_default();
+                st.rows += 1;
+                let Some(blob) = blob else { continue };
+                let parsed = qqflow_server::parser::extract_message(&blob);
+                let Some(media) = parsed.media.as_ref() else { continue };
+                st.with_media += 1;
+                let Some(lp) = media.local_path.as_deref().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                st.with_path += 1;
+                let is_abs = Path::new(lp).is_absolute();
+                if is_abs {
+                    st.absolute += 1;
+                } else {
+                    st.relative += 1;
+                }
+                // Relative values resolve against own nt_data by construction,
+                // so containment only has meaning for the absolute ones.
+                if !is_abs || under(lp, &own_nt_data) {
+                    st.under_own_nt_data += 1;
+                } else {
+                    st.outside_own_nt_data += 1;
+                    if samples.len() < 8 {
+                        samples.push(format!("[{bucket}] OUTSIDE own nt_data: {lp:?}"));
+                    }
+                }
+                if lp.starts_with(NTOS_PREFIX) {
+                    st.ntos_prefix += 1;
+                }
+                // What the production resolver actually returns today. This is
+                // the number that decides how a containment fix must be shaped:
+                // rows that do not resolve now cannot be broken by tightening,
+                // and `resolvable_outside` is exactly what a naive
+                // "must live under nt_data" rule would start rejecting.
+                // Deliberately NOT `resolve_local_path`: that function now
+                // enforces containment, so asking it would make the count 0 by
+                // construction and measure the fix instead of the data. This
+                // replicates the OLD permissive resolution — join-or-take-as-is,
+                // then canonicalize — which is what tells us how much real media
+                // the containment rule actually costs.
+                let raw_joined = if is_abs {
+                    Some(Path::new(lp).to_path_buf())
+                } else if Path::new(lp)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    None
+                } else {
+                    Some(own_nt_data.join(lp))
+                };
+                if let Some(got) = raw_joined.and_then(|p| p.canonicalize().ok()) {
+                    st.resolvable += 1;
+                    // Compare against the CANONICAL root, with `Path::starts_with`
+                    // (component-wise) rather than the string `under()` helper:
+                    // canonicalize returns a `\\?\`-prefixed verbatim path on
+                    // Windows that no raw-string prefix test can ever match.
+                    // Getting this wrong reports 100% of rows as "outside".
+                    if !got.starts_with(&canon_nt_data) {
+                        st.resolvable_outside += 1;
+                    }
+                }
+                let (dotdot, ctrl, stray_colon) = hostile(lp);
+                if dotdot || ctrl || stray_colon {
+                    st.hostile += 1;
+                    st.dotdot += u64::from(dotdot);
+                    st.ctrl += u64::from(ctrl);
+                    st.stray_colon += u64::from(stray_colon);
+                    // Separate buffer: the OUTSIDE samples would otherwise fill
+                    // the quota before a single hostile value was ever shown.
+                    if hostile_samples.len() < 10 {
+                        let why = [("..", dotdot), ("ctrl", ctrl), (":", stray_colon)]
+                            .iter()
+                            .filter(|(_, hit)| *hit)
+                            .map(|(n, _)| *n)
+                            .collect::<Vec<_>>()
+                            .join("+");
+                        hostile_samples.push(format!("[{bucket}] why={why} abs={is_abs} {lp:?}"));
+                    }
+                }
+            }
+        }
+
+        for (name, s) in &buckets {
+            println!(
+                "[45812] qq {} {name}: rows={} media={} path={} abs={} rel={} underOwn={} OUTSIDE={} HOSTILE={} (..={} ctrl={} colon={}) ntos={} resolvable={} resolvableOutside={}",
+                info.qq,
+                s.rows,
+                s.with_media,
+                s.with_path,
+                s.absolute,
+                s.relative,
+                s.under_own_nt_data,
+                s.outside_own_nt_data,
+                s.hostile,
+                s.dotdot,
+                s.ctrl,
+                s.stray_colon,
+                s.ntos_prefix,
+                s.resolvable,
+                s.resolvable_outside
+            );
+            grand_hostile += s.hostile;
+            grand_outside += s.outside_own_nt_data;
+            grand_resolvable_outside += s.resolvable_outside;
+        }
+        for s in &samples {
+            println!("[45812] sample {s}");
+        }
+        for s in &hostile_samples {
+            println!("[45812] HOSTILE {s}");
+        }
+        drop(reader);
+    }
+
+    println!(
+        "[45812] TOTAL outside-own-nt_data={grand_outside} resolvable-outside={grand_resolvable_outside} hostile={grand_hostile}"
+    );
+    // Not asserted as a hard invariant: a legitimate account migration or a QQ
+    // reinstall can leave absolute paths naming an older root, so "outside" is
+    // reported for judgement rather than failed on. A hostile SHAPE has no
+    // benign explanation, and is what an exploit would have to produce.
+    assert_eq!(
+        grand_hostile, 0,
+        "a hostile 45812 shape on real data means the absolute branch of resolve_local_path is reachable with attacker input"
+    );
+    // The measurement that justifies containing the absolute branch to
+    // `media_root`, computed against the OLD permissive resolution so it keeps
+    // measuring the data rather than the fix.
+    //
+    // `outside` counts values that merely NAME another root (984 on this
+    // account, all under a dead `QQ Files` install that no longer exists on
+    // disk); those resolve to nothing either way, so containment cannot regress
+    // them. `resolvable_outside` counts values that WOULD have resolved under
+    // the old rule yet land outside the root — exactly the media containment
+    // newly rejects. Zero means the rule is free here; a non-zero count on some
+    // other account means containment costs real media on that machine and the
+    // rule needs widening to an allowlist of QQ-owned roots instead.
+    assert_eq!(
+        grand_resolvable_outside, 0,
+        "the pre-fix resolution reached files outside media_root, so containment costs real media on this account and needs a QQ-root allowlist"
+    );
 }

@@ -119,11 +119,17 @@ pub async fn exported_handler(
     if !matches!(media_type.as_str(), "images" | "voices" | "videos" | "emojis") {
         return Err(ApiError::not_found("媒体不存在"));
     }
-    // Path segments come from the URL: reject empty / "." / ".." / anything
-    // carrying a separator (the media_type whitelist already narrows one
-    // segment; talker and file get the same treatment here).
-    let seg_ok = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\\');
-    if !(seg_ok(&talker) && seg_ok(&media_type) && seg_ok(&file)) {
+    // Path segments come from the URL. The local check used to stop at
+    // separators and `.`/`..`, which leaves the Windows cases: a trailing dot
+    // or space is stripped by Win32, and a `:` both opens an NTFS alternate
+    // data stream and makes `Path::join` discard the root entirely. The
+    // canonicalize + `starts_with` below did backstop all of that, but only one
+    // of the four surfaces that build paths here had that backstop, so the
+    // shared rule is applied first and the backstop stays.
+    if !(crate::pathsafe::safe_segment(&talker)
+        && crate::pathsafe::safe_segment(&media_type)
+        && crate::pathsafe::safe_segment(&file))
+    {
         return Err(ApiError::not_found("媒体不存在"));
     }
     // Canonicalize both paths on the blocking pool (real file IO), then

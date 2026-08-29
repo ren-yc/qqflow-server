@@ -456,19 +456,26 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
     let mut removed = 0usize;
     for talker in talkers {
         // Talkers come from the database, not the request, but they end up as
-        // a path segment — same containment rule as the media route.
-        let bad = talker.is_empty()
-            || talker == "."
-            || talker == ".."
-            || talker.contains('/')
-            || talker.contains('\\');
-        if bad {
+        // a path segment — same containment rule as the media route, from the
+        // shared module rather than a local copy that had drifted to a subset
+        // of the checks (this one missed `:`, which makes `Path::join` discard
+        // `root` outright, and the Windows trailing-dot case).
+        if !crate::pathsafe::safe_segment(talker) {
             tracing::warn!("[deregister] 跳过异常 talker 目录名: {talker:?}");
             continue;
         }
         let dir = root.join(talker);
         for kind in EXPORT_KINDS {
             let sub = dir.join(kind);
+            // This is a recursive delete, and it is the one path here that has
+            // no read-side backstop to catch a mistake. Assert the parent really
+            // resolves under the export root before removing anything: a
+            // junction planted at `<root>/<talker>` would otherwise be followed
+            // out of the export directory.
+            if !crate::pathsafe::is_contained(root, &sub) {
+                tracing::warn!("[deregister] 跳过越界导出目录: {}", sub.display());
+                continue;
+            }
             match std::fs::remove_dir_all(&sub) {
                 Ok(()) => removed += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

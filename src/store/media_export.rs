@@ -30,6 +30,14 @@ pub struct ExportOptions {
     pub video: bool,
     /// QQ emoji (content type 6) carry display text only — recognized but
     /// inert in v1 (animated gif images export under `images`).
+    ///
+    /// Deliberately never read: [`export_page`] dispatches on
+    /// [`crate::parser::types::media_type_str`], which only ever yields
+    /// `image` / `voice` / `video`, so no row can be classified as an emoji and
+    /// there is nothing for this switch to gate. It exists because the WeFlow
+    /// API accepts an `emoji` parameter and dropping it from the struct would
+    /// make the handler silently diverge from the contract. Wire it up here if
+    /// a later parser learns to emit an `emoji` kind.
     pub emoji: bool,
 }
 
@@ -63,9 +71,14 @@ pub struct ExportOut {
 /// are arbitrary and DO collide across messages), else QQ's file name when
 /// it is a bare URL-safe name, else the source file name.
 fn export_file_name(m: &MediaInfo, source: &Path) -> String {
+    // `.` is allowed (extensions), which is what let `..` and `...` through:
+    // both are built only from accepted bytes. They are not hypothetical — a
+    // dot-only value reaches here whenever QQ's `fileName` is one — and on
+    // Windows a trailing dot is stripped, so `x..` normalizes to `x`. Delegate
+    // the dot rules to `pathsafe::safe_segment` and keep the URL-charset rule
+    // local, since these names also go into a URL path.
     let url_safe = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 128
+        crate::pathsafe::safe_segment(s)
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     };
@@ -116,12 +129,34 @@ pub fn export_media(
         .and_then(|p| resolve_local_path(p, media_root))
         .or_else(|| fallback_path.and_then(|p| resolve_local_path(p, media_root)))?;
     let file_name = export_file_name(m, &source);
+    // `talker` is a caller-supplied query parameter and `file_name` is derived
+    // from the database, so both are checked before either becomes a path
+    // component. Today a traversal `talker` is stopped one layer up — the store
+    // looks conversations up by exact key, so it yields no rows and never
+    // reaches here — but that is a property of the caller, not of this writer,
+    // and this is the only place in the process that CREATES directories.
+    if !crate::pathsafe::safe_segment(&ctx.talker) || !crate::pathsafe::safe_segment(&file_name) {
+        tracing::warn!(
+            "[media-export] unsafe path component rejected: talker={:?} file={:?}",
+            ctx.talker,
+            file_name
+        );
+        return None;
+    }
     let dest_dir = ctx.root.join(&ctx.talker).join(kind_dir);
     if std::fs::create_dir_all(&dest_dir).is_err() {
         tracing::debug!("[media-export] create dir failed: {}", dest_dir.display());
         return None;
     }
     let dest = dest_dir.join(&file_name);
+    // Containment after the fact, not just filtering before it: the segment
+    // checks above are lexical, and on Windows the filesystem gets a say
+    // (short names, symlinks, junctions). `create_dir_all` has already run, so
+    // the parent exists and canonicalizes.
+    if !crate::pathsafe::is_contained(&ctx.root, &dest) {
+        tracing::warn!("[media-export] destination escaped export root: {}", dest.display());
+        return None;
+    }
     // Idempotent: same-size destination is already exported.
     if let (Ok(dm), Ok(sm)) = (dest.metadata(), source.metadata())
         && dm.is_file() && dm.len() == sm.len()
@@ -238,7 +273,10 @@ mod tests {
     #[test]
     fn export_copies_and_is_idempotent() {
         let root = temp_dir("copy");
-        let src_dir = root.join("src");
+        // The source lives under the account's nt_data root, as it does in
+        // production: `resolve_local_path` contains its result to that root, so
+        // a fixture that passes `media_root: None` no longer resolves anything.
+        let src_dir = root.join("nt_data");
         std::fs::create_dir_all(&src_dir).unwrap();
         let src = src_dir.join("aabb.png");
         std::fs::write(&src, b"fake image bytes").unwrap();
@@ -248,7 +286,7 @@ mod tests {
             talker: "10001".into(),
         };
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
-        let e = export_media(&ctx, &m, "images", true, None, None).expect("export");
+        let e = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("export");
         assert_eq!(e.file_name, "aabbccddeeff00112233445566778899.png");
         assert_eq!(
             e.url,
@@ -258,7 +296,7 @@ mod tests {
         assert_eq!(std::fs::read(dest).unwrap(), b"fake image bytes");
         let mtime = dest.metadata().unwrap().modified().unwrap();
         // Second export: same key + same size -> skip, mtime untouched.
-        let e2 = export_media(&ctx, &m, "images", true, None, None).expect("idempotent");
+        let e2 = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
         // Different content, same QQ file name: never the same destination
@@ -266,7 +304,7 @@ mod tests {
         let src2 = src_dir.join("b.png");
         std::fs::write(&src2, b"different bytes, same claimed name").unwrap();
         let m2 = media("ffeeddccbbaa99887766554433221100", Some("aabb.png"), Some(src2.to_str().unwrap()));
-        let e3 = export_media(&ctx, &m2, "images", true, None, None).expect("export2");
+        let e3 = export_media(&ctx, &m2, "images", true, Some(&src_dir), None).expect("export2");
         assert_ne!(e3.file_name, e.file_name, "same QQ name, different md5 -> different file");
         assert_eq!(e3.file_name, "ffeeddccbbaa99887766554433221100.png");
     }
@@ -274,25 +312,82 @@ mod tests {
     #[test]
     fn export_omits_missing_source_and_disabled_kind() {
         let root = temp_dir("omit");
+        let nt_data = root.join("nt_data");
+        std::fs::create_dir_all(&nt_data).unwrap();
         let ctx = ExportContext {
             root: root.join("out"),
             base_url: "http://127.0.0.1:5032".into(),
             talker: "10001".into(),
         };
         let m = media("aabbccddeeff00112233445566778899", Some("gone.png"), Some("C:\\SomeUser\\gone.png"));
-        assert!(export_media(&ctx, &m, "images", true, None, None).is_none(), "missing source -> None");
-        let src = root.join("x.png");
+        assert!(
+            export_media(&ctx, &m, "images", true, Some(&nt_data), None).is_none(),
+            "missing source -> None"
+        );
+        let src = nt_data.join("x.png");
         std::fs::write(&src, b"x").unwrap();
         let m = media("aabbccddeeff00112233445566778899", Some("x.png"), Some(src.to_str().unwrap()));
-        assert!(export_media(&ctx, &m, "images", false, None, None).is_none(), "disabled kind -> None");
+        assert!(
+            export_media(&ctx, &m, "images", false, Some(&nt_data), None).is_none(),
+            "disabled kind -> None"
+        );
 
         // Fallback source: the row has no 45812, but the registered store
         // entry points at a live file — export must resolve through it.
-        let fb = root.join("fallback.jpg");
+        let fb = nt_data.join("fallback.jpg");
         std::fs::write(&fb, b"fb bytes").unwrap();
         let m = media("aabbccddeeff00112233445566778899", Some("a.jpg"), None);
-        let e = export_media(&ctx, &m, "images", true, None, Some(fb.to_str().unwrap()))
+        let e = export_media(&ctx, &m, "images", true, Some(&nt_data), Some(fb.to_str().unwrap()))
             .expect("fallback source exports");
         assert_eq!(std::fs::read(Path::new(&e.local_path)).unwrap(), b"fb bytes");
+
+        // A source outside nt_data is no longer exportable even though it
+        // exists — the trust-boundary change, asserted where it is observable.
+        let outside = root.join("outside.jpg");
+        std::fs::write(&outside, b"nope").unwrap();
+        let m = media("aabbccddeeff00112233445566778899", Some("b.jpg"), None);
+        assert!(
+            export_media(&ctx, &m, "images", true, Some(&nt_data), Some(outside.to_str().unwrap())).is_none(),
+            "source outside media_root must not export"
+        );
+    }
+
+    /// A traversal `talker` must not create anything outside the export root.
+    /// The store stops such a request one layer earlier (conversations are
+    /// looked up by exact key, so it matches nothing), which is why this is
+    /// asserted here rather than through the handler: the writer has to hold
+    /// the line on its own.
+    #[test]
+    fn export_rejects_traversal_talker() {
+        let root = temp_dir("talker");
+        let nt_data = root.join("nt_data");
+        std::fs::create_dir_all(&nt_data).unwrap();
+        let src = nt_data.join("aabb.png");
+        std::fs::write(&src, b"bytes").unwrap();
+        let out_root = root.join("out");
+        std::fs::create_dir_all(&out_root).unwrap();
+
+        let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
+        for talker in ["..", "../../pwned", r"..\..\pwned", "a:b", "10001.", "", "."] {
+            let ctx = ExportContext {
+                root: out_root.clone(),
+                base_url: "http://127.0.0.1:5032".into(),
+                talker: talker.to_string(),
+            };
+            assert!(
+                export_media(&ctx, &m, "images", true, Some(&nt_data), None).is_none(),
+                "talker {talker:?} must not export"
+            );
+        }
+        // Nothing escaped: the export root holds no sibling the loop created.
+        assert!(!root.join("pwned").exists(), "traversal created a directory outside the export root");
+        // ...and the legitimate case still works, so the guard is not just
+        // rejecting everything.
+        let ctx = ExportContext {
+            root: out_root.clone(),
+            base_url: "http://127.0.0.1:5032".into(),
+            talker: "10001".into(),
+        };
+        assert!(export_media(&ctx, &m, "images", true, Some(&nt_data), None).is_some());
     }
 }

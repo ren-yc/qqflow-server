@@ -13,6 +13,7 @@ pub mod db;
 pub mod keystore;
 pub mod logging;
 pub mod parser;
+pub mod pathsafe;
 pub mod sync;
 pub mod server;
 pub mod store;
