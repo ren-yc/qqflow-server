@@ -753,6 +753,21 @@ pub async fn run_with_shutdown(
     // Zero accounts is a valid start state — a client will register them
     // with qq + key + db_path via POST /api/v1/accounts.
     let accounts = db::scan::scan_accounts(None)?;
+    // Only the COUNT is logged, never the QQ numbers. `/health` pays a
+    // type-level price to avoid enumerating accounts without a token
+    // (`AccountPhase` has no `AwaitingKey` variant precisely so a scanned
+    // account cannot leak through the unauthenticated endpoint) — printing the
+    // list here would route around that for anyone who can read the log. The
+    // numbers stay available to authenticated callers via
+    // `GET /api/v1/accounts`.
+    if accounts.is_empty() {
+        tracing::info!("[init] 未发现本机 QQ 账号目录（客户端可显式传 db_path 注册）");
+    } else {
+        tracing::info!(
+            "[init] 发现 {} 个账号目录，等待注册（清单见 GET /api/v1/accounts，需鉴权）",
+            accounts.len()
+        );
+    }
 
     // ---- state -----------------------------------------------------------
     let store = Arc::new(RwLock::new(Store::default()));
