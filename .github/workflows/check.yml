@@ -1,0 +1,113 @@
+# Pull-request / push gate: clippy with warnings denied, then the test suite.
+#
+# Why both OSes rather than just Linux: account discovery is genuinely
+# platform-conditional. `db::scan::scan_accounts` has three separate `cfg`
+# arms (Windows scans `<documents>/Tencent Files/<qq>/nt_qq/nt_db`, Linux globs
+# `~/.config/QQ/nt_qq_*`, macOS globs under `~/Library/Application Support/QQ`),
+# `scan_windows` / `documents_dir` exist only under `cfg(target_os = "windows")`,
+# and `config::data_dir` picks a different base per platform. clippy only lints
+# the branch that is actually compiled, so a Linux-only run leaves the Windows
+# arm unchecked — and Windows is the platform this service is built for.
+#
+# The macOS arm stays unlinted by this gate on purpose: a third runner would
+# roughly triple the cost of the most expensive step (vendored OpenSSL) to cover
+# one `cfg` branch, and release.yml already builds `aarch64-apple-darwin` on
+# tag, so a macOS compile break surfaces there. Add `macos-latest` here if that
+# arm ever grows logic worth linting on every PR.
+#
+# Both jobs go through scripts/build.{ps1,sh}, the same wrappers release.yml
+# uses: rusqlite bundles SQLCipher + vendored OpenSSL, whose perl Configure
+# flow calls cl.exe/link.exe directly and needs the vcvars environment that
+# the cc crate does not set up on its own.
+#
+# The toolchain is pinned in rust-toolchain.toml, which is what makes
+# `-D warnings` safe to gate on: a floating toolchain would let a new stable
+# release introduce a lint and turn every PR red without a code change.
+#
+# The matrix `os:` values are not free-form — they are GitHub's hosted-runner
+# labels, and only labels GitHub publishes will schedule (a typo queues forever
+# rather than failing fast). `-latest` is a moving alias GitHub repoints on its
+# own schedule, so unlike the toolchain the runner image is deliberately NOT
+# pinned here. If an image bump ever breaks the Windows job (MSVC / Strawberry
+# Perl / nasm all come from the image, not from us), pin to a dated label such
+# as `windows-2025` to decouple the fix from the image rollout.
+#
+# The ground-truth tests that need a real QQ database are `#[ignore]`d and read
+# QQFLOW_TEST_DB_ROOT / QQFLOW_TEST_DB_KEY, so they are skipped here rather than
+# silently passing against nothing — CI has no account, and the key must never
+# reach it. Run them locally when touching the parser or the media resolver.
+#
+# Note there is deliberately no `cargo fmt --check` step. Adding it is a
+# separate decision (and a separate commit) from this gate; see the fmt state of
+# the repository before turning it on, because a check that fails on the first
+# PR that touches an untouched file is worse than no check.
+#
+# Do NOT "simplify" this by hoisting `RUSTFLAGS: -Dwarnings` to the job level.
+# It looks like it would save a compile — `-- -D warnings` gives the clippy step
+# its own build fingerprint, so clippy and test do not share a cache and the
+# vendored OpenSSL is built twice on a cold run. But `RUSTFLAGS` applies at link
+# time too, and on Windows the MSVC link emits LNK4099 (missing OpenSSL PDBs)
+# under the `linker_messages` warn-by-default lint. Denying warnings globally
+# turns that into a hard error and the Windows test step can never pass. This is
+# observed on this repository, not hypothetical.
+# The double build is the cheaper problem, and rust-cache absorbs it after the
+# first successful run caches both fingerprints.
+name: check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the in-flight run obsolete. Cancelling it
+# matters more than usual here because the vendored OpenSSL build is expensive.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # release.yml budgets 90 for compiling vendored OpenSSL once; a cold run here
+    # compiles it twice (see the fingerprint note above), so allow more headroom.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false # a Windows-only or Linux-only failure is the interesting case
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # --locked: fail rather than silently resolve a different dependency set
+      # than Cargo.lock records, so CI tests what a checkout actually builds.
+      - name: clippy (deny warnings)
+        if: runner.os == 'Windows'
+        run: powershell -File scripts/build.ps1 clippy --all-targets --locked -- -D warnings
+
+      - name: clippy (deny warnings)
+        if: runner.os != 'Windows'
+        run: bash scripts/build.sh clippy --all-targets --locked -- -D warnings
+
+      - name: test
+        if: runner.os == 'Windows'
+        run: powershell -File scripts/build.ps1 test --locked
+
+      - name: test
+        if: runner.os != 'Windows'
+        run: bash scripts/build.sh test --locked
