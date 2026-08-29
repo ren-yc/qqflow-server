@@ -342,12 +342,19 @@ impl SyncEngine {
     }
 
     /// Manual sync: run a full pass on every registered account and return
-    /// all newly appended messages, newest first. Name maps (备注/群名) and
-    /// the media cache-index fallback ride the manual sync — the one place
-    /// a client-visible refresh happens. The fallback refreshes BEFORE the
-    /// poll so newly-read rows can already register through it.
-    pub fn sync_all(&self) -> Vec<MessageOut> {
-        let mut out = Vec::new();
+    /// `(newMessages, revokeMessages)` — how many rows the pass appended,
+    /// split the same way WeFlow splits them (a recall is not counted as a
+    /// new message). Name maps (备注/群名) and the media cache-index fallback
+    /// ride the manual sync — the one place a client-visible refresh happens.
+    /// The fallback refreshes BEFORE the poll so newly-read rows can already
+    /// register through it.
+    ///
+    /// The rows themselves are deliberately not returned: the endpoint is a
+    /// trigger, and clients read the appended rows back through
+    /// `/api/v1/messages` (or receive them on the SSE stream) rather than
+    /// from a second, differently-shaped copy.
+    pub fn sync_all(&self) -> (usize, usize) {
+        let (mut new_count, mut revoke_count) = (0usize, 0usize);
         for account in self.snapshot() {
             // A deregistration concurrent with this call may already have
             // stopped the account after `snapshot` cloned it; `poll_once`
@@ -359,14 +366,19 @@ impl SyncEngine {
             account.refresh_media_fallback();
             match account.poll_once() {
                 Ok(messages) => {
-                    out.extend(messages);
+                    for m in &messages {
+                        if MsgType::from_code(m.local_type) == MsgType::Recall {
+                            revoke_count += 1;
+                        } else {
+                            new_count += 1;
+                        }
+                    }
                     account.refresh_names();
                 }
                 Err(e) => tracing::warn!("manual sync error: {e:#}"),
             }
         }
-        out.sort_by_key(|m| std::cmp::Reverse((m.create_time, m.local_id)));
-        out
+        (new_count, revoke_count)
     }
 }
 

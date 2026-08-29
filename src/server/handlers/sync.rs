@@ -2,9 +2,14 @@
 //!
 //! Immediately runs a full sync pass on every account (incremental append
 //! against the live connection, bypassing the change-detection poll loop)
-//! and returns the newly appended messages, newest first. Use this at
-//! client initialization or for a manual refresh to pull the most recent
-//! rows.
+//! and reports how many rows it appended. Use this at client initialization
+//! or for a manual refresh; read the rows themselves back through
+//! `/api/v1/messages`, or receive them on the SSE stream.
+//!
+//! The response is counts-only (`newMessages` / `revokeMessages`), matching
+//! weflow-server. WeFlow (安装版) has no `/api/v1/sync` at all, so there is
+//! no baseline shape to align to — and returning the rows here would be a
+//! second, differently-shaped copy of the messages face for no gain.
 
 use std::sync::Arc;
 
@@ -15,21 +20,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::server::error::ApiError;
-use crate::store::query::MessageOut;
 use crate::store::AppState;
 
 use super::{authorized, merge_body};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Params {
-    #[serde(default = "default_limit")]
-    pub limit: usize,
     #[serde(default, alias = "token")]
     pub access_token: Option<String>,
-}
-
-fn default_limit() -> usize {
-    100
 }
 
 pub async fn handler(
@@ -45,23 +43,16 @@ pub async fn handler(
     if !state.ready.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError::not_ready());
     }
-    let limit = params.limit.clamp(1, 10000);
-
     // The sync does blocking DB work (SQLCipher open on reconnect, query) —
     // run it off the async runtime.
     let engine = state.sync.clone();
-    let records = tokio::task::spawn_blocking(move || engine.sync_all())
+    let (new_count, revoke_count) = tokio::task::spawn_blocking(move || engine.sync_all())
         .await
         .map_err(|e| ApiError::internal(format!("sync task panicked: {e}")))?;
 
-    let synced = records.len();
-    let messages: Vec<MessageOut> = records.into_iter().take(limit).collect();
-
     Ok(Json(json!({
         "success": true,
-        "count": messages.len(),
-        "synced": synced,
-        "hasMore": false,
-        "messages": messages,
+        "newMessages": new_count,
+        "revokeMessages": revoke_count,
     })))
 }

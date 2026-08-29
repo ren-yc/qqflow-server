@@ -357,12 +357,14 @@ async fn every_auth_transport_is_accepted() {
 #[tokio::test]
 async fn sync_empty_engine_shape() {
     // Empty SyncEngine (no accounts registered): sync succeeds with 0 rows.
+    // Counts-only shape, identical to weflow-server. `limit` is accepted and
+    // ignored (no rows are returned to limit).
     let (s, v) = get("/api/v1/sync?access_token=test-token-123456&limit=5", true).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true);
-    assert_eq!(v["synced"], 0);
-    assert_eq!(v["count"], 0);
-    assert!(v["messages"].is_array());
+    assert_eq!(v["newMessages"], 0);
+    assert_eq!(v["revokeMessages"], 0);
+    assert!(v["messages"].is_null(), "sync is a trigger, not a messages face");
 }
 
 #[tokio::test]
@@ -670,12 +672,15 @@ async fn sender_name_is_per_conversation_but_username_is_stable() {
     assert_ne!(g.sender_name, c.sender_name, "display name is per conversation");
 }
 
-/// `senderName` must not depend on which endpoint produced the row: the
-/// chatlab view resolves the same names as the WeFlow-shaped one.
+/// ChatLab splits the name into two fields that the native `senderName`
+/// merges: `accountName` is the account's own name (remark > nick > uid) and
+/// `groupNickname` is the per-conversation card (40090). WeFlow (安装版) emits
+/// them as distinct values, so a card holder must NOT show the card in
+/// `accountName` — that is the whole point of having two keys.
 #[tokio::test]
-async fn chatlab_sender_name_matches_weflow_shape() {
+async fn chatlab_splits_account_name_from_group_nickname() {
     let app = build_router(state_with_names());
-    let (_, weflow) = call(
+    let (_, native) = call(
         app.clone(),
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
     )
@@ -686,16 +691,44 @@ async fn chatlab_sender_name_matches_weflow_shape() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    // chatlab is chronological, the WeFlow shape newest-first.
-    assert_eq!(chatlab["messages"][0]["accountName"], weflow["messages"][1]["senderName"]);
-    assert_eq!(chatlab["messages"][0]["accountName"], "张三群名片");
-    let member = chatlab["members"]
-        .as_array()
-        .unwrap()
+    // chatlab is chronological, the native shape newest-first: both [0]/[1]
+    // below are u_a, who holds a card AND a remark.
+    let msg = &chatlab["messages"][0];
+    assert_eq!(msg["sender"], "u_a");
+    assert_eq!(msg["accountName"], "张三备注", "account name is the remark, not the card");
+    assert_eq!(msg["groupNickname"], "张三群名片", "the card lands in groupNickname");
+    assert_ne!(
+        msg["accountName"], msg["groupNickname"],
+        "the two keys must not be the same value"
+    );
+    // The native surface keeps the merged, card-wins meaning downstream pins.
+    assert_eq!(native["messages"][1]["senderName"], "张三群名片");
+
+    let members = chatlab["members"].as_array().unwrap();
+    let member = members
         .iter()
         .find(|m| m["platformId"] == "u_a")
         .expect("u_a in members");
-    assert_eq!(member["accountName"], "张三群名片", "members agree with messages");
+    assert_eq!(member["accountName"], "张三备注", "members agree with messages");
+    assert_eq!(member["groupNickname"], "张三群名片");
+    // u_b has a remark but no card: groupNickname is empty rather than a
+    // duplicate of accountName.
+    let b = members.iter().find(|m| m["platformId"] == "u_b").expect("u_b in members");
+    assert_eq!(b["accountName"], "李四备注");
+    assert_eq!(b["groupNickname"], "");
+    // One entry per sender, not one per message.
+    assert_eq!(members.len(), 2, "members are deduped: {members:?}");
+
+    // A group card never leaks into the private chat with the same uid.
+    let app = build_router(state_with_names());
+    let (s, c2c) = call(
+        app,
+        "/api/v1/messages?talker=u_a&chatlab=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(c2c["messages"][0]["accountName"], "张三备注");
+    assert_eq!(c2c["messages"][0]["groupNickname"], "", "c2c has no card");
 }
 
 #[tokio::test]
@@ -726,6 +759,75 @@ async fn chatlab_pull_sync_block() {
     assert_eq!(v["meta"]["platform"], "qq");
     assert_eq!(v["messages"].as_array().unwrap().len(), 2);
     assert!(v["sync"]["watermark"].as_i64().unwrap() > 0);
+}
+
+/// The Pull face emits canonical ChatLab 0.0.2 type codes, which are a
+/// DIFFERENT code space from the native `localType` on /api/v1/messages
+/// (text is 0 in both, but an image is 1 in ChatLab and 3 natively).
+#[tokio::test]
+async fn chatlab_type_is_the_chatlab_code_space_not_local_type() {
+    let app = build_router(state_with_names());
+    let (s, pull) = call(
+        app.clone(),
+        "/api/v1/sessions/10001/messages?access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // Chronological: row 1 text, row 2 image.
+    assert_eq!(pull["messages"][0]["type"], 0, "text is 0 in the ChatLab space");
+    assert_eq!(pull["messages"][1]["type"], 1, "image is 1 in the ChatLab space");
+    // Same rows through the chatlab branch of /api/v1/messages agree...
+    let (_, envelope) = call(
+        app.clone(),
+        "/api/v1/messages?talker=10001&chatlab=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(envelope["messages"][0]["type"], 0);
+    assert_eq!(envelope["messages"][1]["type"], 1);
+    // ...while the native face keeps the platform code downstream pins: the
+    // same image row is localType 3 there, not 1.
+    let (_, native) = call(
+        app,
+        "/api/v1/messages?talker=10001&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(native["messages"][0]["localType"], 3, "newest first: the image row");
+    assert_eq!(native["messages"][1]["localType"], 0);
+}
+
+/// WeFlow's Pull contract has no 400 semantics for pagination, so malformed
+/// `limit`/`offset` fall back to the defaults instead of rejecting the call.
+#[tokio::test]
+async fn chatlab_pull_tolerates_malformed_pagination() {
+    for q in ["limit=abc", "offset=abc", "limit=&offset=", "limit=0", "limit=-3"] {
+        let (s, v) = get(
+            &format!("/api/v1/sessions/10001/messages?{q}&access_token=test-token-123456"),
+            false,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{q} must not 400");
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2, "{q} served the page");
+    }
+}
+
+/// `meta.ownerId` is the bound account on both ChatLab faces (WeFlow emits its
+/// own wxid there). No account is bound in these fixtures, so it is empty —
+/// the point is that the key exists and both faces agree.
+#[tokio::test]
+async fn chatlab_meta_carries_owner_id_on_both_faces() {
+    let app = build_router(state_with_names());
+    let (_, pull) = call(
+        app.clone(),
+        "/api/v1/sessions/10001/messages?access_token=test-token-123456",
+    )
+    .await;
+    let (_, envelope) = call(
+        app,
+        "/api/v1/messages?talker=10001&chatlab=1&access_token=test-token-123456",
+    )
+    .await;
+    assert!(pull["meta"]["ownerId"].is_string());
+    assert_eq!(pull["meta"]["ownerId"], envelope["meta"]["ownerId"]);
 }
 
 #[tokio::test]

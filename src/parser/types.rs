@@ -17,6 +17,13 @@ pub enum MsgType {
 
 impl MsgType {
     /// Numeric `localType` used by WeFlow-style clients.
+    ///
+    /// This is qqflow's OWN platform-native code space and downstream pins it
+    /// (briefdesk keys image detection on `localType == 3` and drops `6`/`7`).
+    /// It deliberately does NOT match the ChatLab enum — see
+    /// [`MsgType::chatlab_type`], which is the cross-platform normalized view.
+    /// Changing the values here is a breaking API change; changing them to
+    /// "fix" ChatLab conformance would be a bug.
     pub fn code(self) -> i64 {
         match self {
             MsgType::Text => 0,
@@ -26,6 +33,45 @@ impl MsgType {
             MsgType::Recall => 6,
             MsgType::System => 7,
             MsgType::Other => 1,
+        }
+    }
+
+    /// Recover the variant from a [`MsgType::code`] value.
+    ///
+    /// Needed because `MessageOut` carries the code, not the variant, so the
+    /// ChatLab envelope on `/api/v1/messages` has to map back before it can
+    /// emit `chatlab_type`. `code` is injective, so this is lossless; an
+    /// unknown code degrades to `Other` (which maps to ChatLab `99`).
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            0 => MsgType::Text,
+            3 => MsgType::Image,
+            4 => MsgType::Voice,
+            5 => MsgType::Video,
+            6 => MsgType::Recall,
+            7 => MsgType::System,
+            _ => MsgType::Other,
+        }
+    }
+
+    /// Canonical ChatLab 0.0.2 `messages[].type` code.
+    ///
+    /// Per the published spec (docs.chatlab.fun/standard/chatlab-format):
+    /// 0 TEXT, 1 IMAGE, 2 VOICE, 3 VIDEO, 4 FILE, 5 EMOJI, 7 LINK,
+    /// 8 LOCATION, 20..27 interactive, 80 SYSTEM, 81 RECALL, 99 OTHER.
+    /// `6` is unassigned in 0.0.2 and must never be emitted.
+    ///
+    /// This is the cross-platform normalized field, so it is NOT
+    /// [`MsgType::code`] — the two spaces only agree on `Text = 0`.
+    pub fn chatlab_type(self) -> i64 {
+        match self {
+            MsgType::Text => 0,
+            MsgType::Image => 1,
+            MsgType::Voice => 2,
+            MsgType::Video => 3,
+            MsgType::System => 80,
+            MsgType::Recall => 81,
+            MsgType::Other => 99,
         }
     }
 
@@ -231,6 +277,56 @@ pub fn direction_to_is_send(d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `localType` is platform-native and downstream-pinned; `chatlab_type` is
+    /// the ChatLab 0.0.2 normalized code. The two must NOT be conflated — this
+    /// pins the exact values so a future edit to either cannot silently drift
+    /// into the other's space.
+    #[test]
+    fn local_type_and_chatlab_type_are_separate_code_spaces() {
+        let all = [
+            MsgType::Text,
+            MsgType::Image,
+            MsgType::Voice,
+            MsgType::Video,
+            MsgType::Recall,
+            MsgType::System,
+            MsgType::Other,
+        ];
+
+        // Native codes: briefdesk keys on 3 (image) and drops 6/7.
+        assert_eq!(MsgType::Text.code(), 0);
+        assert_eq!(MsgType::Image.code(), 3);
+        assert_eq!(MsgType::Voice.code(), 4);
+        assert_eq!(MsgType::Video.code(), 5);
+        assert_eq!(MsgType::Recall.code(), 6);
+        assert_eq!(MsgType::System.code(), 7);
+        assert_eq!(MsgType::Other.code(), 1);
+
+        // ChatLab 0.0.2 canonical codes.
+        assert_eq!(MsgType::Text.chatlab_type(), 0);
+        assert_eq!(MsgType::Image.chatlab_type(), 1);
+        assert_eq!(MsgType::Voice.chatlab_type(), 2);
+        assert_eq!(MsgType::Video.chatlab_type(), 3);
+        assert_eq!(MsgType::System.chatlab_type(), 80);
+        assert_eq!(MsgType::Recall.chatlab_type(), 81);
+        assert_eq!(MsgType::Other.chatlab_type(), 99);
+
+        // `6` is unassigned in ChatLab 0.0.2 and must never be emitted.
+        for t in all {
+            assert_ne!(t.chatlab_type(), 6, "{t:?} emits the unassigned ChatLab code 6");
+        }
+
+        // `code` is injective, so `from_code` round-trips every variant —
+        // this is what lets the ChatLab envelope recover the variant from
+        // `MessageOut.local_type`.
+        for t in all {
+            assert_eq!(MsgType::from_code(t.code()), t, "round-trip failed for {t:?}");
+        }
+        // Unknown native codes degrade to Other (ChatLab 99), never panic.
+        assert_eq!(MsgType::from_code(12345), MsgType::Other);
+        assert_eq!(MsgType::from_code(12345).chatlab_type(), 99);
+    }
 
     #[test]
     fn media_key_prefers_md5_then_file_name_md5_then_uuid() {

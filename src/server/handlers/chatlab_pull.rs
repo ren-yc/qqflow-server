@@ -15,20 +15,18 @@ use crate::store::AppState;
 
 use super::{authorized, parse_time_bound};
 
+/// Every field is a lenient `Option<String>`: WeFlow's Pull contract has no
+/// 400 semantics for malformed pagination, so garbage degrades to the default
+/// instead of rejecting the request (`?limit=abc` used to 400 here while the
+/// same value on WeFlow's own endpoint is ignored).
 #[derive(Debug, Default, Deserialize)]
 pub struct Params {
     pub since: Option<String>,
     pub end: Option<String>,
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-    #[serde(default)]
-    pub offset: usize,
+    pub limit: Option<String>,
+    pub offset: Option<String>,
     #[serde(default, alias = "token")]
     pub access_token: Option<String>,
-}
-
-fn default_limit() -> usize {
-    5000
 }
 
 pub async fn handler(
@@ -44,7 +42,13 @@ pub async fn handler(
         return Err(ApiError::not_ready());
     }
 
-    let limit = params.limit.clamp(1, 5000);
+    let limit = params
+        .limit
+        .as_deref()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(5000)
+        .clamp(1, 5000);
+    let offset = params.offset.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     let since = params.since.as_deref().and_then(|s| parse_time_bound(s, false));
     let end = params.end.as_deref().and_then(|s| parse_time_bound(s, true));
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
@@ -74,7 +78,7 @@ pub async fn handler(
     let total = filtered.len();
     // Page from `offset`, extending to the end of the last second's ts
     // group: pages never split a second, so `nextSince` strictly advances.
-    let start = params.offset.min(total);
+    let start = offset.min(total);
     let mut page_end = start;
     let mut prev_ts = None;
     while page_end < total {
@@ -88,40 +92,75 @@ pub async fn handler(
     let page = &filtered[start..page_end];
     let has_more = page_end < total;
 
+    // WeFlow's Pull contract keeps these two SEPARATE: `accountName` is the
+    // account's own name, `groupNickname` is the per-conversation group card
+    // ("40090"). Collapsing both onto `display_sender` (card-wins) would make
+    // them identical in groups, leaving a consumer unable to tell "no card" from
+    // "card equals the account name". `senderName` on /api/v1/messages keeps its
+    // card-wins semantics — that field is downstream-visible and unchanged.
+    let account_name = |uid: &str| store.display_uid(uid);
+    let group_card = |uid: &str| -> String {
+        if chat_type != ChatType::Group {
+            return String::new();
+        }
+        store
+            .group_cards
+            .get(&crate::store::conv_key(chat_type, &talker))
+            .and_then(|cards| cards.get(uid))
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_default()
+    };
+
     let messages: Vec<Value> = page
         .iter()
         .map(|&i| {
             let m = &conv.msgs[i];
             json!({
                 "sender": m.from_uid,
-                "accountName": store.display_sender(chat_type, &talker, &m.from_uid),
+                "accountName": account_name(&m.from_uid),
+                "groupNickname": group_card(&m.from_uid),
                 "timestamp": m.ts,
-                "type": m.parsed.msg_type.code(),
+                // Canonical ChatLab 0.0.2 code — NOT the native `localType`.
+                "type": m.parsed.msg_type.chatlab_type(),
                 "content": m.parsed.content,
                 "platformMessageId": m.seq.to_string(),
             })
         })
         .collect();
 
+    // Senders in THIS page, deduped — the roster describes what was exported,
+    // matching WeFlow. Scanning the whole conversation instead made `members`
+    // unbounded and cost a full pass per request.
     let members: Vec<Value> = {
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
         let mut out = Vec::new();
-        for m in &conv.msgs {
-            if !seen.contains(&m.from_uid) && !m.from_uid.is_empty() {
-                seen.push(m.from_uid.clone());
-                let nick = store.display_sender(chat_type, &talker, &m.from_uid);
+        for &i in page {
+            let uid = conv.msgs[i].from_uid.as_str();
+            if !uid.is_empty() && !seen.contains(&uid) {
+                seen.push(uid);
                 out.push(json!({
-                    "platformId": m.from_uid,
-                    "accountName": nick,
-                    // groupNickname = the per-conversation group card (40090)
-                    // when known, else the account name.
-                    "groupNickname": if chat_type == ChatType::Group { nick.clone() } else { String::new() },
+                    "platformId": uid,
+                    "accountName": account_name(uid),
+                    "groupNickname": group_card(uid),
+                    // QQ exposes no avatar source; the field is optional in
+                    // ChatLab 0.0.2, so an empty string is the honest answer.
                     "avatar": "",
                 }));
             }
         }
         out
     };
+
+    // `ownerId` = the bound account (WeFlow emits its own wxid here). Only one
+    // account ever holds the binding, so the first Ready entry is unambiguous.
+    let owner_id = state
+        .accounts
+        .read()
+        .iter()
+        .find(|a| a.state.is_ready())
+        .map(|a| a.qq.clone())
+        .unwrap_or_default();
 
     let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
     Ok(Json(json!({
@@ -135,6 +174,7 @@ pub async fn handler(
             "platform": "qq",
             "type": chat_type.as_str(),
             "groupId": talker,
+            "ownerId": owner_id,
         },
         "members": members,
         "messages": messages,

@@ -478,10 +478,15 @@ async fn downstream_client_real_db() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true);
-    assert_eq!(v["hasMore"], false);
-    assert!(v["synced"].as_i64().unwrap() >= 0);
-    assert_eq!(v["count"].as_u64().unwrap() as usize, v["messages"].as_array().unwrap().len());
-    println!("[CLIENT] manual sync: synced={} returned={}", v["synced"], v["count"]);
+    // Counts-only, same shape as weflow-server. `limit` above is accepted and
+    // ignored — the endpoint is a trigger, not a second messages face.
+    assert!(v["newMessages"].as_i64().unwrap() >= 0);
+    assert!(v["revokeMessages"].as_i64().unwrap() >= 0);
+    assert!(v["messages"].is_null());
+    println!(
+        "[CLIENT] manual sync: new={} revoked={}",
+        v["newMessages"], v["revokeMessages"]
+    );
 
     // ---- 11. SSE: connect shape (content-type; body streams live) -------
     let resp = app

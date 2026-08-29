@@ -188,32 +188,56 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
     let name = conv
         .map(|c| store.display_name(c.chat_type, &c.talker))
         .unwrap_or_else(|| talker.to_string());
-    // members: uid -> name seen in this session. `senderName` is already
-    // resolved per row (remark preferred; in a group the sender's
-    // per-conversation card (40090) wins and never leaks into c2c or the
-    // global contact lists), so reuse it rather than resolving it twice.
-    let members: Vec<Value> = items
-        .iter()
-        .filter_map(|m| {
-            let uid = &m.sender_username;
-            if uid.is_empty() { None } else {
-                Some(json!({
+    // `accountName` (the account's own name) and `groupNickname` (the
+    // per-conversation group card "40090") are SEPARATE in ChatLab — same
+    // split as `chatlab_pull`. `MessageOut.senderName` is the card-wins merge
+    // of the two and keeps that meaning on the native surface, so resolve both
+    // halves independently here instead of reusing it for both keys.
+    let conv_key = conv.map(|c| crate::store::conv_key(c.chat_type, &c.talker));
+    let account_name = |uid: &str| store.display_uid(uid);
+    let group_card = |uid: &str| -> String {
+        if chat_type != crate::parser::types::ChatType::Group {
+            return String::new();
+        }
+        conv_key
+            .as_ref()
+            .and_then(|key| store.group_cards.get(key))
+            .and_then(|cards| cards.get(uid))
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // Senders in this page, deduped — the undeduped version repeated a member
+    // once per message they sent.
+    let members: Vec<Value> = {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        for m in items {
+            let uid = m.sender_username.as_str();
+            if !uid.is_empty() && !seen.contains(&uid) {
+                seen.push(uid);
+                out.push(json!({
                     "platformId": uid,
-                    "accountName": m.sender_name,
-                    "groupNickname": m.sender_name,
+                    "accountName": account_name(uid),
+                    "groupNickname": group_card(uid),
                     "avatar": "",
-                }))
+                }));
             }
-        })
-        .collect();
+        }
+        out
+    };
     let messages: Vec<Value> = items
         .iter()
         .rev() // chatlab is chronological
         .map(|m| json!({
             "sender": m.sender_username,
-            "accountName": m.sender_name,
+            "accountName": account_name(&m.sender_username),
+            "groupNickname": group_card(&m.sender_username),
             "timestamp": m.create_time,
-            "type": m.local_type,
+            // Canonical ChatLab 0.0.2 code. `localType` is the native space, so
+            // recover the variant first (see `MsgType::from_code`).
+            "type": crate::parser::types::MsgType::from_code(m.local_type).chatlab_type(),
             "content": m.content,
             "platformMessageId": m.server_id,
         }))
@@ -230,6 +254,15 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
             "platform": "qq",
             "type": chat_type.as_str(),
             "groupId": talker,
+            // Same as the Pull face: the bound account. Only one account ever
+            // holds the binding, so the first Ready entry is unambiguous.
+            "ownerId": state
+                .accounts
+                .read()
+                .iter()
+                .find(|a| a.state.is_ready())
+                .map(|a| a.qq.clone())
+                .unwrap_or_default(),
         },
         "members": members,
         "messages": messages,

@@ -466,9 +466,21 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）：
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
-- `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）
-- `members[].platformId`、`members[].accountName`（即 §3 的 `senderName`，同一解析链路）、`members[].groupNickname`（同 `accountName`）、`members[].avatar`（恒空）
-- `messages[].sender`、`messages[].accountName`（同上）、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+- `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）、`meta.ownerId`（当前绑定账号 QQ 号，未绑定为空串）
+- `members[].platformId`、`members[].accountName`、`members[].groupNickname`、`members[].avatar`（恒空）；仅含本页出现过的发送者，已去重
+- `messages[].sender`、`messages[].accountName`、`messages[].groupNickname`、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+
+字段语义与 §4.1 ChatLab Pull 完全一致，注意两点：
+
+- `accountName`（账号名：备注 > 昵称 > UID）与 `groupNickname`（本群群名片）
+  是**两个不同的字段**，不是同一个值的别名。上面 §3 的 `senderName` 是二者的
+  合并值（群名片优先），语义不同，不受影响。
+- `messages[].type` 是 ChatLab 0.0.2 标准枚举，与本节 `localType` 的**平台原生
+  编码是两套独立体系**（同一张图片：`type: 1` vs `localType: 3`）。枚举全表和
+  "码 6 未分配"的说明见 §4.1。
+
+`meta.type` 按标准只有 `group`/`private` 两个取值，公众号/订阅号等会归入
+`private`。需要更细的会话分类请用 §4 `/api/v1/sessions` 的 `type`。
 
 ---
 
@@ -581,9 +593,18 @@ GET /api/v1/sessions/{id}/messages
 
 会话不存在时返回 `404`（错误信封，见 §8）。
 
+`limit`/`offset` 容错解析：WeFlow 的 Pull 契约对分页参数没有 400 语义，因此
+`?limit=abc`、`?limit=0`、`?offset=` 等一律退化为默认值，不报错。
+
 ### 响应
 
-`members[].accountName` 与 `messages[].accountName` 与 §3 的 `senderName` 同一解析链路、同一取值（群聊含本群群名片）；`members[].groupNickname` 群聊同 `accountName`、私聊恒为空串。
+**名字是两个字段，不是一个。** `accountName` = 账号自己的名字（备注 `20009` >
+昵称 > UID），`groupNickname` = 本群群名片（`40090`），群聊无名片或私聊时为空
+串。二者不同源、可以不同值，客户端要显示"群里的称呼"取 `groupNickname` 并回落
+到 `accountName`。
+
+§3 `/api/v1/messages` 的 `senderName` 是**另一回事**：它是两者的合并值（群聊
+名片优先），下游已依赖，不随本节改变。
 
 ```json
 {
@@ -596,22 +617,48 @@ GET /api/v1/sessions/{id}/messages
     "name": "项目群",
     "platform": "qq",
     "type": "group",
-    "groupId": "10001"
+    "groupId": "10001",
+    "ownerId": "10000"
   },
   "members": [
-    { "platformId": "u_a", "accountName": "张三", "groupNickname": "张三", "avatar": "" }
+    { "platformId": "u_a", "accountName": "张三", "groupNickname": "张三群名片", "avatar": "" }
   ],
   "messages": [
-    { "sender": "u_a", "accountName": "张三", "timestamp": 1738713600, "type": 0, "content": "你好", "platformMessageId": "123456" }
+    { "sender": "u_a", "accountName": "张三", "groupNickname": "张三群名片", "timestamp": 1738713600, "type": 0, "content": "你好", "platformMessageId": "123456" }
   ],
   "sync": {
     "hasMore": true,
     "nextSince": 1738713600,
-    "nextOffset": 5000,
+    "nextOffset": 0,
     "watermark": 1738714000
   }
 }
 ```
+
+`meta.ownerId` = 当前绑定账号的 QQ 号；未绑定时为空串。
+`members` 仅含**本页**出现过的发送者，且已去重。
+
+### messages[].type
+
+采用 **ChatLab 0.0.2 标准枚举**（`docs.chatlab.fun/standard/chatlab-format`），
+不是 QQ 原生编号：
+
+| 码 | 含义 | | 码 | 含义 |
+| -- | ---- |-| -- | ---- |
+| 0 | TEXT | | 24 | SHARE |
+| 1 | IMAGE | | 25 | REPLY |
+| 2 | VOICE | | 27 | CONTACT |
+| 3 | VIDEO | | 80 | SYSTEM |
+| 4 | FILE | | 81 | RECALL |
+| 5 | EMOJI | | 99 | OTHER |
+| 7 | LINK | | | |
+| 8 | LOCATION | | | |
+
+**`6` 在标准中未分配，任何情况下都不会出现。**
+
+⚠️ 这与 §3 `/api/v1/messages` 的 `localType` 是**两套独立编码**：同一张图片在
+本节是 `type: 1`，在 §3 是 `localType: 3`。`localType` 是平台原生码、下游已按
+它分支，两者不可互换使用。
 
 ### sync 块
 
@@ -619,8 +666,14 @@ GET /api/v1/sessions/{id}/messages
 | ------------ | ---- |
 | `hasMore`    | 是否还有更多数据 |
 | `nextSince`  | 有更多时 = 本页最后一条消息时间；否则 = `watermark` |
-| `nextOffset` | 有更多时 = 下次请求的 offset；否则 = `0` |
+| `nextOffset` | 正常恒为 `0`，仅在时间戳无法推进的退化场景下才为累计偏移 |
 | `watermark`  | 本次拉取的时间上界（未传 `end` 时为当前时间） |
+
+`nextOffset` **有意不同于 WeFlow（安装版）文档里的 `5000`**：`nextSince` 是
+排他上界且分页永不切断同一秒，客户端把两个游标原样回传时，`nextSince` 已经过
+滤掉本页所有行、下一条未读行正好落在 offset 0。此时再叠加一个累计 offset 会
+二次跳过同样的行（double-skip）。两个游标照文档原样回传即可，不需要客户端做
+特殊处理。
 
 ---
 
@@ -719,7 +772,12 @@ GET /api/v1/group-members
 
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
-立即对所有账号执行一次完整同步（直连活库的增量读取，**绕过后台变化检测循环**），并返回本次新增的最近若干条消息。客户端初始化或手动刷新时调用，用于主动拉取最新消息；新增消息同时也会广播给 SSE 订阅端。
+立即对所有账号执行一次完整同步（直连活库的增量读取，**绕过后台变化检测循环**），
+返回本次新增的**条数**。客户端初始化或手动刷新时调用；新增消息同时广播给 SSE
+订阅端，也可随后用 §3 `/api/v1/messages` 读回。
+
+**这是一个触发器，不返回消息体**。消息的唯一读取面是 §3 / §4.1，避免同一批数据
+出现第二种形状。响应结构与 weflow-server 的 `/api/v1/sync` 完全一致。
 
 **请求**
 
@@ -729,33 +787,27 @@ POST /api/v1/sync
 
 ### 参数
 
-| 参数    | 类型   | 必填 | 说明                       |
-| ------- | ------ | ---- | -------------------------- |
-| `limit` | number | 否   | 返回条数，默认 `100`，范围 `1~10000` |
+无（除鉴权）。`limit` 等分页参数会被接受但忽略。
 
 ### 响应字段
 
 - `success`
-- `count`（本次返回条数）
-- `synced`（本次同步新增消息总数，`count` 可能因 `limit` 截断而小于它）
-- `hasMore`（恒为 `false`）
-- `messages`（新增消息，按时间倒序；字段同 §3 单条消息）
+- `newMessages`（本次新增的普通消息条数）
+- `revokeMessages`（本次新增的撤回消息条数，不计入 `newMessages`）
 
 **示例响应**
 
 ```json
 {
   "success": true,
-  "count": 3,
-  "synced": 3,
-  "hasMore": false,
-  "messages": [
-    { "localId": 1234567890123, "serverId": "1234567890123", "localType": 0, "createTime": 1782864000, "isSend": 0, "senderUsername": "u_a", "senderName": "张三（群名片）", "content": "你好", "rawContent": "你好", "parsedContent": "你好" }
-  ]
+  "newMessages": 3,
+  "revokeMessages": 0
 }
 ```
 
-> 说明：账号注册后索引已全量构建，之后无新消息时 `synced` 为 `0`；QQ 运行中产生新消息后调用，可立即取回。
+> 说明：账号注册后索引已全量构建，之后无新消息时两个计数均为 `0`；QQ 运行中产生
+> 新消息后调用可立即同步。WeFlow（安装版）没有这个接口，因此本接口没有可对齐的
+> 上游契约，形状与 weflow-server 对齐。
 
 ---
 
