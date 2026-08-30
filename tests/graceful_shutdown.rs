@@ -12,6 +12,30 @@ use std::time::Duration;
 
 use qqflow_server::config::Config;
 
+/// Cross-test serialization for the (qqflow-server, http-api-token) keyring
+/// entry. The two graceful-shutdown tests both start a real server in-process
+/// and therefore both call `load_or_create_token()`, which writes through
+/// `keyring`. On Windows the credential store is not atomic across concurrent
+/// `set_password` calls — a second concurrent writer can land on the keyring
+/// with a token that the first server's `state.token` does not match, and the
+/// second test then reads the wrong value out of keyring and the SSE handshake
+/// answers 401. The earlier `clear_keyring_token()` helper only fixed the
+/// stale-token-leak case (one race); this mutex fixes the remaining
+/// two-writers-race case (the other race).
+///
+/// The guard is held across `spawn` + `wait_until_up` — by the time the next
+/// test acquires it, the previous test's server has finished
+/// `load_or_create_token()` and bound the listening port, so the keyring value
+/// is stable. `tokio::sync::Mutex` rather than `std::sync::Mutex` so the guard
+/// can be held across `.await`.
+async fn keyring_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    GUARD
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 /// Reserve a free port by binding and immediately releasing it. The window
 /// between release and re-bind is a race in principle, but on a loopback test
 /// port it is far more reliable than hardcoding a number that may be in use.
@@ -42,6 +66,31 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Drop any pre-existing API token so `load_or_create_token()` deterministically
+/// walks the `NoEntry` -> `set_password` path on the very next call. Without
+/// this, a stale token from a previous run (or, on Windows, a credential that
+/// the parallel `shutdown_signal_stops_the_server` test left behind) can leak
+/// into the second test: the server's `state.token` ends up being a freshly
+/// generated in-memory value while `show_token()` reads back the stale one,
+/// and the SSE handshake then answers 401. `delete_credential` is best-effort:
+/// returning `NoEntry` (or any other error) just means there is nothing to
+/// clean up, which is exactly the state we want.
+///
+/// The service/user strings MUST stay in sync with `TOKEN_SERVICE` / `TOKEN_USER`
+/// in `src/config.rs`; if those constants ever change, this helper has to be
+/// updated alongside them.
+fn clear_keyring_token() {
+    let service = "qqflow-server";
+    let user = "http-api-token";
+    if let Ok(entry) = keyring::Entry::new(service, user) {
+        // `NoEntry` is the success case for a clean runner — anything else
+        // (e.g. Windows ACL issues, platform failures) is also fine for our
+        // purposes: we are not asserting the credential store is writable, we
+        // are only trying to make sure whatever was there is gone.
+        let _ = entry.delete_credential();
+    }
+}
+
 /// Wait until the port accepts connections, so shutdown races a live listener
 /// rather than an unbound socket.
 async fn wait_until_up(port: u16) -> bool {
@@ -58,6 +107,11 @@ async fn wait_until_up(port: u16) -> bool {
 /// grace period when nothing is holding a connection open.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_signal_stops_the_server() {
+    clear_keyring_token();
+    // Hold the guard across the server spawn + `wait_until_up` so the other
+    // graceful-shutdown test cannot observe an intermediate keyring state
+    // while our server is still calling `set_password`. See `keyring_guard`.
+    let _guard = keyring_guard().await;
     let dir = tmp_dir("basic");
     let port = free_port();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -71,6 +125,10 @@ async fn shutdown_signal_stops_the_server() {
     });
 
     assert!(wait_until_up(port).await, "server never came up on port {port}");
+    // Dropping the guard here is what serializes the two tests: by the time
+    // the next test acquires it, our server has finished `load_or_create_token`
+    // and bound the listening port, so the keyring value is stable.
+    drop(_guard);
 
     let started = std::time::Instant::now();
     tx.send(()).expect("shutdown trigger delivered");
@@ -98,6 +156,11 @@ async fn shutdown_signal_stops_the_server() {
 /// long as a client stayed subscribed.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_ends_a_live_sse_stream_within_the_grace_period() {
+    clear_keyring_token();
+    // Hold the guard across the server spawn + `wait_until_up` so the other
+    // graceful-shutdown test cannot observe an intermediate keyring state
+    // while our server is still calling `set_password`. See `keyring_guard`.
+    let _guard = keyring_guard().await;
     let dir = tmp_dir("sse");
     let port = free_port();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -111,12 +174,20 @@ async fn shutdown_ends_a_live_sse_stream_within_the_grace_period() {
     });
 
     // The token is minted inside run_with_shutdown from the credential store,
-    // so read it the same way a client would be told to.
+    // so read it the same way a client would be told to. By the time
+    // `wait_until_up` returns true, the server has finished
+    // `load_or_create_token()` and the keyring value is stable, so any
+    // `show_token()` call from here on is guaranteed to match
+    // `state.token`.
     let mut token = None;
     if wait_until_up(port).await {
         token = qqflow_server::config::show_token().ok().flatten();
     }
     let token = token.expect("server up and token readable");
+    // Release the guard: the rest of this test only talks to the server it
+    // just spun up, and we want the other test to be free to spawn its own
+    // server as soon as it gets scheduled.
+    drop(_guard);
 
     // Hold an SSE stream open with a raw socket: no client library, and the
     // response body is deliberately never drained to completion.

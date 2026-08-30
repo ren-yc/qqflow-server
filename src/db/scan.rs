@@ -164,14 +164,14 @@ fn scan_unix(root: &Path) -> Result<Vec<DbInfo>> {
         let chosen = if exact.is_file() {
             Some(exact)
         } else {
-            candidates.sort_by(|a, b| b.0.cmp(&a.0));
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
             candidates.into_iter().next().map(|(_, p)| p)
         };
-        if let Some(p) = chosen {
-            if let Some(h) = dir.file_name().and_then(|n| n.to_str()) {
-                let qq = h.trim_start_matches("nt_qq_").to_string();
-                out.push(DbInfo { qq: if qq.is_empty() { h.to_string() } else { qq }, path: p });
-            }
+        if let Some(p) = chosen
+            && let Some(h) = dir.file_name().and_then(|n| n.to_str())
+        {
+            let qq = h.trim_start_matches("nt_qq_").to_string();
+            out.push(DbInfo { qq: if qq.is_empty() { h.to_string() } else { qq }, path: p });
         }
     }
     out.sort_by(|a, b| a.qq.cmp(&b.qq));
