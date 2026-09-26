@@ -109,14 +109,14 @@ async fn wait_ready(app: &axum::Router) -> bool {
 
 /// 测试专用的 harness 控制端点，**不进入产品路由**。
 fn harness_router(
-    raw_db: std::path::PathBuf,
+    writer: Arc<parking_lot::Mutex<rusqlite::Connection>>,
     nt_db: std::path::PathBuf,
     state: Arc<AppState>,
 ) -> axum::Router {
     axum::Router::new().route(
         "/__harness",
         axum::routing::post(move |body: String| {
-            let raw_db = raw_db.clone();
+            let writer = writer.clone();
             let nt_db = nt_db.clone();
             let src = nt_db.join("nt_msg.db");
             let state = state.clone();
@@ -150,26 +150,43 @@ fn harness_router(
                             println!("[harness] 账号不在（前面的用例注销了它），已重新注册");
                         }
                         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // **必须上密钥**：源库是 SQLCipher 加密的，裸 open 后 INSERT 会报
-                        // `NotADatabase`。第一版还把它 `let _ =` 掉了，于是症状变成「SSE 收不到
-                        // 事件」——错误被吞掉时，报错的地方离出错的地方很远。
-                        if let Ok(conn) = rusqlite::Connection::open(&raw_db) {
-                            conn.execute_batch(&common::pragma_suite(common::FAKE_KEY))
-                                .expect("上密钥失败");
-                            let _ = conn.execute(
+                        // **必须复用夹具那个持久写入连接**，不能自己新开一个：
+                        //
+                        // 源库是 SQLCipher 加密的（裸 open 报 `NotADatabase`），而 `materialize_source`
+                        // 是「读 `raw.db` 主文件 + 硬链接它的 WAL」——新开连接写入会让 WAL 的 salt
+                        // 变化，已打开的读端就用不了那条链接了，于是新行对活连接不可见。
+                        // `open_fake_writer` 的注释里正好警告过这一点。
+                        let writer = writer.clone();
+                        let ins = tokio::task::spawn_blocking(move || {
+                            let conn = writer.lock();
+                            conn.execute(
                                 "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                                 rusqlite::params![
                                     "10001",
-                                    (1782864000i64 << 32) | (99 + seq),
+                                    // `seq` 的高 32 位是时间戳：**必须晚于夹具既有的行**，否则新行落在
+                                    // 水位线之内，`poll_once` 返回 0 —— 症状又是「SSE 收不到事件」
+                                    // （与 weflow 那边同一个坑：追加的时间戳要越过水位线）。
+                                    ((1782864000i64 + 60) << 32) | (99 + seq),
                                     "u_a",
                                     "张三",
                                     "一致性套件新增".as_bytes(),
                                     1,
-                                    1782864000i64,
+                                    1782864000i64 + 60,
                                     "张三群名片"
                                 ],
-                            );
+                            )
+                        })
+                        .await;
+                        if let Ok(Err(e)) = &ins {
+                            println!("[harness] 追加失败：{e}");
                         }
+                        // **materialize 不能不跑**：新行写进的是无头的 `raw.db`，活连接读的是
+                        // `nt_msg.db` —— 不 materialize 就等于没写。第一版把这两行连同显式同步
+                        // 一起删掉了，症状又是「SSE 收不到事件」。
+                        common::materialize_source(&nt_db);
+                        // 与 weflow 的 harness 对齐：显式同步一次，让「追加 → 可见 → 广播」
+                        // 成为确定的事，而不是等 Watcher 的时序。
+                        let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
                 }
                 axum::http::StatusCode::OK
             }
@@ -191,12 +208,14 @@ async fn conformance_suite_passes() {
     // `open_fake_source` 返回的第二个值是 **`nt_msg.db`**（`materialize_source` 的产物），
     // 它是 `raw.db` 前面加上 1024 字节 QQ 头的**只读形态** —— 裸 open 它做 INSERT 会报
     // `NotADatabase`。要写入必须针对无头的 `raw.db`，再 materialize 一次让活连接看见。
+    // `open_fake_source` 返回 (写入连接, `nt_msg.db` 路径)。**连接要留着**：写入必须走它，
+    // 自己新开一个会让 WAL 的 salt 变化，硬链接失效、新行对活连接不可见。
     let (writer, _main) = common::open_fake_source(&nt_db, 0);
-    drop(writer);
+    let writer = Arc::new(parking_lot::Mutex::new(writer));
     let src = nt_db.join("nt_msg.db");
 
     let state = app_state(dir.join("export"));
-    let app = build_router(state.clone()).merge(harness_router(nt_db.join("raw.db"), nt_db.clone(), state.clone()));
+    let app = build_router(state.clone()).merge(harness_router(writer.clone(), nt_db.clone(), state.clone()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
