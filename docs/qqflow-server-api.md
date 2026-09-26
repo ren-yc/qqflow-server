@@ -43,11 +43,31 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /api/v1/group-members`
 - `GET|POST /api/v1/push/messages`（SSE）
 - `GET|POST /api/v1/sync`（手动同步）
+- `GET /openapi.json`（接口描述，**免鉴权**，见 §1.0）
 
 > v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（§3.2，WeFlow 形状）。
 
 ---
 
+## 1.0 接口描述（GET /openapi.json，免鉴权）
+
+返回本服务的 OpenAPI 3 描述，由 `server/dto.rs` 里的响应类型经 `#[derive(ToSchema)]` 生成。
+
+免鉴权是刻意的：它描述的是**形状**，不含账号、路径或密钥，而且正是给尚未拿到 token 的接入方
+看的 —— 拿到它就能生成客户端，再凭 token 调真正的接口。
+
+两点使用提示：
+
+- **多形状端点用 `oneOf`**。`/api/v1/sessions`、`/api/v1/messages`、`/api/v1/accounts`（POST）
+  的响应形状由参数或状态决定，描述里列的是若干可能形状的并集 —— 生成客户端时应按 `oneOf`
+  处理，而不是当成「所有字段都可能存在」。
+- **描述随 DTO 变**。改 DTO 就会改它；`tests/openapi.rs` 保证描述自身自洽（每个 `$ref` 都能
+  解析、operationId 唯一、多形状确实用 `oneOf`），golden 快照保证它的变更有人看过。
+
+错误响应（401/404/405/400 等）**不在描述里**：它们是跨端点的统一信封，见上文「鉴权规范」后的
+错误信封说明。
+
+---
 ## 1. 健康检查
 
 **请求**
