@@ -1,0 +1,20 @@
+{
+  "body": {
+    "count": 1,
+    "page": {
+      "hasMore": false,
+      "nextCursor": null
+    },
+    "sessions": [
+      {
+        "id": "10001",
+        "lastMessageAt": 26481,
+        "messageCount": 0,
+        "name": "项目群",
+        "platform": "qq",
+        "type": "group"
+      }
+    ]
+  },
+  "status": 200
+}

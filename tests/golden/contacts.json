@@ -1,0 +1,29 @@
+{
+  "body": {
+    "contacts": [
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "张三",
+        "nickname": "张三",
+        "remark": "",
+        "type": "friend",
+        "username": "u_a"
+      },
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "李四",
+        "nickname": "李四",
+        "remark": "",
+        "type": "friend",
+        "username": "u_b"
+      }
+    ],
+    "count": 2,
+    "hasMore": false,
+    "success": true,
+    "total": 2
+  },
+  "status": 200
+}

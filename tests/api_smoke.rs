@@ -1927,3 +1927,165 @@ async fn deregister_post_alias_matches_the_delete_route() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "not_registered");
 }
+
+/// Golden 快照：每个 JSON 响应的**逐字节**护栏（含状态码）。
+///
+/// 为什么必须在 DTO 化**之前**有它：DTO 是重写每一个响应构造，而「断言几个字段」的测试
+/// 看不出「某个键消失了」「某个键从 `null` 变成被省略」「某个值的类型变了」——这三类恰恰
+/// 是契约明令禁止的改动。
+///
+/// 更新方式：设 `UPDATE_GOLDEN=1` 后跑本测试，然后**人工读一遍 diff**——自动生成的快照
+/// 等于没有快照。
+mod golden {
+    use super::*;
+
+    /// 值易变、但键必须留下的字段。按**键名**匹配，因此清单不随端点增长。
+    const VOLATILE_KEYS: &[&str] = &[
+        // 每次请求都不同
+        "exportedAt",
+        // 由 `chrono::Utc::now()` 派生
+        "watermark",
+        "nextSince",
+        // 夹具的临时目录
+        "db_path",
+        "dir",
+        "exportPath",
+        "mediaLocalPath",
+        // 原生消息形状里的媒体路径用的是这个键名（与 mediaLocalPath 是两个键）
+        "localPath",
+        // 毫秒级墙钟：由哨兵点名发现（秒级与毫秒级都出现过，见 assert_no_wall_clock）
+        "updatedAt",
+    ];
+
+    fn golden_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("golden")
+    }
+
+    /// 把易变值换成占位符（**掩码值，不删键**——删键会把形状一起丢掉）。
+    fn mask(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, val) in map.iter_mut() {
+                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                        *val = Value::String("<volatile>".into());
+                    } else {
+                        mask(val);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for it in items.iter_mut() {
+                    mask(it);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **时钟哨兵**：快照里不得出现接近「现在」的时间戳。
+    ///
+    /// 这一条决定护栏能不能活下去。夹具的数据停在固定的历史时刻，所以任何接近现在的
+    /// 时间戳都必然来自 `Utc::now()`——它每次运行都会变，于是快照要么天天漂移，要么被人
+    /// 习惯性地点「更新快照」，两种结局都是护栏失效。
+    ///
+    /// **按名字枚举易变字段终究会漏**（weflow 侧的第一版就这么漏掉了 `sync.watermark`：
+    /// 「路径没漏出去」是对的，但它是时间），把「时间」这一整类圈出来才兜得住。
+    fn assert_no_wall_clock(value: &Value, name: &str) {
+        const ONE_YEAR: i64 = 365 * 86_400;
+        let now = chrono::Utc::now().timestamp();
+        match value {
+            Value::Number(n) => {
+                if let Some(v) = n.as_i64()
+                    // **不假设单位**：秒与毫秒各比一次。第一版只写了秒，于是
+                    // `updatedAt: 1790426034799`（毫秒）从哨兵底下漏了过去——
+                    // 一个用来防「时间类字段漏掩码」的哨兵，自己带着单位假设。
+                    && ((v - now).abs() < ONE_YEAR || (v - now * 1000).abs() < ONE_YEAR * 1000)
+                {
+                    panic!(
+                        "{name}：快照里出现接近「现在」的时间戳 {v}（now={now}）——它每次运行都会变，必须加进 VOLATILE_KEYS"
+                    );
+                }
+            }
+            Value::Object(map) => {
+                for v in map.values() {
+                    assert_no_wall_clock(v, name);
+                }
+            }
+            Value::Array(items) => {
+                for v in items {
+                    assert_no_wall_clock(v, name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 端点清单：名字 → (方法, URI)。名字同时是快照文件名。
+    fn endpoints() -> Vec<(&'static str, &'static str, String)> {
+        let t = "test-token-123456";
+        vec![
+            ("health", "GET", "/health".to_string()),
+            ("accounts", "GET", format!("/api/v1/accounts?access_token={t}")),
+            ("sessions-native", "GET", format!("/api/v1/sessions?access_token={t}")),
+            ("sessions-chatlab", "GET", format!("/api/v1/sessions?format=chatlab&access_token={t}")),
+            ("messages-native", "GET", format!("/api/v1/messages?talker=10001&limit=50&access_token={t}")),
+            ("messages-chatlab", "GET", format!("/api/v1/messages?talker=10001&limit=50&chatlab=1&access_token={t}")),
+            ("messages-media", "GET", format!("/api/v1/messages?talker=10001&limit=50&media=1&access_token={t}")),
+            ("pull", "GET", format!("/api/v1/sessions/10001/messages?limit=50&access_token={t}")),
+            ("contacts", "GET", format!("/api/v1/contacts?access_token={t}")),
+            (
+                "group-members",
+                "GET",
+                format!("/api/v1/group-members?chatroomId=10001&includeMessageCounts=1&access_token={t}"),
+            ),
+            ("sync", "POST", format!("/api/v1/sync?access_token={t}")),
+        ]
+    }
+
+    async fn fetch(app: axum::Router, method: &str, uri: &str) -> (StatusCode, Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn responses_match_their_golden_snapshots() {
+        let app = build_router(test_state());
+        let update = std::env::var("UPDATE_GOLDEN").is_ok();
+        std::fs::create_dir_all(golden_dir()).unwrap();
+
+        let mut drifted: Vec<String> = Vec::new();
+        for (name, method, uri) in endpoints() {
+            let (status, body) = fetch(app.clone(), method, &uri).await;
+            let mut snapshot = serde_json::json!({ "status": status.as_u16(), "body": body });
+            mask(&mut snapshot);
+            assert_no_wall_clock(&snapshot, name);
+            let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
+
+            let path = golden_dir().join(format!("{name}.json"));
+            if update || !path.exists() {
+                std::fs::write(&path, &actual).unwrap();
+                println!("[GOLDEN] 写入 {}", path.display());
+                continue;
+            }
+            if std::fs::read_to_string(&path).unwrap() != actual {
+                drifted.push(name.to_string());
+            }
+        }
+        assert!(
+            drifted.is_empty(),
+            "这些端点的响应与快照不一致：{drifted:?}\n\n若改动是有意的，设 UPDATE_GOLDEN=1 重跑后**人工读一遍 diff**。"
+        );
+    }
+}

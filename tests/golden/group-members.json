@@ -1,0 +1,36 @@
+{
+  "body": {
+    "chatroomId": "10001",
+    "count": 2,
+    "fromCache": false,
+    "members": [
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "张三",
+        "groupNickname": "张三",
+        "isFriend": false,
+        "isOwner": false,
+        "messageCount": 1,
+        "nickname": "张三",
+        "remark": "",
+        "wxid": "u_a"
+      },
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "李四",
+        "groupNickname": "李四",
+        "isFriend": false,
+        "isOwner": false,
+        "messageCount": 1,
+        "nickname": "李四",
+        "remark": "",
+        "wxid": "u_b"
+      }
+    ],
+    "success": true,
+    "updatedAt": "<volatile>"
+  },
+  "status": 200
+}

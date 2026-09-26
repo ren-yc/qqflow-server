@@ -1,0 +1,55 @@
+{
+  "body": {
+    "chatlab": {
+      "exportedAt": "<volatile>",
+      "generator": "qqflow-server",
+      "version": "0.0.2"
+    },
+    "count": 2,
+    "hasMore": false,
+    "members": [
+      {
+        "accountName": "李四",
+        "avatar": "",
+        "groupNickname": "",
+        "platformId": "u_b"
+      },
+      {
+        "accountName": "张三",
+        "avatar": "",
+        "groupNickname": "",
+        "platformId": "u_a"
+      }
+    ],
+    "messages": [
+      {
+        "accountName": "张三",
+        "content": "你好",
+        "groupNickname": "",
+        "platformMessageId": "113737825845249",
+        "sender": "u_a",
+        "timestamp": 26481,
+        "type": 0
+      },
+      {
+        "accountName": "李四",
+        "content": "[image]",
+        "groupNickname": "",
+        "platformMessageId": "113737825910786",
+        "sender": "u_b",
+        "timestamp": 26481,
+        "type": 1
+      }
+    ],
+    "meta": {
+      "groupId": "10001",
+      "name": "项目群",
+      "ownerId": "",
+      "platform": "qq",
+      "type": "group"
+    },
+    "success": true,
+    "talker": "10001"
+  },
+  "status": 200
+}

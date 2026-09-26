@@ -1,0 +1,16 @@
+{
+  "body": {
+    "count": 1,
+    "sessions": [
+      {
+        "displayName": "项目群",
+        "lastTimestamp": 26481,
+        "type": 2,
+        "unreadCount": 0,
+        "username": "10001"
+      }
+    ],
+    "success": true
+  },
+  "status": 200
+}

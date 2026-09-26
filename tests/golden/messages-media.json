@@ -1,0 +1,54 @@
+{
+  "body": {
+    "count": 2,
+    "hasMore": false,
+    "media": {
+      "count": 1,
+      "enabled": true,
+      "exportPath": "<volatile>"
+    },
+    "messages": [
+      {
+        "content": "[image]",
+        "createTime": 26481,
+        "isSend": 0,
+        "localId": 2,
+        "localType": 3,
+        "media": {
+          "fileName": "aabb.png",
+          "height": 480,
+          "localPath": "<volatile>",
+          "md5": "aabbccddeeff00112233445566778899",
+          "size": 1234,
+          "uuid": "R020-test",
+          "width": 640
+        },
+        "mediaFileName": "aabbccddeeff00112233445566778899.jpg",
+        "mediaId": "aabbccddeeff00112233445566778899",
+        "mediaLocalPath": "<volatile>",
+        "mediaType": "image",
+        "mediaUrl": "/api/v1/media/10001/images/aabbccddeeff00112233445566778899.jpg",
+        "parsedContent": "[image]",
+        "rawContent": "[image]",
+        "senderName": "李四",
+        "senderUsername": "u_b",
+        "serverId": "113737825910786"
+      },
+      {
+        "content": "你好",
+        "createTime": 26481,
+        "isSend": 1,
+        "localId": 1,
+        "localType": 0,
+        "parsedContent": "你好",
+        "rawContent": "你好",
+        "senderName": "张三",
+        "senderUsername": "u_a",
+        "serverId": "113737825845249"
+      }
+    ],
+    "success": true,
+    "talker": "10001"
+  },
+  "status": 200
+}
