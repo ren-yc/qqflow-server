@@ -30,7 +30,7 @@ fn default_limit() -> usize {
     100
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactOut {
     pub username: String,

@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod dto;
 pub mod error;
+pub mod openapi;
 pub mod handlers;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +27,7 @@ use crate::store::{self, index, AppState, Store};
 
 /// Per-account readiness state (serialized as-is into the token-protected
 /// `GET /api/v1/accounts`; `/health` reports the coarser [`AccountPhase`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountStatus {
     /// Scanned at startup, no key registered yet.
@@ -65,7 +66,7 @@ pub struct AccountState {
 /// finds, which makes the *count* of those entries a disclosure in itself.
 /// This enum has no `AwaitingKey` variant at all, so leaking discovery
 /// results through `/health` is a type error rather than a review item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountPhase {
     /// No account is bound (nothing registered, or it was deregistered).
@@ -241,11 +242,28 @@ impl AccountRegistry {
     }
 }
 
+/// `GET /openapi.json` —— 由 DTO 的 `ToSchema` 生成的接口描述。
+///
+/// 每次请求重新生成：生成成本是一次内存遍历，而缓存会引入「改了 DTO 但描述是旧的」
+/// 这一类只在部署后才暴露的问题。
+async fn openapi_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let doc = openapi::document();
+    match serde_json::to_value(&doc) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(_) => crate::server::error::ApiError::internal("OpenAPI 描述生成失败")
+            .into_response(),
+    }
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     use handlers::*;
     Router::new()
         .route("/health", get(health::handler).post(health::handler))
         .route("/api/v1/health", get(health::handler).post(health::handler))
+        // 接口描述**免鉴权**：它描述的是形状，不含任何本机信息（账号、路径、密钥都不在
+        // 里面），而且正是给尚未拿到 token 的接入方看的。
+        .route("/openapi.json", get(openapi_handler))
         .route("/api/v1/accounts", get(accounts::list_handler).post(accounts::handler))
         .route("/api/v1/accounts/{qq}", delete(accounts::delete_handler))
         // POST alias for clients (and proxies) that cannot issue DELETE.

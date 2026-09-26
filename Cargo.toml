@@ -28,6 +28,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# OpenAPI 描述生成。**编译期** derive（无运行时开销），但它确实渗进了 `parser`/`store`：
+# 响应里的 `MessageOut` / `MediaInfo` 是那两个模块的类型，给它们加 `ToSchema` 才能进 schema。
+# 这是**有意的取舍** —— 替代方案是在 DTO 里复制一份同样的结构体，两份必然漂移。
+# 库边界划定时（core 并入根 package、feature 化的那次改动）应把它换成服务层的 newtype，
+# 届时这些 derive 一起搬走。
+utoipa = { version = "6", features = ["axum_extras"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,2101 @@
+{
+  "body": {
+    "components": {
+      "schemas": {
+        "AccountConflict": {
+          "description": "注册**被别的账号占位**（单绑定互锁）。",
+          "properties": {
+            "occupied_by": {
+              "type": "string"
+            },
+            "occupied_status": {
+              "$ref": "#/components/schemas/AccountStatus"
+            },
+            "qq": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "occupied_by",
+            "occupied_status",
+            "qq",
+            "state",
+            "success"
+          ],
+          "type": "object"
+        },
+        "AccountDeregistered": {
+          "description": "注销：**已成功解绑**。",
+          "properties": {
+            "index_cleared": {
+              "type": "boolean"
+            },
+            "previous_status": {
+              "$ref": "#/components/schemas/AccountStatus",
+              "description": "请求落地时账号处于什么状态 —— 让客户端能区分「我取消了正在进行的构建」与\n「我解绑了一个就绪账号」。"
+            },
+            "purged_dirs": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "purged_media": {
+              "type": "boolean"
+            },
+            "qq": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "index_cleared",
+            "previous_status",
+            "purged_dirs",
+            "purged_media",
+            "qq",
+            "state",
+            "success"
+          ],
+          "type": "object"
+        },
+        "AccountNotRegistered": {
+          "description": "注销：**本来就没有绑定**。刻意幂等 —— 重试已完成的注销得到 200 而不是错误。",
+          "properties": {
+            "index_cleared": {
+              "type": "boolean"
+            },
+            "purged_dirs": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "purged_media": {
+              "type": "boolean"
+            },
+            "qq": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "index_cleared",
+            "purged_dirs",
+            "purged_media",
+            "qq",
+            "state",
+            "success"
+          ],
+          "type": "object"
+        },
+        "AccountPhase": {
+          "description": "What `/health` may disclose about the bound account — deliberately NOT\n[`AccountStatus`].\n\n`/health` is unauthenticated, so it must not reveal which QQ accounts\nexist on this machine, how many there are, or where their databases live.\nThe startup scan seeds one `AwaitingKey` entry per account directory it\nfinds, which makes the *count* of those entries a disclosure in itself.\nThis enum has no `AwaitingKey` variant at all, so leaking discovery\nresults through `/health` is a type error rather than a review item.",
+          "enum": [
+            "unregistered",
+            "indexing",
+            "ready",
+            "error"
+          ],
+          "type": "string"
+        },
+        "AccountQqMismatch": {
+          "description": "注销：**互锁触发**（另一个账号持有绑定，它被完全不动地留下）。",
+          "properties": {
+            "index_cleared": {
+              "type": "boolean"
+            },
+            "occupied_by": {
+              "type": "string"
+            },
+            "occupied_status": {
+              "$ref": "#/components/schemas/AccountStatus"
+            },
+            "purged_dirs": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "purged_media": {
+              "type": "boolean"
+            },
+            "qq": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "index_cleared",
+            "occupied_by",
+            "occupied_status",
+            "purged_dirs",
+            "purged_media",
+            "qq",
+            "state",
+            "success"
+          ],
+          "type": "object"
+        },
+        "AccountRegistered": {
+          "description": "注册**受理**（或幂等命中）。\n\n`status` 与 `db_path` 都是**条件键**：未知时不出现。`db_path` 回显的是服务器**实际解析\n到的**库（请求里的 `db_path` 很松散：可以是文件、可以是 Tencent Files 风格的根目录、\n也可以省略走启动扫描），所以回显解析结果才告诉客户端「在跟哪个库说话」。",
+          "properties": {
+            "db_path": "<volatile>",
+            "qq": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "status": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/AccountStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "qq",
+            "state",
+            "success"
+          ],
+          "type": "object"
+        },
+        "AccountStatus": {
+          "description": "Per-account readiness state (serialized as-is into the token-protected\n`GET /api/v1/accounts`; `/health` reports the coarser [`AccountPhase`]).",
+          "enum": [
+            "awaiting_key",
+            "indexing",
+            "ready",
+            "error"
+          ],
+          "type": "string"
+        },
+        "AccountView": {
+          "description": "账号列表项。\n\n键名是**蛇形**（`message_count` / `db_path`），与 `weflow-server` 的 `message_count` /\n`db_storage` 不是同一套 —— 不要跨仓库统一。\n\n`error` 与 `db_path` 都是**条件键**：不知道就**不出现**，而不是 `null`。",
+          "properties": {
+            "db_path": "<volatile>",
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "qq": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/components/schemas/AccountStatus"
+            }
+          },
+          "required": [
+            "message_count",
+            "qq",
+            "state"
+          ],
+          "type": "object"
+        },
+        "AccountsList": {
+          "description": "`GET /api/v1/accounts`。",
+          "properties": {
+            "accounts": {
+              "items": {
+                "$ref": "#/components/schemas/AccountView"
+              },
+              "type": "array"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "accounts",
+            "success"
+          ],
+          "type": "object"
+        },
+        "ChatlabHeader": {
+          "description": "ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）—— 快照里靠时钟哨兵掩码。",
+          "properties": {
+            "exportedAt": "<volatile>",
+            "generator": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "exportedAt",
+            "generator",
+            "version"
+          ],
+          "type": "object"
+        },
+        "ChatlabMember": {
+          "description": "本页出现过的发送者（去重）。\n\n`accountName` 与 `groupNickname` 在 ChatLab 里是**两件事**：前者是账号自己的名字，\n后者是本会话的群名片（40090）。原生面的 `senderName` 是二者「名片优先」的合并结果，\n含义不同 —— 所以这里各自解析，不复用 `senderName` 填两个键。",
+          "properties": {
+            "accountName": {
+              "type": "string"
+            },
+            "avatar": {
+              "description": "QQ 没有头像来源；ChatLab 0.0.2 里该字段可选，空串是诚实的答案。",
+              "type": "string"
+            },
+            "groupNickname": {
+              "type": "string"
+            },
+            "platformId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "accountName",
+            "avatar",
+            "groupNickname",
+            "platformId"
+          ],
+          "type": "object"
+        },
+        "ChatlabMessage": {
+          "description": "混合面的 ChatLab 消息项。\n\n**没有 `replyToMessageId`** —— 与 `weflow-server` 的同名面**不同**（那边有）。\n不要在两个仓库间统一这个差异。",
+          "properties": {
+            "accountName": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "groupNickname": {
+              "type": "string"
+            },
+            "platformMessageId": {
+              "type": "string"
+            },
+            "sender": {
+              "type": "string"
+            },
+            "timestamp": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "accountName",
+            "content",
+            "groupNickname",
+            "platformMessageId",
+            "sender",
+            "timestamp",
+            "type"
+          ],
+          "type": "object"
+        },
+        "ChatlabMeta": {
+          "description": "会话元信息。`ownerId` 未绑定时是空串。",
+          "properties": {
+            "groupId": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ownerId": {
+              "type": "string"
+            },
+            "platform": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "groupId",
+            "name",
+            "ownerId",
+            "platform",
+            "type"
+          ],
+          "type": "object"
+        },
+        "ContactOut": {
+          "properties": {
+            "alias": {
+              "description": "WeFlow's alias slot: for QQ this carries the contact's QQ number\n(from the uid mapping table / profile, when the version exposes it;\nempty otherwise) — the old qqflow `qq` field migrated here.",
+              "type": "string"
+            },
+            "avatarUrl": {
+              "type": "string"
+            },
+            "displayName": {
+              "type": "string"
+            },
+            "nickname": {
+              "type": "string"
+            },
+            "remark": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "username",
+            "displayName",
+            "nickname",
+            "remark",
+            "alias",
+            "avatarUrl",
+            "type"
+          ],
+          "type": "object"
+        },
+        "Contacts": {
+          "description": "`GET|POST /api/v1/contacts`。",
+          "properties": {
+            "contacts": {
+              "description": "复用既有的 `ContactOut`（它已带 `camelCase` 与字段级注释），不另建一份平行\n定义 —— 两份定义迟早会漂移。",
+              "items": {
+                "$ref": "#/components/schemas/ContactOut"
+              },
+              "type": "array"
+            },
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hasMore": {
+              "type": "boolean"
+            },
+            "success": {
+              "type": "boolean"
+            },
+            "total": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "contacts",
+            "count",
+            "hasMore",
+            "success",
+            "total"
+          ],
+          "type": "object"
+        },
+        "GroupMember": {
+          "description": "群成员项。字段缺失同样压平成**空串**（与 `contacts` 同规）。",
+          "properties": {
+            "alias": {
+              "type": "string"
+            },
+            "avatarUrl": {
+              "type": "string"
+            },
+            "displayName": {
+              "type": "string"
+            },
+            "groupNickname": {
+              "type": "string"
+            },
+            "isFriend": {
+              "type": "boolean"
+            },
+            "isOwner": {
+              "type": "boolean"
+            },
+            "messageCount": {
+              "description": "**条件键**：只有请求带 `includeMessageCounts=1` 时才出现 —— 不是 `0`，是**没有这个\n键**。客户端据「键在不在」判断自己拿到的是计数还是占位，恒出现会让这个判据失效。\n\n**注意与 `weflow-server` 不同**：那边无论是否要求计数都输出该键（值 0）。",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "nickname": {
+              "type": "string"
+            },
+            "remark": {
+              "type": "string"
+            },
+            "wxid": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "alias",
+            "avatarUrl",
+            "displayName",
+            "groupNickname",
+            "isFriend",
+            "isOwner",
+            "nickname",
+            "remark",
+            "wxid"
+          ],
+          "type": "object"
+        },
+        "GroupMembers": {
+          "description": "`GET|POST /api/v1/group-members`。",
+          "properties": {
+            "chatroomId": {
+              "type": "string"
+            },
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "fromCache": {
+              "description": "`true` 表示这份成员表来自缓存而不是刚扫的。**与 weflow 的 `refreshed` 语义相反**\n（那边是「刚刷新过」），不要照抄。",
+              "type": "boolean"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/components/schemas/GroupMember"
+              },
+              "type": "array"
+            },
+            "success": {
+              "type": "boolean"
+            },
+            "updatedAt": "<volatile>"
+          },
+          "required": [
+            "chatroomId",
+            "count",
+            "fromCache",
+            "members",
+            "success",
+            "updatedAt"
+          ],
+          "type": "object"
+        },
+        "Health": {
+          "description": "`GET|POST /health` 与 `/api/v1/health`（**免鉴权**）。\n\n刻意是标量：未鉴权方可访问，因此**不能**列出账号 —— 连数组长度都会泄露\n「本机有几个 QQ 配置、各自到哪一步」。",
+          "properties": {
+            "account": {
+              "$ref": "#/components/schemas/AccountPhase",
+              "description": "账号阶段枚举（取值集合封闭，用类型表达比字符串稳）。"
+            },
+            "status": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "account",
+            "status",
+            "version"
+          ],
+          "type": "object"
+        },
+        "MediaEnvelope": {
+          "description": "本页的导出能力/状态。\n\n`exportPath` 在**未请求导出时是空串**（不是省略）——「空串 = 没有导出」与「有路径 =\n导出了」的区别是下游的判据。",
+          "properties": {
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "exportPath": "<volatile>"
+          },
+          "required": [
+            "count",
+            "enabled",
+            "exportPath"
+          ],
+          "type": "object"
+        },
+        "MediaInfo": {
+          "description": "Media metadata parsed from a structured message segment (image/voice/\nvideo) — field ids per the upstream 40800 analysis (45424 md5 hex,\n45405 size, 45411/45412 dims, 45503 uuid, 45812 local cache path, CDN\nurls 45802/45803/45804). All optional: absent fields stay absent.",
+          "properties": {
+            "fileName": {
+              "description": "File name (45402), often \"md5.ext\".",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "height": {
+              "description": "Image height (45412).",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "localPath": "<volatile>",
+            "md5": {
+              "description": "Image MD5 hex string (45424) — the media store lookup key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "size": {
+              "description": "File size in bytes (45405).",
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "urls": {
+              "description": "CDN URLs (45802 thumb / 45803 preview / 45804 original).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "uuid": {
+              "description": "File UUID (45503).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "width": {
+              "description": "Image width (45411).",
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "MessageOut": {
+          "description": "WeFlow-style message row.",
+          "properties": {
+            "content": {
+              "type": "string"
+            },
+            "createTime": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "isSend": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "localId": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "localType": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "media": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/MediaInfo",
+                  "description": "Structured media metadata (image/voice/video); absent for text etc."
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mediaFileName": {
+              "description": "WeFlow media-export fields — filled by the messages handler when\n`media=1` exports this page's media (absent otherwise).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mediaId": {
+              "description": "Media store key (md5 hex or uuid) — fetch bytes via /api/v1/media/{id}.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mediaLocalPath": "<volatile>",
+            "mediaType": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mediaUrl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parsedContent": {
+              "type": "string"
+            },
+            "rawContent": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "description": "`platformMessageId` of the message this one replies to.\n\n**Omitted when the target cannot be pinned down** — see\n[`resolve_reply_to`]. The key is absent rather than `null` so that a\nreader which trusts the declared type never receives a value it cannot\nuse.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "senderName": {
+              "description": "Resolved sender display name (WeFlow `senderName`): group card (\"40090\")\nfor THIS conversation > remark (\"20009\") > message nick > profile nick >\nUID. Needs the name maps, so only [`shape_record`] fills it;\n`from_record` leaves it empty. Saves every client from rebuilding the\nsame mapping out of /api/v1/contacts + /api/v1/group-members.",
+              "type": "string"
+            },
+            "senderUsername": {
+              "type": "string"
+            },
+            "serverId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "localId",
+            "serverId",
+            "localType",
+            "createTime",
+            "isSend",
+            "senderUsername",
+            "senderName",
+            "content",
+            "rawContent",
+            "parsedContent"
+          ],
+          "type": "object"
+        },
+        "MessagesChatlab": {
+          "description": "`GET|POST /api/v1/messages?chatlab=1`。",
+          "properties": {
+            "chatlab": {
+              "$ref": "#/components/schemas/ChatlabHeader"
+            },
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hasMore": {
+              "type": "boolean"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/components/schemas/ChatlabMember"
+              },
+              "type": "array"
+            },
+            "messages": {
+              "items": {
+                "$ref": "#/components/schemas/ChatlabMessage"
+              },
+              "type": "array"
+            },
+            "meta": {
+              "$ref": "#/components/schemas/ChatlabMeta"
+            },
+            "success": {
+              "type": "boolean"
+            },
+            "talker": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "chatlab",
+            "count",
+            "hasMore",
+            "members",
+            "messages",
+            "meta",
+            "success",
+            "talker"
+          ],
+          "type": "object"
+        },
+        "MessagesNative": {
+          "description": "`GET|POST /api/v1/messages`（原生面）。\n\n消息项直接复用 `store::query::MessageOut` —— 它已经是类型化定义，条件键也已用\n`skip_serializing_if` 表达，不另建平行 struct（两份迟早漂移）。",
+          "properties": {
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hasMore": {
+              "type": "boolean"
+            },
+            "media": {
+              "$ref": "#/components/schemas/MediaEnvelope"
+            },
+            "messages": {
+              "items": {
+                "$ref": "#/components/schemas/MessageOut"
+              },
+              "type": "array"
+            },
+            "success": {
+              "type": "boolean"
+            },
+            "talker": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "count",
+            "hasMore",
+            "media",
+            "messages",
+            "success",
+            "talker"
+          ],
+          "type": "object"
+        },
+        "Page": {
+          "description": "翻页信息。**`nextCursor` 始终出现**（排空时为 `null`）。",
+          "properties": {
+            "hasMore": {
+              "type": "boolean"
+            },
+            "nextCursor": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "hasMore"
+          ],
+          "type": "object"
+        },
+        "PullEnvelope": {
+          "description": "ChatLab Pull 信封：**顶层就是那五块**，没有 `success` / `count`。",
+          "properties": {
+            "chatlab": {
+              "$ref": "#/components/schemas/ChatlabHeader"
+            },
+            "members": {
+              "items": {
+                "$ref": "#/components/schemas/ChatlabMember"
+              },
+              "type": "array"
+            },
+            "messages": {
+              "items": {
+                "$ref": "#/components/schemas/PullMessage"
+              },
+              "type": "array"
+            },
+            "meta": {
+              "$ref": "#/components/schemas/ChatlabMeta"
+            },
+            "sync": {
+              "$ref": "#/components/schemas/PullSync"
+            }
+          },
+          "required": [
+            "chatlab",
+            "members",
+            "messages",
+            "meta",
+            "sync"
+          ],
+          "type": "object"
+        },
+        "PullMessage": {
+          "description": "Pull 面的消息项。\n\n与混合面**不是同一个 struct**：本面的 `replyToMessageId` 在无引用或**目标不唯一**时\n**省略该键**（规范把它列为可选 *string*；给 `null` 会让信任类型的读者拿到解析不了的\n值）。目标不唯一时宁可不说 —— 猜错的 id 会让客户端把回复挂到另一条消息上，而它无从\n分辨。",
+          "properties": {
+            "accountName": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            },
+            "groupNickname": {
+              "type": "string"
+            },
+            "platformMessageId": {
+              "type": "string"
+            },
+            "replyToMessageId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sender": {
+              "type": "string"
+            },
+            "timestamp": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "accountName",
+            "content",
+            "groupNickname",
+            "platformMessageId",
+            "sender",
+            "timestamp",
+            "type"
+          ],
+          "type": "object"
+        },
+        "PullSync": {
+          "description": "翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界，`nextOffset` 只用于\n时间戳没能前进的退化情形。",
+          "properties": {
+            "hasMore": {
+              "type": "boolean"
+            },
+            "nextOffset": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "nextSince": "<volatile>",
+            "watermark": "<volatile>"
+          },
+          "required": [
+            "hasMore",
+            "nextOffset",
+            "nextSince",
+            "watermark"
+          ],
+          "type": "object"
+        },
+        "SessionChatlab": {
+          "description": "ChatLab 面的会话项。`type` 是字符串（`group` / `private`）。",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "lastMessageAt": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "messageCount": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "platform": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "lastMessageAt",
+            "messageCount",
+            "name",
+            "platform",
+            "type"
+          ],
+          "type": "object"
+        },
+        "SessionNative": {
+          "description": "原生面的会话项。\n\n`type` 是**平台数值枚举**，取值集合与 `weflow-server` **不同**：这里 `1` 是私聊、\n`2` 是群（weflow 是 `0/1/2/3`）。下游不要跨仓库复用这个数字，用 ChatLab 面的字符串。",
+          "properties": {
+            "displayName": {
+              "type": "string"
+            },
+            "lastTimestamp": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "unreadCount": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "username": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "displayName",
+            "lastTimestamp",
+            "type",
+            "unreadCount",
+            "username"
+          ],
+          "type": "object"
+        },
+        "SessionsChatlab": {
+          "description": "`GET /api/v1/sessions?format=chatlab`。",
+          "properties": {
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "page": {
+              "$ref": "#/components/schemas/Page"
+            },
+            "sessions": {
+              "items": {
+                "$ref": "#/components/schemas/SessionChatlab"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "count",
+            "page",
+            "sessions"
+          ],
+          "type": "object"
+        },
+        "SessionsNative": {
+          "description": "`GET /api/v1/sessions`（原生面）。",
+          "properties": {
+            "count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sessions": {
+              "items": {
+                "$ref": "#/components/schemas/SessionNative"
+              },
+              "type": "array"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "count",
+            "sessions",
+            "success"
+          ],
+          "type": "object"
+        },
+        "SyncResult": {
+          "description": "`POST /api/v1/sync`。",
+          "properties": {
+            "newMessages": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "revokeMessages": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "newMessages",
+            "revokeMessages",
+            "success"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    "info": {
+      "title": "qqflow-server",
+      "version": "0.5.2"
+    },
+    "openapi": "3.1.0",
+    "paths": {
+      "/api/v1/accounts": {
+        "get": {
+          "operationId": "get__api_v1_accounts",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AccountsList"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "operationId": "post__api_v1_accounts",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/AccountRegistered"
+                      },
+                      {
+                        "$ref": "#/components/schemas/AccountConflict"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/accounts/{qq}/deregister": {
+        "post": {
+          "operationId": "post__api_v1_accounts__qq__deregister",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/AccountDeregistered"
+                      },
+                      {
+                        "$ref": "#/components/schemas/AccountNotRegistered"
+                      },
+                      {
+                        "$ref": "#/components/schemas/AccountQqMismatch"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/contacts": {
+        "get": {
+          "operationId": "get__api_v1_contacts",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Contacts"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "operationId": "post__api_v1_contacts",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Contacts"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/group-members": {
+        "get": {
+          "operationId": "get__api_v1_group-members",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/GroupMembers"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "operationId": "post__api_v1_group-members",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/GroupMembers"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/health": {
+        "get": {
+          "operationId": "get__api_v1_health",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Health"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "operationId": "post__api_v1_health",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Health"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/messages": {
+        "get": {
+          "operationId": "get__api_v1_messages",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/MessagesNative"
+                      },
+                      {
+                        "$ref": "#/components/schemas/MessagesChatlab"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "operationId": "post__api_v1_messages",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/MessagesNative"
+                      },
+                      {
+                        "$ref": "#/components/schemas/MessagesChatlab"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/sessions": {
+        "get": {
+          "operationId": "get__api_v1_sessions",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/components/schemas/SessionsNative"
+                      },
+                      {
+                        "$ref": "#/components/schemas/SessionsChatlab"
+                      }
+                    ]
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/sessions/{id}/messages": {
+        "get": {
+          "operationId": "get__api_v1_sessions__id__messages",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/PullEnvelope"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/api/v1/sync": {
+        "post": {
+          "operationId": "post__api_v1_sync",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/SyncResult"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      },
+      "/health": {
+        "get": {
+          "operationId": "get__health",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Health"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        },
+        "post": {
+          "operationId": "post__health",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/Health"
+                  }
+                }
+              },
+              "description": "成功"
+            }
+          }
+        }
+      }
+    }
+  },
+  "keys": [
+    "components",
+    "schemas",
+    "AccountConflict",
+    "description",
+    "properties",
+    "occupied_by",
+    "type",
+    "occupied_status",
+    "$ref",
+    "qq",
+    "type",
+    "state",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "AccountDeregistered",
+    "description",
+    "properties",
+    "index_cleared",
+    "type",
+    "previous_status",
+    "$ref",
+    "description",
+    "purged_dirs",
+    "minimum",
+    "type",
+    "purged_media",
+    "type",
+    "qq",
+    "type",
+    "state",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "AccountNotRegistered",
+    "description",
+    "properties",
+    "index_cleared",
+    "type",
+    "purged_dirs",
+    "minimum",
+    "type",
+    "purged_media",
+    "type",
+    "qq",
+    "type",
+    "state",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "AccountPhase",
+    "description",
+    "enum",
+    "type",
+    "AccountQqMismatch",
+    "description",
+    "properties",
+    "index_cleared",
+    "type",
+    "occupied_by",
+    "type",
+    "occupied_status",
+    "$ref",
+    "purged_dirs",
+    "minimum",
+    "type",
+    "purged_media",
+    "type",
+    "qq",
+    "type",
+    "state",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "AccountRegistered",
+    "description",
+    "properties",
+    "db_path",
+    "type",
+    "qq",
+    "type",
+    "state",
+    "type",
+    "status",
+    "oneOf",
+    "$ref",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "AccountStatus",
+    "description",
+    "enum",
+    "type",
+    "AccountView",
+    "description",
+    "properties",
+    "db_path",
+    "type",
+    "error",
+    "type",
+    "message_count",
+    "minimum",
+    "type",
+    "qq",
+    "type",
+    "state",
+    "$ref",
+    "required",
+    "type",
+    "AccountsList",
+    "description",
+    "properties",
+    "accounts",
+    "items",
+    "$ref",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "ChatlabHeader",
+    "description",
+    "properties",
+    "exportedAt",
+    "format",
+    "type",
+    "generator",
+    "type",
+    "version",
+    "type",
+    "required",
+    "type",
+    "ChatlabMember",
+    "description",
+    "properties",
+    "accountName",
+    "type",
+    "avatar",
+    "description",
+    "type",
+    "groupNickname",
+    "type",
+    "platformId",
+    "type",
+    "required",
+    "type",
+    "ChatlabMessage",
+    "description",
+    "properties",
+    "accountName",
+    "type",
+    "content",
+    "type",
+    "groupNickname",
+    "type",
+    "platformMessageId",
+    "type",
+    "sender",
+    "type",
+    "timestamp",
+    "format",
+    "type",
+    "type",
+    "format",
+    "type",
+    "required",
+    "type",
+    "ChatlabMeta",
+    "description",
+    "properties",
+    "groupId",
+    "type",
+    "name",
+    "type",
+    "ownerId",
+    "type",
+    "platform",
+    "type",
+    "type",
+    "type",
+    "required",
+    "type",
+    "ContactOut",
+    "properties",
+    "alias",
+    "description",
+    "type",
+    "avatarUrl",
+    "type",
+    "displayName",
+    "type",
+    "nickname",
+    "type",
+    "remark",
+    "type",
+    "type",
+    "type",
+    "username",
+    "type",
+    "required",
+    "type",
+    "Contacts",
+    "description",
+    "properties",
+    "contacts",
+    "description",
+    "items",
+    "$ref",
+    "type",
+    "count",
+    "minimum",
+    "type",
+    "hasMore",
+    "type",
+    "success",
+    "type",
+    "total",
+    "minimum",
+    "type",
+    "required",
+    "type",
+    "GroupMember",
+    "description",
+    "properties",
+    "alias",
+    "type",
+    "avatarUrl",
+    "type",
+    "displayName",
+    "type",
+    "groupNickname",
+    "type",
+    "isFriend",
+    "type",
+    "isOwner",
+    "type",
+    "messageCount",
+    "description",
+    "minimum",
+    "type",
+    "nickname",
+    "type",
+    "remark",
+    "type",
+    "wxid",
+    "type",
+    "required",
+    "type",
+    "GroupMembers",
+    "description",
+    "properties",
+    "chatroomId",
+    "type",
+    "count",
+    "minimum",
+    "type",
+    "fromCache",
+    "description",
+    "type",
+    "members",
+    "items",
+    "$ref",
+    "type",
+    "success",
+    "type",
+    "updatedAt",
+    "description",
+    "format",
+    "type",
+    "required",
+    "type",
+    "Health",
+    "description",
+    "properties",
+    "account",
+    "$ref",
+    "description",
+    "status",
+    "type",
+    "version",
+    "type",
+    "required",
+    "type",
+    "MediaEnvelope",
+    "description",
+    "properties",
+    "count",
+    "minimum",
+    "type",
+    "enabled",
+    "type",
+    "exportPath",
+    "type",
+    "required",
+    "type",
+    "MediaInfo",
+    "description",
+    "properties",
+    "fileName",
+    "description",
+    "type",
+    "height",
+    "description",
+    "format",
+    "type",
+    "localPath",
+    "description",
+    "type",
+    "md5",
+    "description",
+    "type",
+    "size",
+    "description",
+    "format",
+    "type",
+    "urls",
+    "description",
+    "items",
+    "type",
+    "type",
+    "uuid",
+    "description",
+    "type",
+    "width",
+    "description",
+    "format",
+    "type",
+    "type",
+    "MessageOut",
+    "description",
+    "properties",
+    "content",
+    "type",
+    "createTime",
+    "format",
+    "type",
+    "isSend",
+    "format",
+    "type",
+    "localId",
+    "format",
+    "type",
+    "localType",
+    "format",
+    "type",
+    "media",
+    "oneOf",
+    "$ref",
+    "description",
+    "type",
+    "mediaFileName",
+    "description",
+    "type",
+    "mediaId",
+    "description",
+    "type",
+    "mediaLocalPath",
+    "type",
+    "mediaType",
+    "type",
+    "mediaUrl",
+    "type",
+    "parsedContent",
+    "type",
+    "rawContent",
+    "type",
+    "replyToMessageId",
+    "description",
+    "type",
+    "senderName",
+    "description",
+    "type",
+    "senderUsername",
+    "type",
+    "serverId",
+    "type",
+    "required",
+    "type",
+    "MessagesChatlab",
+    "description",
+    "properties",
+    "chatlab",
+    "$ref",
+    "count",
+    "minimum",
+    "type",
+    "hasMore",
+    "type",
+    "members",
+    "items",
+    "$ref",
+    "type",
+    "messages",
+    "items",
+    "$ref",
+    "type",
+    "meta",
+    "$ref",
+    "success",
+    "type",
+    "talker",
+    "type",
+    "required",
+    "type",
+    "MessagesNative",
+    "description",
+    "properties",
+    "count",
+    "minimum",
+    "type",
+    "hasMore",
+    "type",
+    "media",
+    "$ref",
+    "messages",
+    "items",
+    "$ref",
+    "type",
+    "success",
+    "type",
+    "talker",
+    "type",
+    "required",
+    "type",
+    "Page",
+    "description",
+    "properties",
+    "hasMore",
+    "type",
+    "nextCursor",
+    "type",
+    "required",
+    "type",
+    "PullEnvelope",
+    "description",
+    "properties",
+    "chatlab",
+    "$ref",
+    "members",
+    "items",
+    "$ref",
+    "type",
+    "messages",
+    "items",
+    "$ref",
+    "type",
+    "meta",
+    "$ref",
+    "sync",
+    "$ref",
+    "required",
+    "type",
+    "PullMessage",
+    "description",
+    "properties",
+    "accountName",
+    "type",
+    "content",
+    "type",
+    "groupNickname",
+    "type",
+    "platformMessageId",
+    "type",
+    "replyToMessageId",
+    "type",
+    "sender",
+    "type",
+    "timestamp",
+    "format",
+    "type",
+    "type",
+    "format",
+    "type",
+    "required",
+    "type",
+    "PullSync",
+    "description",
+    "properties",
+    "hasMore",
+    "type",
+    "nextOffset",
+    "minimum",
+    "type",
+    "nextSince",
+    "format",
+    "type",
+    "watermark",
+    "format",
+    "type",
+    "required",
+    "type",
+    "SessionChatlab",
+    "description",
+    "properties",
+    "id",
+    "type",
+    "lastMessageAt",
+    "format",
+    "type",
+    "messageCount",
+    "format",
+    "type",
+    "name",
+    "type",
+    "platform",
+    "type",
+    "type",
+    "type",
+    "required",
+    "type",
+    "SessionNative",
+    "description",
+    "properties",
+    "displayName",
+    "type",
+    "lastTimestamp",
+    "format",
+    "type",
+    "type",
+    "format",
+    "type",
+    "unreadCount",
+    "format",
+    "type",
+    "username",
+    "type",
+    "required",
+    "type",
+    "SessionsChatlab",
+    "description",
+    "properties",
+    "count",
+    "minimum",
+    "type",
+    "page",
+    "$ref",
+    "sessions",
+    "items",
+    "$ref",
+    "type",
+    "required",
+    "type",
+    "SessionsNative",
+    "description",
+    "properties",
+    "count",
+    "minimum",
+    "type",
+    "sessions",
+    "items",
+    "$ref",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "SyncResult",
+    "description",
+    "properties",
+    "newMessages",
+    "minimum",
+    "type",
+    "revokeMessages",
+    "minimum",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
+    "info",
+    "title",
+    "version",
+    "openapi",
+    "paths",
+    "/api/v1/accounts",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
+    "$ref",
+    "description",
+    "/api/v1/accounts/{qq}/deregister",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
+    "$ref",
+    "$ref",
+    "description",
+    "/api/v1/contacts",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/api/v1/group-members",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/api/v1/health",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/api/v1/messages",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
+    "$ref",
+    "description",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
+    "$ref",
+    "description",
+    "/api/v1/sessions",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "oneOf",
+    "$ref",
+    "$ref",
+    "description",
+    "/api/v1/sessions/{id}/messages",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/api/v1/sync",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "/health",
+    "get",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "post",
+    "operationId",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description"
+  ],
+  "status": 200
+}

@@ -101,7 +101,7 @@ impl MsgType {
 /// video) — field ids per the upstream 40800 analysis (45424 md5 hex,
 /// 45405 size, 45411/45412 dims, 45503 uuid, 45812 local cache path, CDN
 /// urls 45802/45803/45804). All optional: absent fields stay absent.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaInfo {
     /// File UUID (45503).

@@ -17,7 +17,7 @@ pub struct SessionInfo {
 }
 
 /// WeFlow-style message row.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageOut {
     pub local_id: i64,
