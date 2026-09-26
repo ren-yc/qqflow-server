@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::parser::types::ChatType;
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
 use super::{authorized, parse_time_bound};
@@ -33,7 +33,7 @@ pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(params): Query<Params>,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
 ) -> Result<Json<Value>, ApiError> {
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());

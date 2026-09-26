@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{State};
 use axum::http::{HeaderMap, HeaderName};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 use crate::sync::events::Event;
 
@@ -36,7 +36,7 @@ pub struct Params {
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<Params>,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
 ) -> Result<impl IntoResponse, ApiError> {
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());

@@ -3,13 +3,13 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
 use super::{authorized, merge_body};
@@ -47,7 +47,7 @@ pub struct ContactOut {
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<Params>,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let params = merge_body(params, &body).await?;

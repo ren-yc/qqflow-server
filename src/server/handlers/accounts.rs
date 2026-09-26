@@ -16,7 +16,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{Path as UrlPath, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::db::scan::{self, DbInfo};
 use crate::keystore::validate_key;
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::server::{
     begin_indexing, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
     DeregisterOutcome,
@@ -62,7 +62,7 @@ pub struct ListParams {
 pub async fn list_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<ListParams>,
+    EnvelopeQuery(params): EnvelopeQuery<ListParams>,
 ) -> Result<Json<Value>, ApiError> {
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());
@@ -109,7 +109,7 @@ fn resolve_db_path(state: &AppState, qq: &str, db_path: Option<&str>) -> Option<
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<Params>,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let params = merge_body(params, &body).await?;
@@ -255,7 +255,7 @@ pub async fn delete_handler(
     State(state): State<Arc<AppState>>,
     UrlPath(qq): UrlPath<String>,
     headers: HeaderMap,
-    Query(params): Query<DeleteParams>,
+    EnvelopeQuery(params): EnvelopeQuery<DeleteParams>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let params = merge_body(params, &body).await?;

@@ -388,6 +388,50 @@ async fn sessions_with_token() {
     assert_eq!(v["sessions"][0]["type"], 2);
 }
 
+/// Every error a client can provoke carries the same envelope.
+///
+/// axum answers an unknown path and a bad parameter with a **plain-text, empty**
+/// body by default, so a client that always parses `{success,code,message}`
+/// would have to special-case exactly those two — and a missed exception shows
+/// up as "the server returned something unparseable" instead of the real cause.
+#[tokio::test]
+async fn boundary_errors_carry_the_envelope() {
+    let app = build_router(test_state());
+
+    // Unknown path.
+    let (s, v) = call(app.clone(), "/api/v1/nope").await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["code"], 404);
+    assert!(v["message"].is_string(), "envelope carries a message: {v}");
+
+    // Known path, wrong method: a different status, the same shape.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let v: Value = serde_json::from_slice(&bytes).expect("405 body is the envelope, not plain text");
+    assert_eq!(v["success"], false);
+    assert_eq!(v["code"], 405);
+
+    // A parameter that cannot be parsed is 400 in the envelope too — this is
+    // the one the caller can actually fix, so it must not arrive as plain text.
+    let (s, v) = call(app, "/api/v1/sessions?limit=abc&access_token=test-token-123456").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["code"], 400);
+    assert!(v["message"].is_string(), "envelope carries a message: {v}");
+}
+
 /// The ChatLab session face must say when it truncated.
 ///
 /// Regression: it returned `{sessions:[...]}` with no `count` and no `page`.

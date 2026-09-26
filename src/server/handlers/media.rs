@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::Deserialize;
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::store::AppState;
 
 use super::{authorized, media_content_type};
-use crate::server::error::ApiError;
+use crate::server::error::{ApiError, EnvelopeQuery};
 
 #[derive(Debug, Default, Deserialize, serde::Serialize)]
 pub struct Params {
@@ -65,7 +65,7 @@ async fn serve_file(local_path: &std::path::Path, file_name_hint: Option<&str>) 
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<Params>,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
@@ -105,7 +105,7 @@ pub async fn handler(
 pub async fn exported_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<Params>,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
     Path((talker, media_type, file)): Path<(String, String, String)>,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {

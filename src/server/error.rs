@@ -45,3 +45,32 @@ impl From<anyhow::Error> for ApiError {
         ApiError::internal(format!("{e:#}"))
     }
 }
+
+/// `Query` whose rejection becomes the unified envelope.
+///
+/// axum's own rejection is a **plain-text 400 with an empty body**, so a client
+/// that always parses `{success,code,message}` cannot tell "you sent a bad
+/// parameter" from "the transport returned something unparseable" — and the
+/// first is the one it can actually fix.
+///
+/// Wrapping the extractor keeps that promise in one place instead of asking
+/// every handler to remember it.
+pub struct EnvelopeQuery<T>(pub T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for EnvelopeQuery<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(v)| EnvelopeQuery(v))
+            .map_err(|e| ApiError::bad_request(format!("参数解析失败：{e}")))
+    }
+}
