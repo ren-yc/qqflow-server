@@ -396,7 +396,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | `mediaType` | 仅图片/语音/视频消息：`image` / `voice` / `video` |
 | `media` | 仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略） |
 | `mediaId` | 媒体获取键（md5 hex 或 uuid，统一小写），用于 `GET /api/v1/media/{id}`；**仅当索引注册了本地缓存路径（`media.localPath` 非空）时提供**——否则省略（`media` 对象仍在，但该键无法取到字节，承诺了就是必 404） |
-| `mediaFileName` / `mediaUrl` / `mediaLocalPath` | 仅 `media=1` 导出后出现：导出文件名、可访问 URL、导出目录绝对路径（WeFlow 形状字段） |
+| `mediaFileName` / `mediaUrl` / `mediaLocalPath` | 仅 `media=1` 导出后出现：导出文件名、**根相对路径**（调用方按自己的基址拼接，取字节带鉴权头）、导出目录绝对路径（WeFlow 形状字段） |
 
 消息类型码：
 
@@ -514,7 +514,7 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 
 `GET|POST /api/v1/messages?media=1`（别名 `meiti`）把**本页**媒体导出到导出根目录（`--media-export-dir`，默认 `<data-dir>/api-media`），布局 `<exportPath>/<talker>/<images|voices|videos>/<file>`，并：
 
-- 每条媒体消息填充 `mediaFileName` / `mediaUrl`（=`{base}/api/v1/media/{talker}/{type}/{file}`）/ `mediaLocalPath`（绝对路径）
+- 每条媒体消息填充 `mediaFileName` / `mediaUrl`（**根相对路径** `/api/v1/media/{talker}/{type}/{file}`，不含 token）/ `mediaLocalPath`（绝对路径）
 - envelope 变为 `"media": {"enabled": true, "exportPath": "<导出根>", "count": <本次导出条数>}`
 - 子开关 `image`（别名 `tupian`）、`voice`（别名 `vioce`）、`video`、`emoji` 默认开启，`0`/`false` 关闭对应类型导出
 - 导出在阻塞线程池执行（`spawn_blocking`），不阻塞 HTTP worker（并发导出/SSE 互不影响）

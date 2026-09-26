@@ -314,7 +314,9 @@ async fn downstream_client_real_db() {
     for m in v["messages"].as_array().unwrap() {
         if let Some(name) = m.get("mediaFileName").and_then(|n| n.as_str()) {
             let url = m["mediaUrl"].as_str().unwrap();
-            assert!(url.starts_with("http://127.0.0.1:5032/api/v1/media/"), "mediaUrl shape");
+            // 根相对路径，且不含凭据：见 weflow 侧同一断言的注释。
+            assert!(url.starts_with("/api/v1/media/"), "mediaUrl is a root-relative path");
+            assert!(!url.contains("access_token"), "no credential in a response body: {url}");
             assert!(url.ends_with(&format!("/{name}")), "mediaUrl ends with the file name");
             assert!(
                 m["mediaLocalPath"].as_str().unwrap().starts_with(export_path),

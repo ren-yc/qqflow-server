@@ -549,10 +549,8 @@ async fn fake_db_media_export_serves_exported_bytes() {
     // Export names are key-derived (<md5>.jpg): unique per content.
     let exported_name = format!("{md5}.jpg");
     assert_eq!(m["mediaFileName"], exported_name);
-    assert_eq!(
-        m["mediaUrl"],
-        format!("http://127.0.0.1:5032/api/v1/media/10001/images/{exported_name}")
-    );
+    // 根相对路径、不含凭据：调用方按自己的基址拼接。
+    assert_eq!(m["mediaUrl"], format!("/api/v1/media/10001/images/{exported_name}"));
     let local = m["mediaLocalPath"].as_str().unwrap();
     assert!(local.starts_with(export_root.to_string_lossy().as_ref()));
 

@@ -591,9 +591,10 @@ async fn messages_media_enabled_v1() {
     // Export names are key-derived (<md5>.<source ext>): unique per content.
     let exported_name = "aabbccddeeff00112233445566778899.jpg";
     assert_eq!(m0["mediaFileName"], exported_name);
+    // 根相对路径、不含凭据；调用方按自己的基址拼接（响应体里带 token 会泄漏到日志与转发）。
     assert_eq!(
         m0["mediaUrl"],
-        format!("http://127.0.0.1:5032/api/v1/media/10001/images/{exported_name}")
+        format!("/api/v1/media/10001/images/{exported_name}")
     );
     assert!(
         m0["mediaLocalPath"].as_str().unwrap().starts_with(export_path),

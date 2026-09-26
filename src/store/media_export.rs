@@ -161,19 +161,22 @@ pub fn export_media(
     if let (Ok(dm), Ok(sm)) = (dest.metadata(), source.metadata())
         && dm.is_file() && dm.len() == sm.len()
     {
-        return Some(out(ctx, &ctx.talker, kind_dir, &file_name, &dest));
+        return Some(out(&ctx.talker, kind_dir, &file_name, &dest));
     }
     if std::fs::copy(&source, &dest).is_err() {
         tracing::debug!("[media-export] copy failed: {} -> {}", source.display(), dest.display());
         return None;
     }
-    Some(out(ctx, &ctx.talker, kind_dir, &file_name, &dest))
+    Some(out(&ctx.talker, kind_dir, &file_name, &dest))
 }
 
-fn out(ctx: &ExportContext, talker: &str, kind: &str, file_name: &str, dest: &Path) -> ExportOut {
+fn out(talker: &str, kind: &str, file_name: &str, dest: &Path) -> ExportOut {
     ExportOut {
         file_name: file_name.to_string(),
-        url: format!("{}/api/v1/media/{talker}/{kind}/{file_name}", ctx.base_url),
+        // **相对路径，且不带 token**：token 一旦进了响应体就会出现在客户端日志与
+        // 任何转发里，而它本来是只走请求头的凭据；相对路径同时免掉了把服务基址烤进
+        // 响应——反代或换端口不会下发失效地址。调用方按自己的基址拼接。
+        url: format!("/api/v1/media/{talker}/{kind}/{file_name}"),
         local_path: dest.to_string_lossy().into_owned(),
     }
 }
@@ -288,10 +291,9 @@ mod tests {
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
         let e = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("export");
         assert_eq!(e.file_name, "aabbccddeeff00112233445566778899.png");
-        assert_eq!(
-            e.url,
-            "http://127.0.0.1:5032/api/v1/media/10001/images/aabbccddeeff00112233445566778899.png"
-        );
+        // 根相对路径、不含 token：调用方按自己的基址拼接。
+        assert_eq!(e.url, "/api/v1/media/10001/images/aabbccddeeff00112233445566778899.png");
+        assert!(!e.url.contains("access_token"), "响应体里不得出现凭据");
         let dest = Path::new(&e.local_path);
         assert_eq!(std::fs::read(dest).unwrap(), b"fake image bytes");
         let mtime = dest.metadata().unwrap().modified().unwrap();
