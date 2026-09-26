@@ -130,6 +130,144 @@ pub struct AccountQqMismatch {
     pub state: String,
     pub success: bool,
 }
+// ── 消息（原生面）─────────────────────────────────────────
+
+/// `GET|POST /api/v1/messages`（原生面）。
+///
+/// 消息项直接复用 `store::query::MessageOut` —— 它已经是类型化定义，条件键也已用
+/// `skip_serializing_if` 表达，不另建平行 struct（两份迟早漂移）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesNative {
+    pub count: usize,
+    pub has_more: bool,
+    pub media: MediaEnvelope,
+    pub messages: Vec<crate::store::query::MessageOut>,
+    pub success: bool,
+    pub talker: String,
+}
+
+/// 本页的导出能力/状态。
+///
+/// `exportPath` 在**未请求导出时是空串**（不是省略）——「空串 = 没有导出」与「有路径 =
+/// 导出了」的区别是下游的判据。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaEnvelope {
+    pub count: usize,
+    pub enabled: bool,
+    pub export_path: String,
+}
+
+// ── 消息（ChatLab 混合面）─────────────────────────────────
+
+/// `GET|POST /api/v1/messages?chatlab=1`。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesChatlab {
+    pub chatlab: ChatlabHeader,
+    pub count: usize,
+    pub has_more: bool,
+    pub members: Vec<ChatlabMember>,
+    pub messages: Vec<ChatlabMessage>,
+    pub meta: ChatlabMeta,
+    pub success: bool,
+    pub talker: String,
+}
+
+/// ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）—— 快照里靠时钟哨兵掩码。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabHeader {
+    pub exported_at: i64,
+    pub generator: String,
+    pub version: String,
+}
+
+/// 会话元信息。`ownerId` 未绑定时是空串。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabMeta {
+    pub group_id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub platform: String,
+    pub r#type: String,
+}
+
+/// 本页出现过的发送者（去重）。
+///
+/// `accountName` 与 `groupNickname` 在 ChatLab 里是**两件事**：前者是账号自己的名字，
+/// 后者是本会话的群名片（40090）。原生面的 `senderName` 是二者「名片优先」的合并结果，
+/// 含义不同 —— 所以这里各自解析，不复用 `senderName` 填两个键。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabMember {
+    pub account_name: String,
+    /// QQ 没有头像来源；ChatLab 0.0.2 里该字段可选，空串是诚实的答案。
+    pub avatar: String,
+    pub group_nickname: String,
+    pub platform_id: String,
+}
+
+/// 混合面的 ChatLab 消息项。
+///
+/// **没有 `replyToMessageId`** —— 与 `weflow-server` 的同名面**不同**（那边有）。
+/// 不要在两个仓库间统一这个差异。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatlabMessage {
+    pub account_name: String,
+    pub content: String,
+    pub group_nickname: String,
+    pub platform_message_id: String,
+    pub sender: String,
+    pub timestamp: i64,
+    pub r#type: i64,
+}
+
+// ── Pull 面（/api/v1/sessions/{id}/messages）─────────────
+
+/// ChatLab Pull 信封：**顶层就是那五块**，没有 `success` / `count`。
+#[derive(Debug, Serialize)]
+pub struct PullEnvelope {
+    pub chatlab: ChatlabHeader,
+    pub members: Vec<ChatlabMember>,
+    pub messages: Vec<PullMessage>,
+    pub meta: ChatlabMeta,
+    pub sync: PullSync,
+}
+
+/// Pull 面的消息项。
+///
+/// 与混合面**不是同一个 struct**：本面的 `replyToMessageId` 在无引用或**目标不唯一**时
+/// **省略该键**（规范把它列为可选 *string*；给 `null` 会让信任类型的读者拿到解析不了的
+/// 值）。目标不唯一时宁可不说 —— 猜错的 id 会让客户端把回复挂到另一条消息上，而它无从
+/// 分辨。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullMessage {
+    pub account_name: String,
+    pub content: String,
+    pub group_nickname: String,
+    pub platform_message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+    pub sender: String,
+    pub timestamp: i64,
+    pub r#type: i64,
+}
+
+/// 翻页与水位。**两个游标都要原样回传**：`nextSince` 是排他下界，`nextOffset` 只用于
+/// 时间戳没能前进的退化情形。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullSync {
+    pub has_more: bool,
+    pub next_offset: usize,
+    pub next_since: i64,
+    pub watermark: i64,
+}
 // ── 会话列表 ──────────────────────────────────────────────
 
 /// `GET /api/v1/sessions`（原生面）。

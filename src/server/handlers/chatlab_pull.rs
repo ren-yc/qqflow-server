@@ -7,9 +7,10 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::parser::types::ChatType;
+use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta, PullEnvelope, PullMessage, PullSync};
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
@@ -115,50 +116,52 @@ pub async fn handler(
     // Built once for the whole page: resolving row by row would rescan the
     // conversation per message.
     let inner_index = crate::store::query::build_inner_index(conv);
-    let messages: Vec<Value> = page
+    let messages: Vec<PullMessage> = page
         .iter()
         .map(|&i| {
             let m = &conv.msgs[i];
-            let mut out = json!({
-                "sender": m.from_uid,
-                "accountName": account_name(&m.from_uid),
-                "groupNickname": group_card(&m.from_uid),
-                "timestamp": m.ts,
-                // Canonical ChatLab 0.0.2 code — NOT the native `localType`.
-                "type": m.parsed.msg_type.chatlab_type(),
-                "content": m.parsed.content,
-                "platformMessageId": m.seq.to_string(),
-            });
             // Only when the target is unambiguous: a wrong id here would make a
             // client attach this reply to the wrong message, and it could not
             // tell. Absent beats misleading.
-            if let Some(index) = &inner_index
-                && let Some(target) = crate::store::query::resolve_reply_to(index, m)
-            {
-                out["replyToMessageId"] = Value::String(target.to_string());
+            //
+            // 类型化赋值：此前是 `out["replyToMessageId"] = …`（往 `Value` 里按字符串键
+            // 写），键名写错不会报错，只会静默多一个键。
+            let reply_to_message_id = inner_index
+                .as_ref()
+                .and_then(|index| crate::store::query::resolve_reply_to(index, m))
+                .map(|target| target.to_string());
+            PullMessage {
+                account_name: account_name(&m.from_uid),
+                content: m.parsed.content.clone(),
+                group_nickname: group_card(&m.from_uid),
+                platform_message_id: m.seq.to_string(),
+                reply_to_message_id,
+                sender: m.from_uid.clone(),
+                timestamp: m.ts,
+                // Canonical ChatLab 0.0.2 code — NOT the native `localType`.
+                r#type: m.parsed.msg_type.chatlab_type(),
             }
-            out
         })
         .collect();
 
     // Senders in THIS page, deduped — the roster describes what was exported,
     // matching WeFlow. Scanning the whole conversation instead made `members`
     // unbounded and cost a full pass per request.
-    let members: Vec<Value> = {
+    let members: Vec<ChatlabMember> = {
         let mut seen: Vec<&str> = Vec::new();
         let mut out = Vec::new();
         for &i in page {
             let uid = conv.msgs[i].from_uid.as_str();
             if !uid.is_empty() && !seen.contains(&uid) {
                 seen.push(uid);
-                out.push(json!({
-                    "platformId": uid,
-                    "accountName": account_name(uid),
-                    "groupNickname": group_card(uid),
+                out.push(ChatlabMember {
+                    account_name: account_name(uid),
                     // QQ exposes no avatar source; the field is optional in
                     // ChatLab 0.0.2, so an empty string is the honest answer.
-                    "avatar": "",
-                }));
+                    avatar: String::new(),
+                    group_nickname: group_card(uid),
+                    platform_id: uid.to_string(),
+                });
             }
         }
         out
@@ -175,36 +178,38 @@ pub async fn handler(
         .unwrap_or_default();
 
     let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
-    Ok(Json(json!({
-        "chatlab": {
-            "version": "0.0.2",
-            "exportedAt": chrono::Utc::now().timestamp(),
-            "generator": "qqflow-server",
+    let body = serde_json::to_value(PullEnvelope {
+        chatlab: ChatlabHeader {
+            exported_at: chrono::Utc::now().timestamp(),
+            generator: "qqflow-server".to_string(),
+            version: "0.0.2".to_string(),
         },
-        "meta": {
-            "name": store.display_name(chat_type, &talker),
-            "platform": "qq",
-            "type": chat_type.as_str(),
-            "groupId": talker,
-            "ownerId": owner_id,
+        members,
+        messages,
+        meta: ChatlabMeta {
+            group_id: talker.clone(),
+            name: store.display_name(chat_type, &talker),
+            owner_id,
+            platform: "qq".to_string(),
+            r#type: chat_type.as_str().to_string(),
         },
-        "members": members,
-        "messages": messages,
-        "sync": {
-            "hasMore": has_more,
-            "nextSince": if has_more { next_since } else { watermark },
+        sync: PullSync {
+            has_more,
+            next_since: if has_more { next_since } else { watermark },
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the
             // page ends on a complete ts group, so re-filtering with it drops
             // exactly the rows already served — leaving the next unseen row at
             // offset 0. `nextOffset` therefore only carries weight in the
             // degenerate case where the timestamp could not advance at all.
-            "nextOffset": if has_more && next_since <= since.unwrap_or(i64::MIN) {
+            next_offset: if has_more && next_since <= since.unwrap_or(i64::MIN) {
                 start.saturating_add(page.len())
             } else {
                 0
             },
-            "watermark": watermark,
-        }
-    })))
+            watermark,
+        },
+    })
+    .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;
+    Ok(Json(body))
 }

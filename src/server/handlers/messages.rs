@@ -13,13 +13,17 @@ use axum::extract::{State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::store::media_export::{self, ExportContext, ExportOptions};
 use crate::store::query::{query_messages, MessageOut, MessageQuery};
 use crate::store::AppState;
 
 use super::{authorized, merge_body, parse_time_bound, FlexBool};
+use crate::server::dto::{
+    ChatlabHeader, ChatlabMember, ChatlabMessage, ChatlabMeta, MediaEnvelope, MessagesChatlab,
+    MessagesNative,
+};
 use crate::server::error::{ApiError, EnvelopeQuery};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -107,8 +111,12 @@ pub async fn handler(
             talker,
             items.len(),
             has_more,
-            json!({ "enabled": true, "exportPath": "", "count": media_count }),
-            json!(items),
+            MediaEnvelope {
+                count: media_count,
+                enabled: true,
+                export_path: String::new(),
+            },
+            items,
         )
     };
     Ok(Json(body))
@@ -116,15 +124,24 @@ pub async fn handler(
 
 /// WeFlow message-envelope shape — one shared builder for the media=1 and
 /// compat paths so the contract field set cannot drift between them.
-fn envelope(talker: &str, count: usize, has_more: bool, media: Value, messages: Value) -> Value {
-    json!({
-        "success": true,
-        "talker": talker,
-        "count": count,
-        "hasMore": has_more,
-        "media": media,
-        "messages": messages,
+fn envelope(
+    talker: &str,
+    count: usize,
+    has_more: bool,
+    media: MediaEnvelope,
+    messages: Vec<crate::store::query::MessageOut>,
+) -> Value {
+    // 构造 DTO 后 `to_value`：`json!` 与 `to_value` 都经 BTreeMap（键被排序），因此**输出
+    // 逐字节不变**，而类型化构造让「键名写错」变成编译错误。
+    serde_json::to_value(MessagesNative {
+        count,
+        has_more,
+        media,
+        messages,
+        success: true,
+        talker: talker.to_string(),
     })
+    .expect("消息信封必须可序列化")
 }
 
 /// WeFlow-shaped media export envelope (`media=1` / `meiti`): exports the
@@ -171,8 +188,12 @@ async fn export_envelope(
         talker,
         messages.len(),
         has_more,
-        json!({ "enabled": true, "exportPath": export_path, "count": exported }),
-        json!(messages),
+        MediaEnvelope {
+            count: exported,
+            enabled: true,
+            export_path,
+        },
+        messages,
     ))
 }
 
@@ -220,64 +241,66 @@ fn chatlab_envelope(
 
     // Senders in this page, deduped — the undeduped version repeated a member
     // once per message they sent.
-    let members: Vec<Value> = {
+    let members: Vec<ChatlabMember> = {
         let mut seen: Vec<&str> = Vec::new();
         let mut out = Vec::new();
         for m in items {
             let uid = m.sender_username.as_str();
             if !uid.is_empty() && !seen.contains(&uid) {
                 seen.push(uid);
-                out.push(json!({
-                    "platformId": uid,
-                    "accountName": account_name(uid),
-                    "groupNickname": group_card(uid),
-                    "avatar": "",
-                }));
+                out.push(ChatlabMember {
+                    account_name: account_name(uid),
+                    // QQ 没有头像来源；ChatLab 0.0.2 里该字段可选，空串是诚实的答案。
+                    avatar: String::new(),
+                    group_nickname: group_card(uid),
+                    platform_id: uid.to_string(),
+                });
             }
         }
         out
     };
-    let messages: Vec<Value> = items
+    let messages: Vec<ChatlabMessage> = items
         .iter()
         .rev() // chatlab is chronological
-        .map(|m| json!({
-            "sender": m.sender_username,
-            "accountName": account_name(&m.sender_username),
-            "groupNickname": group_card(&m.sender_username),
-            "timestamp": m.create_time,
+        .map(|m| ChatlabMessage {
+            account_name: account_name(&m.sender_username),
+            content: m.content.clone(),
+            group_nickname: group_card(&m.sender_username),
+            platform_message_id: m.server_id.clone(),
+            sender: m.sender_username.clone(),
+            timestamp: m.create_time,
             // Canonical ChatLab 0.0.2 code. `localType` is the native space, so
             // recover the variant first (see `MsgType::from_code`).
-            "type": crate::parser::types::MsgType::from_code(m.local_type).chatlab_type(),
-            "content": m.content,
-            "platformMessageId": m.server_id,
-        }))
+            r#type: crate::parser::types::MsgType::from_code(m.local_type).chatlab_type(),
+        })
         .collect();
-    json!({
-        "success": true,
-        "talker": talker,
-        "count": messages.len(),
-        "hasMore": has_more,
-        "chatlab": {
-            "version": "0.0.2",
-            "exportedAt": chrono::Utc::now().timestamp(),
-            "generator": "qqflow-server",
+    serde_json::to_value(MessagesChatlab {
+        chatlab: ChatlabHeader {
+            exported_at: chrono::Utc::now().timestamp(),
+            generator: "qqflow-server".to_string(),
+            version: "0.0.2".to_string(),
         },
-        "meta": {
-            "name": name,
-            "platform": "qq",
-            "type": chat_type.as_str(),
-            "groupId": talker,
+        count: messages.len(),
+        has_more,
+        members,
+        messages,
+        meta: ChatlabMeta {
+            group_id: talker.to_string(),
+            name,
             // Same as the Pull face: the bound account. Only one account ever
             // holds the binding, so the first Ready entry is unambiguous.
-            "ownerId": state
+            owner_id: state
                 .accounts
                 .read()
                 .iter()
                 .find(|a| a.state.is_ready())
                 .map(|a| a.qq.clone())
                 .unwrap_or_default(),
+            platform: "qq".to_string(),
+            r#type: chat_type.as_str().to_string(),
         },
-        "members": members,
-        "messages": messages,
+        success: true,
+        talker: talker.to_string(),
     })
+    .expect("ChatLab 信封必须可序列化")
 }
