@@ -410,7 +410,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | 撤回 | 6 |
 | 系统 | 7 |
 
-> v1 差异：无 `replyToMessageId` / `quote` 字段；媒体通过 `media` 对象 + `mediaId` 提供，字节经 `GET /api/v1/media/{id}` 获取。
+> v1 差异：有 `replyToMessageId`（**仅在目标唯一时输出**，见 §4.1 末的判据），无 `quote` 字段；媒体通过 `media` 对象 + `mediaId` 提供，字节经 `GET /api/v1/media/{id}` 获取。
 
 **示例响应**
 
@@ -482,8 +482,9 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 `meta.type` 按标准只有 `group`/`private` 两个取值，公众号/订阅号等会归入
 `private`。需要更细的会话分类请用 §4 `/api/v1/sessions` 的 `type`。
 
-不输出的可选字段（`meta.groupAvatar`、`members[].aliases`、`messages[].mediaPath`、
-`messages[].replyToMessageId`）与本面同样适用，清单见 §4.1"与标准 / 安装版的已知差异"。
+不输出的可选字段（`meta.groupAvatar`、`members[].aliases`、`messages[].mediaPath`）与本面
+同样适用，清单见 §4.1"与标准 / 安装版的已知差异"。`messages[].replyToMessageId` 由本面与
+`format=chatlab` 面**同样规则**输出。
 
 ---
 
@@ -535,6 +536,7 @@ GET /api/v1/sessions
 | `keyword` | string | 否   | 匹配 `username` 或 `displayName` |
 | `limit`   | number | 否   | 默认 `100`，范围 `1~10000`       |
 | `offset`  | number | 否   | 分页偏移，默认 `0`               |
+| `cursor`  | string | 否   | 翻页游标：把上一次响应的 `page.nextCursor` 原样传回。解析不了就退回 `offset`；两者做同一件事（本面按偏移翻页），`cursor` 只是免去调用方自己算下一个偏移 |
 | `format`  | string | 否   | `chatlab` 时输出 ChatLab 格式    |
 
 ### 响应字段（按最后消息时间倒序）
@@ -566,11 +568,18 @@ GET /api/v1/sessions
 {
   "sessions": [
     { "id": "10001", "name": "项目群", "platform": "qq", "type": "group", "messageCount": 0, "lastMessageAt": 1782864000 }
-  ]
+  ],
+  "count": 1,
+  "page": { "hasMore": true, "nextCursor": "1" }
 }
 ```
 
-`platform` 固定 `"qq"`；`messageCount` v1 恒为 `0`。
+`platform` 固定 `"qq"`；`messageCount` v1 恒为 `0`。`count` 是**本页条数**（与原生面同义）。
+
+**`page` 块是必需的。** ChatLab 把「没有 `page` 块」的响应读作「这就是完整一页」，
+所以不带 `page` 的截断会被下游当成全量——默认 `limit` 是 100，普通账号就能撞上，
+表现是「第 101 个会话凭空消失」且不报错。`hasMore` 为假时 `nextCursor` 为 `null`；
+把 `nextCursor` 原样回传即可继续翻页。
 
 ---
 
@@ -661,8 +670,9 @@ GET /api/v1/sessions/{id}/messages
 
 **本项目实际只产出 `0` / `1` / `2` / `3` / `80` / `81` / `99` 七个码。** 上表是标准
 全集，其余码位（`4` FILE、`5` EMOJI、`7` LINK、`8` LOCATION、`24` SHARE、`25`
-REPLY、`27` CONTACT）在 QQ 侧没有对应的解析：没有引用关系抽取，也没有名片 / 位置 /
-链接的细分识别，这些消息统一落到 `99` OTHER。
+REPLY、`27` CONTACT）在 QQ 侧没有对应的**类型码**解析：没有名片 / 位置 / 链接的细分识别，
+这些消息统一落到 `99` OTHER。（**引用关系本身是抽得出的**——见 §4.1 末的
+`replyToMessageId`；类型码与引用关系是两件事，不要因为其中一个没做就以为另一个也没有。）
 
 ⚠️ **与 weflow-server 的覆盖面不对等。** weflow-server 能输出
 `0/1/2/3/4/5/7/8/24/25/27/80/81/99`。同一个逻辑消息在两个平台上可能一边是 `25`
@@ -698,7 +708,19 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 多来源名字已收敛进 `accountName`（备注 > `uid_names` > 昵称 > UID） |
 | `members[].avatar` | 可选，要求 Data URL | 真实 URL | **恒为空串** | QQ 侧没有可用的头像来源；字段保留以满足形状 |
 | `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 媒体字节请走 §3 `/api/v1/messages` 的媒体导出 |
-| `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 `format=chatlab` 面有 | **两个面都不输出** | QQ 侧没有引用关系抽取，无数据可填 |
+| `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 `format=chatlab` 面有 | **目标唯一时输出；否则省略该键** | 键名与语义对齐 WeFlow；判据见下 |
+
+**`replyToMessageId` 的判据（为什么有时不给）**：它取自表列 `40850`（被回复消息的**会话内序号**），
+再在同一会话里找 `40003` 等于它的那一行，输出**那一行的 `40001`**（也就是 `platformMessageId`）。
+
+问题在于 `(会话, 40003)` **并不唯一**——实测某真实库 31,820 行群消息里重复了 **1371 组**，而
+文档只说了「可跨群复用」，漏了「**群内也复用**」。直接查会随机命中一行，于是客户端把引用挂到
+**错的消息**上，而它无法分辨。因此实现只在**恰好一个候选**（同一 `40003` 且不晚于本条的时间）
+时输出，否则**省略该键**：实测覆盖 **1522/1616 = 94.2%** 的回复，其余 5.8% 的表现是
+「看不到引用」，而不是「看到错的引用」。
+
+> 列 `40900`（引用场景的消息快照）经实测**不含**目标身份——四种编码 × 两列 × 发送者维度都试过，
+> 不能用来消歧。上游文档在这一点上与本库形态不同，**以本库实测为准**。
 
 ---
 

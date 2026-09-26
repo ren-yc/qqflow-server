@@ -21,6 +21,9 @@ pub struct Params {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
+    /// `page.nextCursor` 的回传入参；解析不了就退回 `offset`。
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default, alias = "token")]
@@ -45,11 +48,21 @@ pub async fn handler(
         return Err(ApiError::not_ready());
     }
     let limit = params.limit.clamp(1, 10000);
+    // `cursor` 是 `page.nextCursor` 的回传入参；解析不了就退回 `offset`，
+    // 与其它参数一样「坏值退化为默认而不是报错」。
+    let offset = params
+        .cursor
+        .as_deref()
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(params.offset);
     let chatlab = params.format.as_deref() == Some("chatlab");
 
     let store = state.store.read();
     if chatlab {
-        let sessions: Vec<Value> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, params.offset)
+        // ChatLab 把**没有 page 块**的响应读作「这就是完整一页」，所以截断必须显式
+        // 告知，否则第 limit 条之后的会话会被静默丢掉。总数与列表共用同一个谓词。
+        let total = crate::store::query::count_sessions(&store, params.keyword.as_deref());
+        let sessions: Vec<Value> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, offset)
             .into_iter()
             .map(|s| {
                 json!({
@@ -62,9 +75,18 @@ pub async fn handler(
                 })
             })
             .collect();
-        Ok(Json(json!({ "sessions": sessions })))
+        let next_offset = offset + sessions.len();
+        let has_more = next_offset < total;
+        Ok(Json(json!({
+            "sessions": sessions,
+            "count": sessions.len(),
+            "page": {
+                "hasMore": has_more,
+                "nextCursor": if has_more { Some(next_offset.to_string()) } else { None },
+            },
+        })))
     } else {
-        let sessions: Vec<Value> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, params.offset)
+        let sessions: Vec<Value> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, offset)
             .into_iter()
             .map(|s| {
                 json!({

@@ -231,6 +231,16 @@ pub struct MessageRecord {
     /// Raw "40013" direction (0 other / 1,2 self / 3 system); None when the
     /// column is absent in this QQ version (is_send degrades to 0).
     pub direction: Option<i64>,
+    /// Column "40003": the *inner* conversation-local message number.
+    ///
+    /// **Not unique inside a conversation** — measured on a real database,
+    /// 1371 key groups repeat (only 9 of them at the same second). It is
+    /// therefore never used on its own; a reply lookup combines it with a
+    /// time bound and refuses to answer when more than one row matches.
+    pub inner_seq: Option<i64>,
+    /// Column "40850": inner number of the message this one replies to.
+    /// `None` when the column is absent, or zero (= no reply / not applicable).
+    pub reply_inner_seq: Option<i64>,
     pub parsed: ParsedMessage,
 }
 

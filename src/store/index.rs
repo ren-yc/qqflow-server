@@ -28,9 +28,11 @@ const C2C_TABLE: &str = "c2c_msg_table";
 /// (value-driven: absent columns degrade, never fail the scan).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TableCols {
-    has_dir: bool,  // "40013" message direction
-    has_time: bool, // "40050" unix send time
-    has_card: bool, // "40090" sender group card
+    has_dir: bool,    // "40013" message direction
+    has_time: bool,   // "40050" unix send time
+    has_card: bool,   // "40090" sender group card
+    has_inner: bool,  // "40003" conversation-local message number
+    has_reply: bool,  // "40850" inner number this message replies to
 }
 
 /// Probe which spec-derived columns the table has (metadata-only query).
@@ -47,6 +49,8 @@ fn probe_cols(conn: &Connection, table: &str) -> TableCols {
             "40013" => cols.has_dir = true,
             "40050" => cols.has_time = true,
             "40090" => cols.has_card = true,
+            "40003" => cols.has_inner = true,
+            "40850" => cols.has_reply = true,
             _ => {}
         }
     }
@@ -75,6 +79,12 @@ fn cols_sql(chat_type: ChatType, cols: TableCols) -> String {
     if cols.has_card {
         sql.push_str(", \"40090\"");
     }
+    if cols.has_inner {
+        sql.push_str(", \"40003\"");
+    }
+    if cols.has_reply {
+        sql.push_str(", \"40850\"");
+    }
     sql
 }
 
@@ -89,6 +99,8 @@ struct RowData {
     dir: Option<i64>,
     time: Option<i64>,
     card: Option<String>,
+    inner: Option<i64>,
+    reply: Option<i64>,
 }
 
 /// Map a query row to `RowData`, reading every column by NAME (SQL
@@ -125,7 +137,9 @@ fn map_row(
     let dir = if cols.has_dir { row.get::<_, Option<i64>>("40013")? } else { None };
     let time = if cols.has_time { row.get::<_, Option<i64>>("40050")? } else { None };
     let card = if cols.has_card { row.get::<_, Option<String>>("40090")? } else { None };
-    Ok(RowData { rowid, talker, seq, uid, nick, blob, dir, time, card })
+    let inner = if cols.has_inner { row.get::<_, Option<i64>>("40003")? } else { None };
+    let reply = if cols.has_reply { row.get::<_, Option<i64>>("40850")? } else { None };
+    Ok(RowData { rowid, talker, seq, uid, nick, blob, dir, time, card, inner, reply })
 }
 
 /// Decode a row into a `MessageRecord`: ts prefers "40050" (spec-authoritative
@@ -147,6 +161,10 @@ fn row_to_record(chat_type: ChatType, d: RowData) -> MessageRecord {
             .then(|| d.card.filter(|c| !c.is_empty()))
             .flatten(),
         direction: d.dir,
+        // Zero is the documented "no target / not applicable" value, so it is
+        // folded into None here — downstream never has to special-case it.
+        inner_seq: d.inner.filter(|v| *v != 0),
+        reply_inner_seq: d.reply.filter(|v| *v != 0),
         parsed: parser::extract_message(&d.blob),
     }
 }
@@ -453,7 +471,7 @@ mod tests {
         let conn = make_table(true);
         assert_eq!(
             probe_cols(&conn, "group_msg_table"),
-            TableCols { has_dir: true, has_time: true, has_card: true }
+            TableCols { has_dir: true, has_time: true, has_card: true, has_inner: false, has_reply: false }
         );
         let conn = make_table(false);
         assert_eq!(probe_cols(&conn, "group_msg_table"), TableCols::default());

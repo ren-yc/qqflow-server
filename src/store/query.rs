@@ -1,6 +1,8 @@
 //! Read-side queries over the in-memory index (WeFlow-compatible shapes).
 
-use crate::parser::types::{ChatType, MediaInfo};
+use std::collections::HashMap;
+
+use crate::parser::types::{ChatType, MediaInfo, MessageRecord};
 use crate::store::Store;
 
 /// WeFlow-style session row.
@@ -49,6 +51,14 @@ pub struct MessageOut {
     pub media_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_local_path: Option<String>,
+    /// `platformMessageId` of the message this one replies to.
+    ///
+    /// **Omitted when the target cannot be pinned down** — see
+    /// [`resolve_reply_to`]. The key is absent rather than `null` so that a
+    /// reader which trusts the declared type never receives a value it cannot
+    /// use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
 }
 
 impl MessageOut {
@@ -75,6 +85,9 @@ impl MessageOut {
             media_file_name: None,
             media_url: None,
             media_local_path: None,
+            // Filled by the query layer, which is the only place that can see
+            // the whole conversation a candidate must be found in.
+            reply_to_message_id: None,
         }
     }
 }
@@ -119,6 +132,59 @@ pub(crate) fn fetchable_media_id(store: &Store, m: &MediaInfo) -> Option<String>
     store.media.contains_key(key).then(|| key.to_string())
 }
 
+/// `40003` -> every `(ts, seq)` carrying it in this conversation.
+///
+/// Built once per query: resolving row by row would be O(n²), and a long
+/// conversation is exactly where a reply is most likely to exist.
+/// `None` when no row in the conversation replies to anything, so the cost is
+/// not paid for the common case.
+pub(crate) fn build_inner_index(
+    conv: &crate::store::Conversation,
+) -> Option<HashMap<i64, Vec<(i64, i64)>>> {
+    if !conv.msgs.iter().any(|m| m.reply_inner_seq.is_some()) {
+        return None;
+    }
+    let mut map: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+    for m in &conv.msgs {
+        if let Some(k) = m.inner_seq {
+            map.entry(k).or_default().push((m.ts, m.seq));
+        }
+    }
+    Some(map)
+}
+
+/// Resolve a reply target to a `platformMessageId`, or `None`.
+///
+/// **Deliberately conservative.** "40003" is not unique inside a conversation
+/// (measured on a real database: 1371 repeating key groups, only 9 of them at
+/// the same second), so the obvious `(conversation, "40003")` lookup can land
+/// on several rows. Picking one would be worse than emitting nothing: a client
+/// matches `replyToMessageId` against another message in the same conversation
+/// and **cannot tell a wrong match from a right one**.
+///
+/// So a value is emitted only when exactly one candidate both carries the
+/// wanted "40003" and is not newer than the reply. Measured on a real
+/// database: 1522 of 1616 replies (94.2%) resolve uniquely; the rest omit the
+/// field. The upstream field notes omit this ambiguity — the local database
+/// shape is what the rule is built on.
+pub(crate) fn resolve_reply_to(
+    index: &HashMap<i64, Vec<(i64, i64)>>,
+    m: &MessageRecord,
+) -> Option<i64> {
+    let want = m.reply_inner_seq?;
+    let mut hit: Option<i64> = None;
+    for (ts, seq) in index.get(&want)? {
+        if *ts > m.ts {
+            continue;
+        }
+        if hit.is_some() {
+            return None; // more than one candidate: refuse to guess
+        }
+        hit = Some(*seq);
+    }
+    hit
+}
+
 pub struct MessageQuery<'a> {
     pub talker: &'a str,
     pub limit: usize,
@@ -143,6 +209,7 @@ pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool
         (y.ts, y.rowid).cmp(&(x.ts, x.rowid)) // newest first
     });
 
+    let inner_index = build_inner_index(conv);
     let kw = q.keyword.map(|k| k.to_lowercase());
     let mut out = Vec::new();
     let mut skipped = 0usize;
@@ -169,7 +236,11 @@ pub fn query_messages(store: &Store, q: &MessageQuery) -> (Vec<MessageOut>, bool
             has_more = true;
             break;
         }
-        out.push(shape_record(store, m));
+        let mut row = shape_record(store, m);
+        if let Some(index) = &inner_index {
+            row.reply_to_message_id = resolve_reply_to(index, m).map(|s| s.to_string());
+        }
+        out.push(row);
     }
     (out, has_more)
 }
@@ -180,6 +251,29 @@ fn conv_last_ts(c: &crate::store::Conversation) -> i64 {
     c.msgs.iter().map(|m| m.ts).max().unwrap_or(0)
 }
 
+/// 会话是否匹配关键词。**这是唯一的过滤谓词**——`query_sessions` 与
+/// `count_sessions` 共用它：两份各写一遍必然漂移，而漂移的表现就是
+/// 「还有没有下一页」与实际返回的内容对不上。
+fn matches_keyword(store: &Store, c: &crate::store::Conversation, kw: Option<&str>) -> bool {
+    match kw {
+        Some(k) => {
+            store.display_name(c.chat_type, &c.talker).to_lowercase().contains(k)
+                || c.talker.to_lowercase().contains(k)
+        }
+        None => true,
+    }
+}
+
+/// 过滤后的会话总数：调用方用它判断「还有没有下一页」。不做切片。
+pub fn count_sessions(store: &Store, keyword: Option<&str>) -> usize {
+    let kw = keyword.map(|k| k.to_lowercase());
+    store
+        .convs
+        .values()
+        .filter(|c| matches_keyword(store, c, kw.as_deref()))
+        .count()
+}
+
 /// Sessions sorted by last message time (newest first). Display names
 /// resolve through the name maps (remark / group-info > message-derived).
 pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<SessionInfo> {
@@ -187,14 +281,7 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
     let mut all: Vec<&crate::store::Conversation> = store.convs.values().collect();
     all.sort_by_key(|c| std::cmp::Reverse(conv_last_ts(c)));
     all.into_iter()
-        .filter(|c| {
-            if let Some(k) = &kw {
-                store.display_name(c.chat_type, &c.talker).to_lowercase().contains(k.as_str())
-                    || c.talker.to_lowercase().contains(k.as_str())
-            } else {
-                true
-            }
-        })
+        .filter(|c| matches_keyword(store, c, kw.as_deref()))
         .skip(offset)
         .take(limit)
         .map(|c| SessionInfo {
@@ -302,6 +389,8 @@ mod tests {
             from_nick: "张三".into(),
             card: None,
             direction: Some(0),
+            inner_seq: None,
+            reply_inner_seq: None,
             parsed: ParsedMessage { msg_type: MsgType::Text, content: "x".into(), media: None },
         }
     }

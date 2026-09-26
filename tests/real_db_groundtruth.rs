@@ -25,7 +25,7 @@ use qqflow_server::db::live::LiveReader;
 use qqflow_server::db::scan;
 use qqflow_server::parser::types::{seq_to_time, ChatType, MsgType};
 use qqflow_server::server::{build_router, AccountRegistry, AccountState, AccountStatus};
-use qqflow_server::store::query::MessageOut;
+use qqflow_server::store::query::{query_messages, MessageOut, MessageQuery};
 use qqflow_server::store::AppState;
 use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
@@ -870,6 +870,345 @@ async fn client_registers_account_with_key_and_db_path() {
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["success"], true);
     assert_eq!(v["messages"].as_array().unwrap().len(), 5, "group 10001 has 5 rows");
+}
+
+
+/// A reply exposes the quoted message's id — but only when the target is
+/// unambiguous.
+///
+/// `(conversation, "40003")` is NOT unique in a real database (1371 repeating
+/// key groups were measured), so the obvious lookup can land on several rows.
+/// The contract this endpoint makes is "the id, when present, is correct";
+/// guessing would break it silently, because a client matches the id against
+/// another message in the same conversation and cannot tell a wrong match from
+/// a right one.
+#[test]
+fn fake_db_reply_is_stated_only_when_unambiguous() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    common::seed_reply_rows(&writer);
+    common::materialize_source(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    drop(reader);
+
+    let q = MessageQuery {
+        talker: "10001",
+        limit: 50,
+        offset: 0,
+        start: None,
+        end: None,
+        keyword: None,
+    };
+    let (rows, _) = query_messages(&store, &q);
+    let seq_of = |rowid: i64| {
+        store
+            .conversation(ChatType::Group, "10001")
+            .unwrap()
+            .msgs
+            .iter()
+            .find(|m| m.rowid == rowid)
+            .expect("row indexed")
+            .seq
+            .to_string()
+    };
+    let served = |rowid: i64| {
+        let seq = seq_of(rowid);
+        rows.iter().find(|r| r.server_id == seq).expect("row served")
+    };
+
+    // The quoted row is on the page, so the id is checkable rather than
+    // merely plausible.
+    assert_eq!(
+        served(7).reply_to_message_id.as_deref(),
+        Some(seq_of(2).as_str()),
+        "a unique target becomes the quoted row's platformMessageId"
+    );
+
+    // Two rows carry the wanted number: stating either one would be a coin
+    // flip, so the key is absent instead.
+    assert_eq!(served(8).reply_to_message_id, None, "ambiguous target -> omitted");
+    // No reply at all is absent too — never null.
+    assert_eq!(served(9).reply_to_message_id, None, "no reply -> omitted");
+}
+
+/// Ground truth for the reply relation: does `40850` point at a message in the
+/// same conversation, and at which column of it?
+///
+/// Ignored by default; requires QQFLOW_TEST_DB_ROOT + QQFLOW_TEST_DB_KEY.
+///
+/// Prints statistics only — never a platform id, a group number or a message
+/// body. It exists to settle what the format notes cannot: whether the upstream
+/// field documentation matches **this** database.
+#[test]
+#[ignore]
+fn real_db_reply_relation() {
+    let root = match std::env::var("QQFLOW_TEST_DB_ROOT") {
+        Ok(v) => v,
+        Err(_) => {
+            println!("[GT] SKIPPED: QQFLOW_TEST_DB_ROOT not set");
+            return;
+        }
+    };
+    let key = match std::env::var("QQFLOW_TEST_DB_KEY") {
+        Ok(v) => v,
+        Err(_) => {
+            println!("[GT] SKIPPED: QQFLOW_TEST_DB_KEY not set");
+            return;
+        }
+    };
+    let accounts = scan::scan_accounts(Some(Path::new(&root))).expect("scan custom root");
+    for info in &accounts {
+        let mut reader = LiveReader::new(info.path.clone(), key.clone());
+        reader.open().expect("real DB must open read-only through the offset VFS");
+        let conn = reader.acquire().unwrap();
+
+        // ① The local shape decides: check the columns actually present before
+        // trusting any upstream note.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(group_msg_table)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect();
+        let has = |c: &str| cols.iter().any(|x| x == c);
+        println!("[GT] reply: 列数 {}，40850={} 40003={} 40027={} 40001={}",
+            cols.len(), has("40850"), has("40003"), has("40027"), has("40001"));
+        if !has("40850") || !has("40003") {
+            println!("[GT] reply: 本库缺 40850 或 40003 —— 上游文档与本库形态不符，到此为止");
+            continue;
+        }
+
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM group_msg_table", [], |r| r.get(0))
+            .unwrap();
+        let nonzero: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM group_msg_table WHERE \"40850\" IS NOT NULL AND \"40850\" != 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        println!("[GT] reply: 总行 {total}；40850 非零 {nonzero}（{:.2}%）",
+            100.0 * nonzero as f64 / total.max(1) as f64);
+
+        // ② Resolution and direction in one pass over a bounded sample: the
+        // table is large and unindexed on 40003, so an unbounded correlated
+        // subquery would scan it per row.
+        let sample = nonzero.min(2000);
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.\"40850\", a.\"40001\", \
+                 (SELECT b.\"40001\" FROM group_msg_table b \
+                  WHERE b.\"40027\" = a.\"40027\" AND b.\"40003\" = a.\"40850\" LIMIT 1) \
+                 FROM group_msg_table a WHERE a.\"40850\" != 0 LIMIT ?1",
+            )
+            .unwrap();
+        let rows: Vec<(i64, Option<i64>)> = stmt
+            .query_map([sample], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        let resolved = rows.iter().filter(|(_, t)| t.is_some()).count();
+        println!("[GT] reply: 抽样 {sample} 行，能在同会话内解析到 40003 的 {resolved}（{:.2}%）",
+            100.0 * resolved as f64 / sample.max(1) as f64);
+
+        // ③ A reply must point BACKWARDS: the target has to be older than the
+        // message quoting it. If it does not, 40850 means something else here.
+        let mut stmt2 = conn
+            .prepare(
+                "SELECT a.\"40001\", b.\"40001\" FROM group_msg_table a \
+                 JOIN group_msg_table b ON b.\"40027\" = a.\"40027\" AND b.\"40003\" = a.\"40850\" \
+                 WHERE a.\"40850\" != 0 LIMIT ?1",
+            )
+            .unwrap();
+        let joins: Vec<(i64, i64)> = stmt2
+            .query_map([sample], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        let earlier = joins.iter().filter(|(a, b)| b < a).count();
+        println!("[GT] reply: 连接抽样 {} 对，目标更早（40001 更小）的 {earlier}（{:.2}%）",
+            joins.len(), 100.0 * earlier as f64 / joins.len().max(1) as f64);
+
+        // ④ Which outer types carry a reply — the set the parser must cover.
+        let mut stmt3 = conn
+            .prepare(
+                "SELECT \"40011\", count(*) FROM group_msg_table \
+                 WHERE \"40850\" != 0 GROUP BY \"40011\" ORDER BY 2 DESC LIMIT 6",
+            )
+            .unwrap();
+        let types: Vec<(i64, i64)> = stmt3
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        println!("[GT] reply: 带引用的行按 40011 分布（前 6）：{types:?}");
+    }
+}
+
+
+/// Can the reply target be disambiguated? `(40027, 40003)` repeats, so the
+/// documented lookup can land on more than one row. This measures whether
+/// bounding the target by TIME (`40050` not after the reply) leaves exactly one
+/// candidate — the disambiguation any implementation would have to rely on.
+#[test]
+#[ignore]
+fn real_db_reply_relation_disambiguation() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("QQFLOW_TEST_DB_ROOT");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("QQFLOW_TEST_DB_KEY");
+    let accounts = scan::scan_accounts(Some(Path::new(&root))).expect("scan custom root");
+    for info in &accounts {
+        let mut reader = LiveReader::new(info.path.clone(), key.clone());
+        reader.open().expect("real DB must open");
+        let conn = reader.acquire().unwrap();
+
+        // ① How many duplicate key groups are duplicates IN TIME (the same
+        // message stored twice) versus genuinely distinct rows?
+        let (dup_total, dup_same_time): (i64, i64) = conn
+            .query_row(
+                "SELECT count(*), sum(CASE WHEN n_ts = 1 THEN 1 ELSE 0 END) FROM (\
+                 SELECT \"40027\", \"40003\", count(DISTINCT \"40050\") AS n_ts \
+                 FROM group_msg_table GROUP BY 1, 2 HAVING count(*) > 1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        println!("[GT] reply3: 重复键组 {dup_total}，其中同一时间的 {dup_same_time}");
+
+        // ② Candidate counts once the target is bounded by time.
+        let mut stmt = conn
+            .prepare(
+                "SELECT cnt, count(*) FROM (SELECT a.rowid AS rid, \
+                 (SELECT count(*) FROM group_msg_table b WHERE b.\"40027\" = a.\"40027\" \
+                  AND b.\"40003\" = a.\"40850\" AND b.\"40050\" <= a.\"40050\") AS cnt \
+                 FROM group_msg_table a WHERE a.\"40850\" != 0) GROUP BY cnt ORDER BY cnt",
+            )
+            .unwrap();
+        let dist: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        println!("[GT] reply3: 时间上界内候选数分布（候选数, 行数）：{dist:?}");
+
+        // ③ Same, but also requiring the target to be strictly older, which is
+        // what a reply means: the newest match strictly before the reply.
+        let mut stmt2 = conn
+            .prepare(
+                "SELECT cnt, count(*) FROM (SELECT a.rowid AS rid, \
+                 (SELECT count(*) FROM group_msg_table b WHERE b.\"40027\" = a.\"40027\" \
+                  AND b.\"40003\" = a.\"40850\" AND b.\"40050\" < a.\"40050\") AS cnt \
+                 FROM group_msg_table a WHERE a.\"40850\" != 0) GROUP BY cnt ORDER BY cnt",
+            )
+            .unwrap();
+        let dist2: Vec<(i64, i64)> = stmt2
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        println!("[GT] reply3: 严格更早的候选数分布：{dist2:?}");
+    }
+}
+
+
+/// Last look at the ambiguous rows: what DOES `40900` contain, and is there a
+/// sender-level tie-break?
+///
+/// The previous probe only checked one encoding of one column, so "the blob has
+/// no candidate" was not yet a safe conclusion. This checks both columns in both
+/// encodings (protobuf varint and decimal text), plus whether the candidates
+/// differ by sender.
+#[test]
+#[ignore]
+fn real_db_reply_relation_ambiguous_detail() {
+    fn varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                return out;
+            }
+        }
+    }
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("QQFLOW_TEST_DB_ROOT");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("QQFLOW_TEST_DB_KEY");
+    let accounts = scan::scan_accounts(Some(Path::new(&root))).expect("scan custom root");
+    for info in &accounts {
+        let mut reader = LiveReader::new(info.path.clone(), key.clone());
+        reader.open().expect("real DB must open");
+        let conn = reader.acquire().unwrap();
+
+        /// One ambiguous row: (rowid, "40900" blob, conversation, reply
+        /// target number, sender uid).
+        type AmbiguousRow = (i64, Option<Vec<u8>>, i64, i64, String);
+        let rows: Vec<AmbiguousRow> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.rowid, a.\"40900\", a.\"40027\", a.\"40850\", coalesce(a.\"40020\", \"\") \
+                     FROM group_msg_table a WHERE a.\"40850\" != 0 AND (SELECT count(*) FROM group_msg_table b \
+                       WHERE b.\"40027\" = a.\"40027\" AND b.\"40003\" = a.\"40850\" \
+                       AND b.\"40050\" <= a.\"40050\") > 1",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        let (mut blob_hits_seq, mut blob_hits_no, mut blob_text_hits, mut sender_unique) = (0, 0, 0, 0);
+        for (rowid, blob, sess, target, sender) in &rows {
+            let mut cs = conn
+                .prepare(
+                    "SELECT \"40001\", \"40003\", coalesce(\"40020\", \"\") FROM group_msg_table \
+                     WHERE \"40027\" = ?1 AND \"40003\" = ?2 AND \"40050\" <= \
+                       (SELECT \"40050\" FROM group_msg_table WHERE rowid = ?3)",
+                )
+                .unwrap();
+            let cands: Vec<(i64, i64, String)> = cs
+                .query_map([sess, target, rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            if cands.iter().filter(|(_, _, s)| s == sender).count() == 1 {
+                sender_unique += 1;
+            }
+            let Some(blob) = blob else { continue };
+            let by_seq = cands.iter().filter(|(s, _, _)| contains(blob, &varint(*s as u64))).count();
+            let by_no = cands.iter().filter(|(_, n, _)| contains(blob, &varint(*n as u64))).count();
+            let by_text = cands
+                .iter()
+                .filter(|(s, n, _)| {
+                    contains(blob, s.to_string().as_bytes()) || contains(blob, n.to_string().as_bytes())
+                })
+                .count();
+            if by_seq == 1 {
+                blob_hits_seq += 1;
+            }
+            if by_no == 1 {
+                blob_hits_no += 1;
+            }
+            if by_text == 1 {
+                blob_text_hits += 1;
+            }
+        }
+        println!("[GT] reply5: 多候选 {} 行；blob 唯一命中 40001={blob_hits_seq} 40003={blob_hits_no} 文本形态={blob_text_hits}；候选里发送者唯一={sender_unique}",
+            rows.len());
+    }
 }
 
 /// Ground truth over a REAL QQ database. Ignored by default; requires

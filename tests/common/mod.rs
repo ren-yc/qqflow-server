@@ -163,6 +163,49 @@ pub fn append_group_row(conn: &Connection, n: i64, text: &str) {
     .unwrap();
 }
 
+/// Add the reply columns ("40003" inner number, "40850" reply target) to the
+/// group table and seed two replies.
+///
+/// The columns are added here rather than in `make_schema` because their
+/// ABSENCE is itself covered behaviour: a QQ version without them must degrade
+/// to "no reply information" rather than fail the scan (the c2c table keeps
+/// lacking them, which exercises exactly that path).
+///
+/// Two shapes are seeded on purpose: row 7 quotes a number only one row
+/// carries, row 8 quotes a number two rows carry. Only the first can be turned
+/// into an id without guessing.
+pub fn seed_reply_rows(conn: &Connection) {
+    conn.execute_batch(
+        "ALTER TABLE group_msg_table ADD COLUMN \"40003\" INTEGER;\
+         ALTER TABLE group_msg_table ADD COLUMN \"40850\" INTEGER;\
+         UPDATE group_msg_table SET \"40003\" = rowid WHERE \"40003\" IS NULL;",
+    )
+    .unwrap();
+    let ts: i64 = 1782864000;
+    let reply = |n: i64, inner: i64, target: i64| {
+        conn.execute(
+            "INSERT INTO group_msg_table (\"40021\", \"40001\", \"40020\", \"40093\", \"40800\", \"40013\", \"40050\", \"40090\", \"40003\", \"40850\") \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "10001",
+                (ts << 32) | n,
+                "u_b",
+                "李四",
+                "收到".as_bytes(),
+                0,
+                ts,
+                "",
+                inner,
+                target
+            ],
+        )
+        .unwrap();
+    };
+    reply(7, 7, 2); // quotes inner 2 — exactly one row carries it
+    reply(8, 8, 1); // quotes inner 1 — two rows carry it, so no id may be stated
+    reply(9, 1, 0); // duplicates inner 1, the way a real group does
+}
+
 // ---- structured 40800 blob builder (test-side protobuf encoder) ----------
 // Encodes the spec-confirmed MsgBody layout (see db_docs 40800.md):
 //   MsgBody { repeated MsgContent content = 40800; }

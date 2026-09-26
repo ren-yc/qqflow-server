@@ -112,11 +112,14 @@ pub async fn handler(
             .unwrap_or_default()
     };
 
+    // Built once for the whole page: resolving row by row would rescan the
+    // conversation per message.
+    let inner_index = crate::store::query::build_inner_index(conv);
     let messages: Vec<Value> = page
         .iter()
         .map(|&i| {
             let m = &conv.msgs[i];
-            json!({
+            let mut out = json!({
                 "sender": m.from_uid,
                 "accountName": account_name(&m.from_uid),
                 "groupNickname": group_card(&m.from_uid),
@@ -125,7 +128,16 @@ pub async fn handler(
                 "type": m.parsed.msg_type.chatlab_type(),
                 "content": m.parsed.content,
                 "platformMessageId": m.seq.to_string(),
-            })
+            });
+            // Only when the target is unambiguous: a wrong id here would make a
+            // client attach this reply to the wrong message, and it could not
+            // tell. Absent beats misleading.
+            if let Some(index) = &inner_index
+                && let Some(target) = crate::store::query::resolve_reply_to(index, m)
+            {
+                out["replyToMessageId"] = Value::String(target.to_string());
+            }
+            out
         })
         .collect();
 

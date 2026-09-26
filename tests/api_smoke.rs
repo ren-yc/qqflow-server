@@ -92,6 +92,8 @@ fn test_state() -> Arc<AppState> {
                 from_nick: "张三".into(),
                 card: None,
                 direction: Some(1),
+                inner_seq: None,
+                reply_inner_seq: None,
                 parsed: ParsedMessage {
                     msg_type: MsgType::Text,
                     content: "你好".into(),
@@ -108,6 +110,8 @@ fn test_state() -> Arc<AppState> {
                 from_nick: "李四".into(),
                 card: None,
                 direction: Some(0),
+                inner_seq: None,
+                reply_inner_seq: None,
                 parsed: ParsedMessage {
                     msg_type: MsgType::Image,
                     content: "[image]".into(),
@@ -384,6 +388,52 @@ async fn sessions_with_token() {
     assert_eq!(v["sessions"][0]["type"], 2);
 }
 
+/// The ChatLab session face must say when it truncated.
+///
+/// Regression: it returned `{sessions:[...]}` with no `count` and no `page`.
+/// A reader that treats a missing `page` block as "this is the complete set"
+/// (which is what the pull specification says it means) silently lost every
+/// session past `limit`, and the default limit is small enough to hit on a
+/// normal account.
+#[tokio::test]
+async fn chatlab_sessions_page_reports_more() {
+    // Two conversations, so a page of one is genuinely truncated.
+    let app = build_router(state_with_names());
+
+    let (s, v) = call(
+        app.clone(),
+        "/api/v1/sessions?format=chatlab&limit=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["count"], 1, "count is the page size");
+    assert_eq!(v["page"]["hasMore"], true, "a truncated page must say so");
+    let cursor = v["page"]["nextCursor"]
+        .as_str()
+        .expect("truncation must hand back a cursor")
+        .to_string();
+
+    // Following the cursor serves the remainder and then reports completion.
+    let (s, v) = call(
+        app.clone(),
+        &format!("/api/v1/sessions?format=chatlab&limit=1&cursor={cursor}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["page"]["hasMore"], false);
+    assert!(v["page"]["nextCursor"].is_null(), "no cursor once drained");
+
+    // A page that already covers everything reports completion immediately.
+    let (_, v) = call(
+        app,
+        "/api/v1/sessions?format=chatlab&limit=50&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["page"]["hasMore"], false);
+}
+
 const SEQ2: i64 = 0x6771A6B60002;
 
 #[tokio::test]
@@ -400,6 +450,50 @@ async fn messages_pagination_and_filter() {
     assert_eq!(v["messages"][0]["localId"], 2);
     assert_eq!(v["messages"][0]["serverId"], SEQ2.to_string());
     assert_eq!(v["messages"][0]["createTime"], seq_to_time(SEQ2));
+}
+
+/// A bare `YYYYMMDD` passed as `end` must cover that whole day.
+///
+/// `start` resolves to midnight — correct for an inclusive lower bound. The
+/// upper bound is inclusive too, so midnight would silently exclude the very
+/// day the caller named: it reads as "no messages that day" rather than as an
+/// error, which is the worst way to be wrong.
+///
+/// The date string is derived from the fixture's own data instead of being
+/// hardcoded, so the test keeps working when the fixture moves.
+#[tokio::test]
+async fn messages_end_date_covers_the_whole_day() {
+    use chrono::TimeZone;
+
+    let uri = "/api/v1/messages?talker=10001&access_token=test-token-123456";
+    let (_, v) = get(uri, false).await;
+    let msgs = v["messages"].as_array().unwrap();
+    assert!(!msgs.is_empty(), "fixture must produce messages");
+    let create_time = msgs[0]["createTime"].as_i64().unwrap();
+    let day = chrono::Utc
+        .timestamp_opt(create_time, 0)
+        .single()
+        .expect("fixture createTime must be a valid timestamp")
+        .date_naive();
+    let same_day = day.format("%Y%m%d").to_string();
+    let day_before = (day - chrono::Duration::days(1)).format("%Y%m%d").to_string();
+
+    let uri = format!(
+        "/api/v1/messages?talker=10001&end={same_day}&limit=100&access_token=test-token-123456"
+    );
+    let (s, v) = get(&uri, false).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        !v["messages"].as_array().unwrap().is_empty(),
+        "end={same_day} must keep that day's messages"
+    );
+
+    // The preceding day still excludes them, so the bound remains a real filter.
+    let uri = format!(
+        "/api/v1/messages?talker=10001&end={day_before}&limit=100&access_token=test-token-123456"
+    );
+    let (_, v) = get(&uri, false).await;
+    assert!(v["messages"].as_array().unwrap().is_empty(), "end={day_before} must exclude them");
 }
 
 #[tokio::test]
@@ -607,6 +701,8 @@ fn state_with_names() -> Arc<AppState> {
                 from_nick: "张三".into(),
                 card: None,
                 direction: Some(0),
+                inner_seq: None,
+                reply_inner_seq: None,
                 parsed: ParsedMessage {
                     msg_type: MsgType::Text,
                     content: "私聊".into(),
@@ -1034,6 +1130,8 @@ fn ts_boundary_state() -> Arc<AppState> {
         from_nick: "张三".into(),
         card: None,
         direction: Some(0),
+        inner_seq: None,
+        reply_inner_seq: None,
         parsed: ParsedMessage { msg_type: MsgType::Text, content: content.into(), media: None },
     };
     let conv = Conversation {
@@ -1167,6 +1265,8 @@ async fn all_digit_c2c_talker_resolves_via_fallback() {
             from_nick: "数字UID好友".into(),
             card: None,
             direction: Some(0),
+            inner_seq: None,
+            reply_inner_seq: None,
             parsed: ParsedMessage { msg_type: MsgType::Text, content: "在吗".into(), media: None },
         }],
         dirty: false,
