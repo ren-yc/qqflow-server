@@ -102,7 +102,10 @@ pub fn authorized(state: &AppState, headers: &HeaderMap, query_token: Option<&st
 /// Merge query params with a POST JSON body (WeFlow contract: POST
 /// parameters live in the JSON body). Body fields win when present and
 /// non-null; an empty or non-JSON body leaves the query params as-is.
-/// This also makes the body-carried `access_token` work (D-4).
+/// This also makes the body-carried `access_token` work: auth accepts five
+/// transports and they must be interchangeable, so folding the body in must
+/// not drop the token
+/// (see `tests/api_smoke.rs::every_auth_transport_is_accepted`).
 ///
 /// The handler extracts the raw body as `Bytes` (not `Option<Bytes>` —
 /// axum's `Option<T>` only implements `FromRequestParts`, so it cannot be
