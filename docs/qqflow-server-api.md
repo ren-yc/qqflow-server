@@ -463,7 +463,12 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 
 ### ChatLab 响应
 
-当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）：
+当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）。
+
+**外层信封与原生面一致**：`success` / `talker` / `count` / `hasMore` 四个键照常出现，
+`count` 是本页条数。只换消息体、不换翻页模型——否则调用方为了**翻页**还得切回原生面，
+而它本来只是为了拿另一种消息形状才传了 `chatlab=1`。
+
 
 - `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
 - `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）、`meta.ownerId`（当前绑定账号 QQ 号，未绑定为空串）

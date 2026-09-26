@@ -478,6 +478,39 @@ async fn chatlab_sessions_page_reports_more() {
     assert_eq!(v["page"]["hasMore"], false);
 }
 
+/// The ChatLab face of `/api/v1/messages` carries the same outer paging keys
+/// as the native face.
+///
+/// Regression: it returned `{success, chatlab, meta, members, messages}` only,
+/// so a client that asked for `chatlab=1` to get a different message body also
+/// silently lost `talker` / `count` / `hasMore` — it had to switch to a
+/// different paging model just to walk the conversation.
+#[tokio::test]
+async fn chatlab_face_carries_the_outer_paging_keys() {
+    let app = build_router(test_state());
+
+    // The fixture group holds two messages; take one at a time.
+    let (s, v) = call(
+        app.clone(),
+        "/api/v1/messages?talker=10001&limit=1&chatlab=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["talker"], "10001", "the echoed talker, as on the native face");
+    assert_eq!(v["count"], 1, "count is the page size");
+    assert_eq!(v["hasMore"], true, "a truncated page must say so");
+
+    // A page that covers everything reports completion instead.
+    let (_, v) = call(
+        app,
+        "/api/v1/messages?talker=10001&limit=5000&chatlab=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["hasMore"], false);
+}
+
 const SEQ2: i64 = 0x6771A6B60002;
 
 #[tokio::test]

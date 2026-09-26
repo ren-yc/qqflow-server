@@ -94,7 +94,7 @@ pub async fn handler(
 
     let body = if chatlab {
         // ChatLab output carries no export envelope (WeFlow parity).
-        chatlab_envelope(&state, talker, &items)
+        chatlab_envelope(&state, talker, &items, has_more)
     } else if media_on {
         // WeFlow-shaped export: copy this page's media into the export
         // root, fill per-message mediaFileName/mediaUrl/mediaLocalPath.
@@ -177,7 +177,17 @@ async fn export_envelope(
 }
 
 /// ChatLab-style envelope for /api/v1/messages (meta + members + messages).
-fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query::MessageOut]) -> Value {
+///
+/// Carries the same outer keys as the native face (`talker` / `count` /
+/// `hasMore`): a client that picks the ChatLab shape should not have to switch
+/// to a different paging model just because it asked for different message
+/// bodies. `count` is the page size, matching the native face.
+fn chatlab_envelope(
+    state: &AppState,
+    talker: &str,
+    items: &[crate::store::query::MessageOut],
+    has_more: bool,
+) -> Value {
     let store = state.store.read();
     // find_conversation falls back to the other chat type, so an all-digit
     // c2c peer uid resolves to its real conversation (and real meta.type).
@@ -244,6 +254,9 @@ fn chatlab_envelope(state: &AppState, talker: &str, items: &[crate::store::query
         .collect();
     json!({
         "success": true,
+        "talker": talker,
+        "count": messages.len(),
+        "hasMore": has_more,
         "chatlab": {
             "version": "0.0.2",
             "exportedAt": chrono::Utc::now().timestamp(),
