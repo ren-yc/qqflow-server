@@ -1,0 +1,12 @@
+{
+  "body": {
+    "index_cleared": true,
+    "previous_status": "ready",
+    "purged_dirs": 0,
+    "purged_media": false,
+    "qq": "10001",
+    "state": "deregistered",
+    "success": true
+  },
+  "status": 200
+}

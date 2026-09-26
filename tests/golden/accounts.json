@@ -1,6 +1,12 @@
 {
   "body": {
-    "accounts": [],
+    "accounts": [
+      {
+        "message_count": 2,
+        "qq": "10001",
+        "state": "ready"
+      }
+    ],
     "success": true
   },
   "status": 200

@@ -42,7 +42,7 @@
     "meta": {
       "groupId": "10001",
       "name": "项目群",
-      "ownerId": "",
+      "ownerId": "10001",
       "platform": "qq",
       "type": "group"
     },

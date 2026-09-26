@@ -1,0 +1,10 @@
+{
+  "body": {
+    "occupied_by": "10001",
+    "occupied_status": "ready",
+    "qq": "20002",
+    "state": "account_conflict",
+    "success": true
+  },
+  "status": 200
+}

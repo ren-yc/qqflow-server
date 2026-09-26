@@ -2021,36 +2021,77 @@ mod golden {
     }
 
     /// 端点清单：名字 → (方法, URI)。名字同时是快照文件名。
-    fn endpoints() -> Vec<(&'static str, &'static str, String)> {
+    fn endpoints() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
         let t = "test-token-123456";
         vec![
-            ("health", "GET", "/health".to_string()),
-            ("accounts", "GET", format!("/api/v1/accounts?access_token={t}")),
-            ("sessions-native", "GET", format!("/api/v1/sessions?access_token={t}")),
-            ("sessions-chatlab", "GET", format!("/api/v1/sessions?format=chatlab&access_token={t}")),
-            ("messages-native", "GET", format!("/api/v1/messages?talker=10001&limit=50&access_token={t}")),
-            ("messages-chatlab", "GET", format!("/api/v1/messages?talker=10001&limit=50&chatlab=1&access_token={t}")),
-            ("messages-media", "GET", format!("/api/v1/messages?talker=10001&limit=50&media=1&access_token={t}")),
-            ("pull", "GET", format!("/api/v1/sessions/10001/messages?limit=50&access_token={t}")),
-            ("contacts", "GET", format!("/api/v1/contacts?access_token={t}")),
+            ("health", "GET", "/health".to_string(), None),
+            ("accounts", "GET", format!("/api/v1/accounts?access_token={t}"), None),
+            ("sessions-native", "GET", format!("/api/v1/sessions?access_token={t}"), None),
+            ("sessions-chatlab", "GET", format!("/api/v1/sessions?format=chatlab&access_token={t}"), None),
+            ("messages-native", "GET", format!("/api/v1/messages?talker=10001&limit=50&access_token={t}"), None),
+            ("messages-chatlab", "GET", format!("/api/v1/messages?talker=10001&limit=50&chatlab=1&access_token={t}"), None),
+            ("messages-media", "GET", format!("/api/v1/messages?talker=10001&limit=50&media=1&access_token={t}"), None),
+            ("pull", "GET", format!("/api/v1/sessions/10001/messages?limit=50&access_token={t}"), None),
+            ("contacts", "GET", format!("/api/v1/contacts?access_token={t}"), None),
             (
                 "group-members",
                 "GET",
                 format!("/api/v1/group-members?chatroomId=10001&includeMessageCounts=1&access_token={t}"),
+                None,
             ),
-            ("sync", "POST", format!("/api/v1/sync?access_token={t}")),
+            ("sync", "POST", format!("/api/v1/sync?access_token={t}"), None),
+            // ---- 别名路由与错误信封 ----
+            // 错误信封是刚建立的契约，DTO 化最容易在「构造响应的那条路径之外」把它碰坏。
+            ("health-alias", "GET", "/api/v1/health".to_string(), None),
+            ("error-unauthorized", "GET", "/api/v1/sessions".to_string(), None),
+            ("error-unknown-path", "GET", "/api/v1/nope".to_string(), None),
+            ("error-method-not-allowed", "DELETE", "/api/v1/health".to_string(), None),
+            // 坏参数走统一信封是本仓库新建立的行为（weflow 用 HashMap 接参数，没有这条路径）
+            (
+                "error-bad-param",
+                "GET",
+                format!("/api/v1/sessions?limit=abc&access_token={t}"),
+                None,
+            ),
+            // ---- 账号面的多形状返回（注册/注销各 3 种 state 的键集不同）----
+            (
+                "accounts-detail",
+                "GET",
+                format!("/api/v1/accounts/10001?access_token={t}"),
+                None,
+            ),
+            (
+                "accounts-conflict",
+                "POST",
+                format!("/api/v1/accounts?access_token={t}"),
+                Some(serde_json::json!({ "qq": "20002", "key": "0123456789abcdef" })),
+            ),
+            // ---- 会改状态的排最后 ----
+            (
+                "accounts-deregister",
+                "POST",
+                format!("/api/v1/accounts/10001/deregister?access_token={t}"),
+                None,
+            ),
         ]
     }
 
-    async fn fetch(app: axum::Router, method: &str, uri: &str) -> (StatusCode, Value) {
+    async fn fetch(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        payload: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        let body = match payload {
+            Some(v) => {
+                req = req.header("content-type", "application/json");
+                Body::from(v.to_string())
+            }
+            None => Body::empty(),
+        };
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(req.body(body).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -2061,13 +2102,23 @@ mod golden {
 
     #[tokio::test]
     async fn responses_match_their_golden_snapshots() {
-        let app = build_router(test_state());
+        // 账号面要有内容才谈得上钉形状。沿用本文件既有做法（直接给注册表放一条）：
+        // `AccountRegistry` 的 `is_scanned` 只由构造参数决定，而走 `POST /api/v1/accounts`
+        // 注册会连带启动索引线程——那会让快照取决于索引时序，快照就不该依赖那个。
+        let state = test_state();
+        state.accounts.write().push(qqflow_server::server::AccountState {
+            qq: "10001".into(),
+            state: AccountStatus::Ready,
+            message_count: 2,
+            error: None,
+        });
+        let app = build_router(state);
         let update = std::env::var("UPDATE_GOLDEN").is_ok();
         std::fs::create_dir_all(golden_dir()).unwrap();
 
         let mut drifted: Vec<String> = Vec::new();
-        for (name, method, uri) in endpoints() {
-            let (status, body) = fetch(app.clone(), method, &uri).await;
+        for (name, method, uri, payload) in endpoints() {
+            let (status, body) = fetch(app.clone(), method, &uri, payload).await;
             let mut snapshot = serde_json::json!({ "status": status.as_u16(), "body": body });
             mask(&mut snapshot);
             assert_no_wall_clock(&snapshot, name);
