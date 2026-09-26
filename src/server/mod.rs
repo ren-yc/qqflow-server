@@ -384,7 +384,14 @@ fn set_account_state_if_current(
 /// let one transient decrypt error hand the server to a different account
 /// without anyone asking. Re-registering the same qq recovers; switching
 /// accounts requires an explicit deregistration.
-fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
+/// Claim the single account binding and start the background index build.
+///
+/// `pub` because a **test harness** may need to restore this precondition: conformance cases do
+/// not currently guarantee independence, and one of them deregisters the account — anything
+/// after it then runs against a server with no account. `weflow-server` exposes its equivalent
+/// (`start_account`) the same way, so this also removes an inconsistency between the two.
+/// The library boundary (narrowing what is `pub`) is a separate, later concern.
+pub fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
     let mut accs = state.accounts.write();
     if let Some(b) = bound_account(&accs) {
         if b.qq != qq {

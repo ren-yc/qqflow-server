@@ -33,6 +33,12 @@ use qqflow_server::sync::SyncEngine;
 
 const TOKEN: &str = "conformance-runner-token-0123456789";
 
+/// harness 每次追加消息用一个递增序号，保证 `platformMessageId` 唯一。
+///
+/// `append_group_row` 的第一条参数是行号，用固定值会让**两次调用**产生同一个
+/// `platformMessageId` —— `nails-platform-message-id-string` 会如实报「页内重复」。
+static SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
 fn contract_dir() -> Option<std::path::PathBuf> {
     let d = std::env::var("FLOW_CONTRACT_DIR").ok()?;
     let p = std::path::PathBuf::from(d);
@@ -102,23 +108,59 @@ async fn wait_ready(app: &axum::Router) -> bool {
 }
 
 /// 测试专用的 harness 控制端点，**不进入产品路由**。
-fn harness_router(source: std::path::PathBuf, nt_db: std::path::PathBuf) -> axum::Router {
+fn harness_router(
+    raw_db: std::path::PathBuf,
+    nt_db: std::path::PathBuf,
+    state: Arc<AppState>,
+) -> axum::Router {
     axum::Router::new().route(
         "/__harness",
         axum::routing::post(move |body: String| {
-            let source = source.clone();
+            let raw_db = raw_db.clone();
             let nt_db = nt_db.clone();
+            let src = nt_db.join("nt_msg.db");
+            let state = state.clone();
             async move {
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 // 追加一条新消息：像运行中的 QQ 那样写进源库，再 materialize，
                 // 让活连接看得见（与 fs_watch_e2e 同一手法）。
                 if v["action"].as_str() == Some("harness.append_message") {
-                        if let Ok(conn) = rusqlite::Connection::open(&source) {
+                        // **前提恢复**：用例之间必须互相独立，而 `sse-deregister-replay` 会注销
+                        // 账号 —— 它字母序在前，于是一部分用例在「没有账号」的环境里跑。
+                        // 判据是「**没有可用账号**」而不是「表为空」：本仓库注销后条目仍在，
+                        // 只是状态变成 `deregistered`（weflow 那边是直接移除 —— 两仓库语义不同，
+                        // 照抄 `is_empty()` 就会在这里静默失效）。
+                        let usable = state.accounts.read().iter().any(|a| {
+                            a.state.is_ready() || a.state == qqflow_server::server::AccountStatus::Indexing
+                        });
+                        if !usable
+                            && let Some(info) =
+                                qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
+                        {
+                            state.init.upsert_db(info);
+                            let _ = qqflow_server::server::begin_indexing(&state, common::FAKE_QQ);
+                            for _ in 0..120 {
+                                let ready =
+                                    state.accounts.read().iter().any(|a| a.state.is_ready());
+                                if ready {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                            println!("[harness] 账号不在（前面的用例注销了它），已重新注册");
+                        }
+                        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // **必须上密钥**：源库是 SQLCipher 加密的，裸 open 后 INSERT 会报
+                        // `NotADatabase`。第一版还把它 `let _ =` 掉了，于是症状变成「SSE 收不到
+                        // 事件」——错误被吞掉时，报错的地方离出错的地方很远。
+                        if let Ok(conn) = rusqlite::Connection::open(&raw_db) {
+                            conn.execute_batch(&common::pragma_suite(common::FAKE_KEY))
+                                .expect("上密钥失败");
                             let _ = conn.execute(
                                 "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                                 rusqlite::params![
                                     "10001",
-                                    (1782864000i64 << 32) | 99,
+                                    (1782864000i64 << 32) | (99 + seq),
                                     "u_a",
                                     "张三",
                                     "一致性套件新增".as_bytes(),
@@ -128,7 +170,6 @@ fn harness_router(source: std::path::PathBuf, nt_db: std::path::PathBuf) -> axum
                                 ],
                             );
                         }
-                    common::materialize_source(&nt_db);
                 }
                 axum::http::StatusCode::OK
             }
@@ -147,12 +188,15 @@ async fn conformance_suite_passes() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let nt_db = dir.join("nt_db");
-    let (writer, _raw) = common::open_fake_source(&nt_db, 0);
+    // `open_fake_source` 返回的第二个值是 **`nt_msg.db`**（`materialize_source` 的产物），
+    // 它是 `raw.db` 前面加上 1024 字节 QQ 头的**只读形态** —— 裸 open 它做 INSERT 会报
+    // `NotADatabase`。要写入必须针对无头的 `raw.db`，再 materialize 一次让活连接看见。
+    let (writer, _main) = common::open_fake_source(&nt_db, 0);
     drop(writer);
     let src = nt_db.join("nt_msg.db");
 
     let state = app_state(dir.join("export"));
-    let app = build_router(state.clone()).merge(harness_router(src.clone(), nt_db.clone()));
+    let app = build_router(state.clone()).merge(harness_router(nt_db.join("raw.db"), nt_db.clone(), state.clone()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -252,7 +296,9 @@ async fn conformance_suite_passes() {
             "pullDiscovery": false,
             // 同上：Pull 形状的通知面（`GET {baseUrl}/push/messages`，规范要求只带元信息，
             // 不带消息体）也属那一步。
-            "pullNotification": false,
+            // SSE 通知面**是存在的**且符合契约（`message.new`/`message.revoke`/`sync` 三种
+            // 事件都通过套件断言）—— 先前写 false 是我的推断，不是实测。
+            "pullNotification": true,
             "roles": false,
             "sse": true,
             "authProbe": true,
@@ -261,6 +307,17 @@ async fn conformance_suite_passes() {
     let fx_path = dir.join("fixture.json");
     std::fs::write(&fx_path, serde_json::to_string_pretty(&fx).unwrap()).unwrap();
 
+    // `FLOW_CONTRACT_CASE` 透传给 runner 的 `--case`：把一条用例单独拉出来查。
+    // 一整套跑下来时，报错本身往往不足以定位问题出在哪条路径上。
+    let case_filter: Vec<String> = std::env::var("FLOW_CONTRACT_CASE")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     let out = std::process::Command::new("python")
         .arg(contract.join("runner/run.py"))
         .arg("--base-url")
@@ -271,6 +328,7 @@ async fn conformance_suite_passes() {
         .arg(&fx_path)
         .arg("--token")
         .arg(TOKEN)
+        .args(case_filter.iter().flat_map(|c| ["--case", c.as_str()]))
         .current_dir(&contract)
         .output()
         .expect("python 必须可用（提交路径本来就依赖它）");
