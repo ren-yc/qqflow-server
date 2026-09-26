@@ -32,5 +32,33 @@
     "success": true,
     "updatedAt": "<volatile>"
   },
+  "keys": [
+    "chatroomId",
+    "count",
+    "fromCache",
+    "members",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "groupNickname",
+    "isFriend",
+    "isOwner",
+    "messageCount",
+    "nickname",
+    "remark",
+    "wxid",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "groupNickname",
+    "isFriend",
+    "isOwner",
+    "messageCount",
+    "nickname",
+    "remark",
+    "wxid",
+    "success",
+    "updatedAt"
+  ],
   "status": 200
 }

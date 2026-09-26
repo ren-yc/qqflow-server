@@ -2020,6 +2020,48 @@ mod golden {
         }
     }
 
+/// 原始响应里的键**按出现顺序**（含嵌套）。
+    ///
+    /// 为什么单独记它：上面那份 body 是**解析成 `Value` 再序列化**的，而 `serde_json::Map`
+    /// 默认是 BTreeMap —— **键会被排序**，于是原始顺序在比较里丢掉了。把顺序单独钉住，
+    /// 「换 DTO 时顺手改了键序」这类无意义但真实的改动才会显形。
+    ///
+    /// 实现是扫 `"..."` 后紧跟冒号的位置，够用且不引依赖：值里的中文冒号不会误判，
+    /// 而真正的风险（重排、删键、加键）都能看见。
+    fn key_order(raw: &str) -> Vec<String> {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            let mut esc = false;
+            while j < bytes.len() {
+                if esc {
+                    esc = false;
+                } else if bytes[j] == b'\\' {
+                    esc = true;
+                } else if bytes[j] == b'"' {
+                    break;
+                }
+                j += 1;
+            }
+            let mut k = j + 1;
+            while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b':' {
+                out.push(raw[start..j].to_string());
+            }
+            i = j + 1;
+        }
+        out
+    }
+
     /// 端点清单：名字 → (方法, URI)。名字同时是快照文件名。
     fn endpoints() -> Vec<(&'static str, &'static str, String, Option<Value>)> {
         let t = "test-token-123456";
@@ -2081,7 +2123,7 @@ mod golden {
         method: &str,
         uri: &str,
         payload: Option<Value>,
-    ) -> (StatusCode, Value) {
+    ) -> (StatusCode, Value, String) {
         let mut req = Request::builder().method(method).uri(uri);
         let body = match payload {
             Some(v) => {
@@ -2097,7 +2139,7 @@ mod golden {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
         let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, json)
+        (status, json, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     #[tokio::test]
@@ -2118,8 +2160,10 @@ mod golden {
 
         let mut drifted: Vec<String> = Vec::new();
         for (name, method, uri, payload) in endpoints() {
-            let (status, body) = fetch(app.clone(), method, &uri, payload).await;
-            let mut snapshot = serde_json::json!({ "status": status.as_u16(), "body": body });
+            let (status, body, raw_body) = fetch(app.clone(), method, &uri, payload).await;
+            let keys = key_order(&raw_body);
+            let mut snapshot =
+                serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
             mask(&mut snapshot);
             assert_no_wall_clock(&snapshot, name);
             let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";

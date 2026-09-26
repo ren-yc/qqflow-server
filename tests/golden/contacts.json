@@ -25,5 +25,26 @@
     "success": true,
     "total": 2
   },
+  "keys": [
+    "contacts",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "nickname",
+    "remark",
+    "type",
+    "username",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "nickname",
+    "remark",
+    "type",
+    "username",
+    "count",
+    "hasMore",
+    "success",
+    "total"
+  ],
   "status": 200
 }

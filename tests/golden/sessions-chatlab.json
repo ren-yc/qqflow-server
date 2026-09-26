@@ -16,5 +16,18 @@
       }
     ]
   },
+  "keys": [
+    "count",
+    "page",
+    "hasMore",
+    "nextCursor",
+    "sessions",
+    "id",
+    "lastMessageAt",
+    "messageCount",
+    "name",
+    "platform",
+    "type"
+  ],
   "status": 200
 }

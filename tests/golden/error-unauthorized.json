@@ -4,5 +4,10 @@
     "message": "未授权：请携带有效 token",
     "success": false
   },
+  "keys": [
+    "code",
+    "message",
+    "success"
+  ],
   "status": 401
 }

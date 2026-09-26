@@ -4,5 +4,10 @@
     "message": "未知路径",
     "success": false
   },
+  "keys": [
+    "code",
+    "message",
+    "success"
+  ],
   "status": 404
 }

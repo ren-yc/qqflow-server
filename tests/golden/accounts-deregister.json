@@ -8,5 +8,14 @@
     "state": "deregistered",
     "success": true
   },
+  "keys": [
+    "index_cleared",
+    "previous_status",
+    "purged_dirs",
+    "purged_media",
+    "qq",
+    "state",
+    "success"
+  ],
   "status": 200
 }

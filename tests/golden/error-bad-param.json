@@ -4,5 +4,10 @@
     "message": "参数解析失败：Failed to deserialize query string: limit: invalid digit found in string",
     "success": false
   },
+  "keys": [
+    "code",
+    "message",
+    "success"
+  ],
   "status": 400
 }

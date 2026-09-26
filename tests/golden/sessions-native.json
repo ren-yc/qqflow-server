@@ -12,5 +12,15 @@
     ],
     "success": true
   },
+  "keys": [
+    "count",
+    "sessions",
+    "displayName",
+    "lastTimestamp",
+    "type",
+    "unreadCount",
+    "username",
+    "success"
+  ],
   "status": 200
 }
