@@ -282,7 +282,7 @@ async fn conformance_suite_passes() {
     }
 
     let fx = json!({
-        "contractVersion": "0.1.0",
+        "contractVersion": "0.1.1",
         "platform": "qq",
         "generatedBy": "qqflow-server tests/conformance_runner.rs",
         "endpoints": {
