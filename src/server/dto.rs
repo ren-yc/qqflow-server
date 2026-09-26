@@ -41,6 +41,95 @@ pub struct SyncResult {
     pub success: bool,
 }
 
+// ── 账号面 ────────────────────────────────────────────────
+
+/// `GET /api/v1/accounts`。
+#[derive(Debug, Serialize)]
+pub struct AccountsList {
+    pub accounts: Vec<AccountView>,
+    pub success: bool,
+}
+
+/// 账号列表项。
+///
+/// 键名是**蛇形**（`message_count` / `db_path`），与 `weflow-server` 的 `message_count` /
+/// `db_storage` 不是同一套 —— 不要跨仓库统一。
+///
+/// `error` 与 `db_path` 都是**条件键**：不知道就**不出现**，而不是 `null`。
+#[derive(Debug, Serialize)]
+pub struct AccountView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub message_count: usize,
+    pub qq: String,
+    pub state: crate::server::AccountStatus,
+}
+
+/// 注册**受理**（或幂等命中）。
+///
+/// `status` 与 `db_path` 都是**条件键**：未知时不出现。`db_path` 回显的是服务器**实际解析
+/// 到的**库（请求里的 `db_path` 很松散：可以是文件、可以是 Tencent Files 风格的根目录、
+/// 也可以省略走启动扫描），所以回显解析结果才告诉客户端「在跟哪个库说话」。
+#[derive(Debug, Serialize)]
+pub struct AccountRegistered {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_path: Option<String>,
+    pub qq: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<crate::server::AccountStatus>,
+    pub success: bool,
+}
+
+/// 注册**被别的账号占位**（单绑定互锁）。
+#[derive(Debug, Serialize)]
+pub struct AccountConflict {
+    pub occupied_by: String,
+    pub occupied_status: crate::server::AccountStatus,
+    pub qq: String,
+    pub state: String,
+    pub success: bool,
+}
+
+/// 注销：**已成功解绑**。
+#[derive(Debug, Serialize)]
+pub struct AccountDeregistered {
+    pub index_cleared: bool,
+    /// 请求落地时账号处于什么状态 —— 让客户端能区分「我取消了正在进行的构建」与
+    /// 「我解绑了一个就绪账号」。
+    pub previous_status: crate::server::AccountStatus,
+    pub purged_dirs: usize,
+    pub purged_media: bool,
+    pub qq: String,
+    pub state: String,
+    pub success: bool,
+}
+
+/// 注销：**本来就没有绑定**。刻意幂等 —— 重试已完成的注销得到 200 而不是错误。
+#[derive(Debug, Serialize)]
+pub struct AccountNotRegistered {
+    pub index_cleared: bool,
+    pub purged_dirs: usize,
+    pub purged_media: bool,
+    pub qq: String,
+    pub state: String,
+    pub success: bool,
+}
+
+/// 注销：**互锁触发**（另一个账号持有绑定，它被完全不动地留下）。
+#[derive(Debug, Serialize)]
+pub struct AccountQqMismatch {
+    pub index_cleared: bool,
+    pub occupied_by: String,
+    pub occupied_status: crate::server::AccountStatus,
+    pub purged_dirs: usize,
+    pub purged_media: bool,
+    pub qq: String,
+    pub state: String,
+    pub success: bool,
+}
 // ── 会话列表 ──────────────────────────────────────────────
 
 /// `GET /api/v1/sessions`（原生面）。

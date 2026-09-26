@@ -20,10 +20,14 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::db::scan::{self, DbInfo};
 use crate::keystore::validate_key;
+use crate::server::dto::{
+    AccountConflict, AccountDeregistered, AccountNotRegistered, AccountQqMismatch,
+    AccountRegistered, AccountView, AccountsList,
+};
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::server::{
     begin_indexing, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
@@ -71,25 +75,29 @@ pub async fn list_handler(
     // `find_db` takes the registry mutex, and taking it while holding the
     // accounts lock would nest two locks that are otherwise independent.
     let accounts: Vec<_> = state.accounts.read().iter().cloned().collect();
-    let accounts: Vec<Value> = accounts
+    let accounts: Vec<AccountView> = accounts
         .into_iter()
         .map(|a| {
-            let mut out = json!({
-                "qq": a.qq,
-                "state": a.state,
-                "message_count": a.message_count,
-            });
-            let obj = out.as_object_mut().expect("json! object literal");
-            if let Some(e) = a.error {
-                obj.insert("error".into(), json!(e));
+            // 先解析路径（要借用 `a.qq`），再把字段移进来。
+            //
+            // 类型化赋值：`error` / `db_path` 是**条件键**（不知道就不出现），此前是往
+            // `Value` 里按字符串键 `insert` —— 键名写错不会报错，只会静默多一个键。
+            let db_path = state
+                .init
+                .find_db(&a.qq)
+                .map(|info| info.path.to_string_lossy().into_owned());
+            AccountView {
+                db_path,
+                error: a.error,
+                message_count: a.message_count,
+                qq: a.qq,
+                state: a.state,
             }
-            if let Some(info) = state.init.find_db(&a.qq) {
-                obj.insert("db_path".into(), json!(info.path.to_string_lossy()));
-            }
-            out
         })
         .collect();
-    Ok(Json(json!({ "success": true, "accounts": accounts })))
+    let body = serde_json::to_value(AccountsList { accounts, success: true })
+        .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;
+    Ok(Json(body))
 }
 
 /// Resolve `(qq, db_path)` to a `DbInfo`: an explicit path (nt_msg.db file
@@ -131,15 +139,16 @@ pub async fn handler(
     // startup scan), so the resolved path is what tells the client which
     // database is in play. Both are omitted when unknown.
     let reply = |state_name: &str, status: Option<AccountStatus>, db_path: Option<&Path>| {
-        let mut out = json!({ "success": true, "qq": qq, "state": state_name });
-        let obj = out.as_object_mut().expect("json! object literal");
-        if let Some(st) = status {
-            obj.insert("status".into(), json!(st));
-        }
-        if let Some(p) = db_path {
-            obj.insert("db_path".into(), json!(p.to_string_lossy()));
-        }
-        Json(out)
+        Json(
+            serde_json::to_value(AccountRegistered {
+                db_path: db_path.map(|p| p.to_string_lossy().into_owned()),
+                qq: qq.to_string(),
+                state: state_name.to_string(),
+                status,
+                success: true,
+            })
+            .expect("账号回复必须可序列化"),
+        )
     };
 
     // A different account already holds the single binding. The authoritative
@@ -148,13 +157,16 @@ pub async fn handler(
     // retry. `occupied_by` names the incumbent so the client can log which
     // account it is actually talking to instead of retrying forever.
     let conflict = |qq_in_use: &str, status: AccountStatus| {
-        Json(json!({
-            "success": true,
-            "qq": qq,
-            "state": "account_conflict",
-            "occupied_by": qq_in_use,
-            "occupied_status": status,
-        }))
+        Json(
+            serde_json::to_value(AccountConflict {
+                occupied_by: qq_in_use.to_string(),
+                occupied_status: status,
+                qq: qq.to_string(),
+                state: "account_conflict".to_string(),
+                success: true,
+            })
+            .expect("冲突回复必须可序列化"),
+        )
     };
 
     // Idempotent guards for accounts already past the waiting stage. Check
@@ -278,41 +290,47 @@ pub async fn delete_handler(
     .await
     .map_err(|e| ApiError::internal(format!("注销任务失败: {e}")))?;
 
+    // 三个分支的**键集不同**，各建 struct、各自序列化 —— 而不是三份 `json!` 字面量
+    // （键名写错只有运行时才知道）。
     let out = match outcome {
-        DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs } => json!({
-            "success": true,
-            "qq": qq,
-            "state": "deregistered",
-            // The state the account was in when the request landed — lets a
-            // client tell "I cancelled an in-flight build" from "I unbound a
-            // ready account".
-            "previous_status": previous,
-            "index_cleared": index_cleared,
-            "purged_media": purge_media,
-            "purged_dirs": purged_dirs,
-        }),
+        DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs } => {
+            serde_json::to_value(AccountDeregistered {
+                index_cleared,
+                previous_status: previous,
+                purged_dirs,
+                purged_media: purge_media,
+                qq: qq.clone(),
+                state: "deregistered".to_string(),
+                success: true,
+            })
+            .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?
+        }
         // Nothing was bound. Idempotent by design: a client that retries a
         // deregistration it already completed gets a 200, not an error.
-        DeregisterOutcome::NotRegistered => json!({
-            "success": true,
-            "qq": qq,
-            "state": "not_registered",
-            "index_cleared": false,
-            "purged_media": false,
-            "purged_dirs": 0,
-        }),
+        DeregisterOutcome::NotRegistered => serde_json::to_value(AccountNotRegistered {
+            index_cleared: false,
+            purged_dirs: 0,
+            purged_media: false,
+            qq: qq.clone(),
+            state: "not_registered".to_string(),
+            success: true,
+        })
+        .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?,
         // The interlock tripped: a different account holds the binding and is
         // left completely untouched.
-        DeregisterOutcome::QqMismatch { occupied_by, status } => json!({
-            "success": true,
-            "qq": qq,
-            "state": "qq_mismatch",
-            "occupied_by": occupied_by,
-            "occupied_status": status,
-            "index_cleared": false,
-            "purged_media": false,
-            "purged_dirs": 0,
-        }),
+        DeregisterOutcome::QqMismatch { occupied_by, status } => {
+            serde_json::to_value(AccountQqMismatch {
+                index_cleared: false,
+                occupied_by,
+                occupied_status: status,
+                purged_dirs: 0,
+                purged_media: false,
+                qq,
+                state: "qq_mismatch".to_string(),
+                success: true,
+            })
+            .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?
+        }
     };
     Ok(Json(out))
 }
