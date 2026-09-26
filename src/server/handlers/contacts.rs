@@ -7,8 +7,9 @@ use axum::extract::{State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
+use crate::server::dto::Contacts;
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
@@ -50,6 +51,7 @@ pub async fn handler(
     EnvelopeQuery(params): EnvelopeQuery<Params>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    // 形状见 `crate::server::dto::Contacts`。
     let params = merge_body(params, &body).await?;
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());
@@ -70,12 +72,18 @@ pub async fn handler(
     // inferring the end from "page shorter than limit" — which silently breaks
     // if the server-side default limit ever changes.
     let has_more = params.offset.saturating_add(count) < total;
-    let body = json!({
-        "success": true,
-        "count": count,
-        "total": total,
-        "hasMore": has_more,
-        "contacts": contacts,
-    });
+    // 构造 DTO 后 `to_value`：`json!` 与 `to_value` 都经 BTreeMap（键被排序），因此**输出
+    // 逐字节不变**；而类型化构造让「键名写错」变成编译错误。
+    //
+    // 这里**不用** `Json<Contacts>` 直接序列化：`ContactOut` 的字段声明不是字母序，直接
+    // 序列化会让响应里的键序变化。`to_value` 对声明顺序免疫。
+    let body = serde_json::to_value(Contacts {
+        contacts,
+        count,
+        has_more,
+        success: true,
+        total,
+    })
+    .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;
     Ok(Json(body))
 }

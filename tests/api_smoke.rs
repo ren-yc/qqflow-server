@@ -2081,6 +2081,14 @@ mod golden {
                 format!("/api/v1/group-members?chatroomId=10001&includeMessageCounts=1&access_token={t}"),
                 None,
             ),
+            // 不带 counts：钉住 `messageCount` 是**条件键**（整个键不出现，而不是 0）。
+            // 这条路径此前没有覆盖，而 DTO 化最容易在这里把「没有键」写成「0」。
+            (
+                "group-members-no-counts",
+                "GET",
+                format!("/api/v1/group-members?chatroomId=10001&access_token={t}"),
+                None,
+            ),
             ("sync", "POST", format!("/api/v1/sync?access_token={t}"), None),
             // ---- 别名路由与错误信封 ----
             // 错误信封是刚建立的契约，DTO 化最容易在「构造响应的那条路径之外」把它碰坏。

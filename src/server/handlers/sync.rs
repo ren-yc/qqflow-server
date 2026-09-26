@@ -17,8 +17,9 @@ use axum::extract::{State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
+
+use crate::server::dto::SyncResult;
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
@@ -35,7 +36,7 @@ pub async fn handler(
     headers: HeaderMap,
     EnvelopeQuery(params): EnvelopeQuery<Params>,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SyncResult>, ApiError> {
     let params = merge_body(params, &body).await?;
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());
@@ -50,9 +51,9 @@ pub async fn handler(
         .await
         .map_err(|e| ApiError::internal(format!("sync task panicked: {e}")))?;
 
-    Ok(Json(json!({
-        "success": true,
-        "newMessages": new_count,
-        "revokeMessages": revoke_count,
-    })))
+    Ok(Json(SyncResult {
+        new_messages: new_count,
+        revoke_messages: revoke_count,
+        success: true,
+    }))
 }

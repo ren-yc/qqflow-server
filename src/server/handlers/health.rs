@@ -14,8 +14,8 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde_json::json;
 
+use crate::server::dto::Health;
 use crate::server::{bound_account, AccountPhase};
 use crate::store::AppState;
 
@@ -24,9 +24,9 @@ pub async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let account = bound_account(&state.accounts.read())
         .map(|a| AccountPhase::from(a.state))
         .unwrap_or(AccountPhase::Unregistered);
-    Json(json!({
-        "status": status,
-        "version": env!("CARGO_PKG_VERSION"),
-        "account": account,
-    }))
+    Json(Health {
+        account,
+        status: status.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }

@@ -7,8 +7,9 @@ use axum::extract::{State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 
+
+use crate::server::dto::{Page, SessionChatlab, SessionNative, SessionsChatlab, SessionsNative};
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
@@ -39,7 +40,7 @@ pub async fn handler(
     headers: HeaderMap,
     EnvelopeQuery(params): EnvelopeQuery<Params>,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let params = merge_body(params, &body).await?;
     if !authorized(&state, &headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());
@@ -62,43 +63,44 @@ pub async fn handler(
         // ChatLab 把**没有 page 块**的响应读作「这就是完整一页」，所以截断必须显式
         // 告知，否则第 limit 条之后的会话会被静默丢掉。总数与列表共用同一个谓词。
         let total = crate::store::query::count_sessions(&store, params.keyword.as_deref());
-        let sessions: Vec<Value> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, offset)
+        let sessions: Vec<SessionChatlab> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, offset)
             .into_iter()
             .map(|s| {
-                json!({
-                    "id": s.username,
-                    "name": s.display_name,
-                    "platform": "qq",
-                    "type": if s.r#type == 2 { "group" } else { "private" },
-                    "messageCount": 0,
-                    "lastMessageAt": s.last_timestamp,
-                })
+                SessionChatlab {
+                    id: s.username.clone(),
+                    last_message_at: s.last_timestamp,
+                    // 本仓库不维护每会话条数，恒为 0（**键要留着**：下游按它排序）。
+                    message_count: 0,
+                    name: s.display_name.clone(),
+                    platform: "qq".to_string(),
+                    r#type: if s.r#type == 2 { "group" } else { "private" }.to_string(),
+                }
             })
             .collect();
         let next_offset = offset + sessions.len();
         let has_more = next_offset < total;
-        Ok(Json(json!({
-            "sessions": sessions,
-            "count": sessions.len(),
-            "page": {
-                "hasMore": has_more,
-                "nextCursor": if has_more { Some(next_offset.to_string()) } else { None },
+        let body = SessionsChatlab {
+            count: sessions.len(),
+            page: Page {
+                has_more,
+                next_cursor: has_more.then(|| next_offset.to_string()),
             },
-        })))
+            sessions,
+        };
+        Ok(axum::response::IntoResponse::into_response(Json(body)))
     } else {
-        let sessions: Vec<Value> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, offset)
+        let sessions: Vec<SessionNative> = crate::store::query::query_sessions(&store, params.keyword.as_deref(), limit, offset)
             .into_iter()
-            .map(|s| {
-                json!({
-                    "username": s.username,
-                    "displayName": s.display_name,
-                    "type": s.r#type,
-                    "lastTimestamp": s.last_timestamp,
-                    "unreadCount": s.unread_count,
-                })
+            .map(|s| SessionNative {
+                display_name: s.display_name.clone(),
+                last_timestamp: s.last_timestamp,
+                r#type: s.r#type,
+                unread_count: s.unread_count,
+                username: s.username.clone(),
             })
             .collect();
         let count = sessions.len();
-        Ok(Json(json!({ "success": true, "count": count, "sessions": sessions })))
+        let body = SessionsNative { count, sessions, success: true };
+        Ok(axum::response::IntoResponse::into_response(Json(body)))
     }
 }

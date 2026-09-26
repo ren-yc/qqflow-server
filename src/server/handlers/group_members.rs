@@ -9,9 +9,10 @@ use axum::extract::{State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::parser::types::ChatType;
+use crate::server::dto::{GroupMember, GroupMembers};
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::store::AppState;
 
@@ -76,7 +77,7 @@ pub async fn handler(
         nicks.entry(m.from_uid.clone()).or_insert_with(|| m.from_nick.clone());
     }
 
-    let members: Vec<Value> = uid_order
+    let members: Vec<GroupMember> = uid_order
         .iter()
         .map(|uid| {
             let nick = nicks.get(uid).cloned().unwrap_or_default();
@@ -84,30 +85,31 @@ pub async fn handler(
             // groupNickname prefers the per-conversation card (40090); the
             // plain nickname stays the message-derived name.
             let group_nick = store.display_sender(ChatType::Group, room, uid);
-            let mut m = json!({
-                "wxid": uid,
-                "displayName": nick,
-                "nickname": nick,
-                "remark": remark,
-                "alias": "",
-                "groupNickname": group_nick,
-                "avatarUrl": "",
-                "isOwner": false,
-                "isFriend": false,
-            });
-            if with_counts {
-                m["messageCount"] = json!(counts.get(uid).copied().unwrap_or(0));
+            // 类型化赋值：`messageCount` 由「要不要计数」决定**在不在**，而不是先建
+            // `Value` 再按字符串键插进去（那样键名写错不会报错）。
+            GroupMember {
+                alias: String::new(),
+                avatar_url: String::new(),
+                display_name: nick.clone(),
+                group_nickname: group_nick,
+                is_friend: false,
+                is_owner: false,
+                message_count: with_counts.then(|| counts.get(uid).copied().unwrap_or(0)),
+                nickname: nick,
+                remark,
+                wxid: uid.clone(),
             }
-            m
         })
         .collect();
 
-    Ok(Json(json!({
-        "success": true,
-        "chatroomId": room,
-        "count": members.len(),
-        "fromCache": false,
-        "updatedAt": chrono::Utc::now().timestamp_millis(),
-        "members": members,
-    })))
+    let body = serde_json::to_value(GroupMembers {
+        chatroom_id: room.to_string(),
+        count: members.len(),
+        from_cache: false,
+        members,
+        success: true,
+        updated_at: chrono::Utc::now().timestamp_millis(),
+    })
+    .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;
+    Ok(Json(body))
 }
