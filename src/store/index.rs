@@ -205,6 +205,18 @@ fn apply_record(store: &mut Store, rec: MessageRecord) {
     if let Some(m) = &rec.parsed.media {
         register_media(store, m, rec.parsed.msg_type);
     }
+    // **talker 为空的行不成会话。** 真实库里有这样的 c2c 行（`40020` 为空）：它们没有可寻址的
+    // 对端，于是既不能作为拉取路径、也无法归属到任何会话 —— 若照建，会出现一个 id 与 name 都是
+    // 空串的会话，而规范要求 `id` 是「对话在数据源中的唯一标识」且能直接用作拉取路径。
+    //
+    // 但**与会话无关的副作用照做**：媒体登记按 md5 定址、昵称表按 uid 定址，两者都不依赖会话。
+    // 整条跳过会让这些数据一起消失，那比脏会话更难查。
+    if rec.talker.is_empty() {
+        if !rec.from_nick.is_empty() {
+            store.uid_names.insert(rec.from_uid.clone(), rec.from_nick.clone());
+        }
+        return;
+    }
     let key = conv_key(rec.chat_type, &rec.talker);
     let conv = store.convs.entry(key).or_insert_with(|| {
         let name = if rec.chat_type == ChatType::Group {
@@ -520,6 +532,29 @@ mod tests {
             .unwrap();
         }
         conn
+    }
+
+    /// 真实库里有 `40020` 为空的 c2c 行。它们没有可寻址的对端，因此**不该成会话** —— 否则
+    /// `/chatlab/sessions` 会吐出一个 `id` 与 `name` 都是空串的会话，而规范要求 `id` 是「对话在
+    /// 数据源中的唯一标识」且能直接用作拉取路径（`session_ids_resolvable_by_pull` 查的就是这个，
+    /// 只是夹具里没有这种行，所以它在夹具上永远绿）。
+    #[test]
+    fn rows_without_a_talker_do_not_become_conversations() {
+        let conn = make_table(true);
+        conn.execute_batch(
+            "INSERT INTO c2c_msg_table VALUES ('', 200, '王五', CAST('没有对端' AS BLOB));",
+        )
+        .unwrap();
+        let store = build_index(&conn, None).unwrap();
+        let keys: Vec<&String> = store.convs.keys().collect();
+        assert!(
+            !keys.iter().any(|k| k.ends_with(':')),
+            "talker 为空的行不该成会话，实际有：{keys:?}"
+        );
+        assert_eq!(store.convs.len(), 1, "只有那条真会话：{keys:?}");
+        // 与会话无关的副作用照做：昵称表按 uid 定址，不依赖会话 —— 所以这条行的昵称**仍要进表**。
+        // 整条跳过（而不是只跳会话）会让这类数据一起消失，那比脏会话更难查。
+        assert_eq!(store.uid_names.get("").map(String::as_str), Some("王五"));
     }
 
     #[test]
