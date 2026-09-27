@@ -9,6 +9,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::store::Store;
 use crate::server::dto::Contacts;
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::server::AppState;
@@ -61,7 +62,7 @@ pub async fn handler(
     }
     let limit = params.limit.clamp(1, 10000);
     let store = state.store.read();
-    let (contacts, total) = crate::store::query::query_contacts(
+    let (contacts, total) = query_contacts(
         &store,
         params.keyword.as_deref(),
         limit,
@@ -87,3 +88,71 @@ pub async fn handler(
     .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;
     Ok(Json(body))
 }
+
+/// Contacts: every UID known to chat or to the name maps (a profile-only
+/// uid with no chat history appears too — that is the point of the
+/// mapping), with nickname (profile > message-derived), remark, and the
+/// QQ number exposed in the WeFlow `alias` slot.
+///
+/// Returns `(page, total_after_filter)`: the caller needs the pre-pagination
+/// count to answer `hasMore` without running the query twice.
+///
+/// 它返回的是 HTTP 面的 DTO（[`ContactOut`]），所以住在这一层 —— 之前它在 `store::query` 里，
+/// 于是核心面反过来依赖服务层（`--no-default-features` 下得为它加 cfg 才能编译）。
+pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> (Vec<ContactOut>, usize) {
+    let kw = keyword.map(|k| k.to_lowercase());
+    let mut uid_set: std::collections::BTreeSet<&String> = store.uid_names.keys().collect();
+    uid_set.extend(store.names.uid_remark.keys());
+    uid_set.extend(store.names.uid_nick.keys());
+    let mut rows: Vec<ContactOut> = uid_set
+        .into_iter()
+        .map(|uid| {
+            let nick = store
+                .names
+                .uid_nick
+                .get(uid)
+                .or_else(|| store.uid_names.get(uid))
+                .cloned()
+                .unwrap_or_default();
+            ContactOut {
+                username: uid.clone(),
+                display_name: store.display_uid(uid),
+                nickname: nick,
+                remark: store.names.uid_remark.get(uid).cloned().unwrap_or_default(),
+                // WeFlow's alias slot carries the QQ number here (migrated
+                // from the old `qq` field; empty when the version lacks a
+                // uid->QQ mapping source).
+                alias: store.names.uid_qq.get(uid).cloned().unwrap_or_default(),
+                avatar_url: String::new(),
+                r#type: "friend".into(),
+            }
+        })
+        .collect();
+    // Sort by (display_name, username): display names are not unique, so a
+    // display-name-only key leaves ties in arbitrary order between requests and
+    // offset paging would skip or repeat those rows.
+    rows.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+            .then_with(|| a.username.cmp(&b.username))
+    });
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|c| {
+            if let Some(k) = &kw {
+                c.username.to_lowercase().contains(k.as_str())
+                    || c.display_name.to_lowercase().contains(k.as_str())
+                    || c.nickname.to_lowercase().contains(k.as_str())
+            } else {
+                true
+            }
+        })
+        .collect();
+    let total = filtered.len();
+    (
+        filtered.into_iter().skip(offset).take(limit).collect(),
+        total,
+    )
+}
+
