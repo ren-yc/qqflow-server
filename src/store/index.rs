@@ -364,6 +364,46 @@ fn scan_table(
 /// and build the cache-index fallback snapshot (files named md5/uuid).
 /// The cache walk runs here — the caller executes `build_index` on the
 /// blocking pool, never on a tokio worker.
+/// 从一条已打开的连接建全量索引（含群名映射）—— **服务层与嵌入者共用的那一段**。
+///
+/// `nt_db_dir` 是 `nt_msg.db` 所在目录：媒体根 `nt_data` 与群名映射都从它派生。
+/// `key` 是**同一个库的密钥**，`load_names` 要用它去读同目录下的兄弟库。
+///
+/// 抽出来是因为这段「建索引 + 载映射」的次序有讲究（映射要拿索引里已知的键做约束），抄一份
+/// 就多一份会漂移的实现 —— 而漂移的后果是嵌入者拿到的索引与服务拿到的不一样。
+pub fn build_with(
+    conn: &Connection,
+    nt_db_dir: &std::path::Path,
+    key: &str,
+) -> anyhow::Result<Store> {
+    let media_root = super::media::media_root_of(nt_db_dir);
+    let mut st = build_index(conn, media_root.as_deref())?;
+    // uid→备注/QQ、群号→群名 maps（尽力而为 —— schema 变动时为空）。
+    st.names = super::names::load_names(
+        conn,
+        nt_db_dir,
+        key,
+        &super::names::KnownKeys::from_store(&st),
+    );
+    Ok(st)
+}
+
+/// 打开账号库、上密钥、建全量索引 —— **嵌入者的入口**。
+///
+/// `db_path` 是 `nt_msg.db` **文件**（不是目录）：本仓库的库带 QQ 自有的明文头偏移，由自定义
+/// VFS 处理，所以必须经 [`crate::db::live::LiveReader`] 打开，不能裸 `Connection::open`。
+///
+/// 服务层不走这里 —— 它建完之后还要留着那条连接做增量，所以直接用 [`build_with`]。
+pub fn open_and_build(
+    db_path: &std::path::Path,
+    key: &str,
+) -> anyhow::Result<Store> {
+    let mut reader = crate::db::live::LiveReader::new(db_path.to_path_buf(), key.to_string());
+    reader.open()?;
+    let conn = reader.acquire()?;
+    let nt_db_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    build_with(conn, nt_db_dir, key)
+}
 pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> Result<Store> {
     let mut store = Store {
         media_root: media_root.map(std::path::Path::to_path_buf),

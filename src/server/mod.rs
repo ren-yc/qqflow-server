@@ -23,7 +23,7 @@ use crate::db::live::LiveReader;
 use crate::db::scan::DbInfo;
 use crate::sync;
 use crate::sync::Event;
-use crate::store::{self, index, AppState, Store};
+use crate::store::{index, AppState, Store};
 
 /// Per-account readiness state (serialized as-is into the token-protected
 /// `GET /api/v1/accounts`; `/health` reports the coarser [`AccountPhase`]).
@@ -651,22 +651,13 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
         let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build.clone());
         reader.open()?; // verify the key now — bad key → error state (unchanged UX)
         let conn = reader.acquire()?;
-        // Media root: <root>/<qq>/nt_qq/nt_db -> <root>/<qq>/nt_qq/nt_data;
-        // relative "45812" local cache paths resolve against it. Supplied to
-        // build_index up front so media registration can refresh stale paths.
+        // 媒体根与群名映射都在 `build_with` 里处理（嵌入者走同一段）。
         let nt_db_dir = info_for_build
             .path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
-        let media_root = store::media::media_root_of(nt_db_dir);
-        let mut st = index::build_index(conn, media_root.as_deref())?;
-        // uid→备注/QQ、群号→群名 maps (best-effort — empty on schema churn).
-        st.names = store::names::load_names(
-            conn,
-            nt_db_dir,
-            &key_for_build,
-            &store::names::KnownKeys::from_store(&st),
-        );
+        // 与嵌入者走**同一段**：建索引 + 载群名映射的次序有讲究，抄一份就会漂移。
+        let st = index::build_with(conn, nt_db_dir, &key_for_build)?;
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         // Cancelled during the build (decrypt + index is the slow part) —
         // drop the freshly built index instead of installing it.
@@ -1143,7 +1134,7 @@ mod tests {
             st.watermark_c2c = 7;
             st.convs.insert(
                 "g:g1".into(),
-                store::Conversation { talker: "g1".into(), ..Default::default() },
+                crate::store::Conversation { talker: "g1".into(), ..Default::default() },
             );
         }
         update_ready(&state);
