@@ -1982,3 +1982,170 @@ fn real_db_local_path_trust_boundary() {
         "the pre-fix resolution reached files outside media_root, so containment costs real media on this account and needs a QQ-root allowlist"
     );
 }
+
+/// 真库表调研：列出 nt_db 下每个库的表名与行数，找出**群成员**的来源。
+///
+/// 用法与其它真库探针一致（`#[ignore]` ＋ 环境变量门控）：
+///   QQFLOW_TEST_DB_ROOT  QQFLOW_TEST_DB_KEY
+#[test]
+#[ignore]
+fn probe_real_db_tables() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("需要 QQFLOW_TEST_DB_ROOT");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("需要 QQFLOW_TEST_DB_KEY");
+    // 三种传法都接受：直接给 `nt_msg.db`、给 `nt_db` 目录、或给 `<Tencent Files 根>`
+    // （配置文件里的 `db_path` 是**根**，真实布局是 `<根>/<qq>/nt_qq/nt_db`）。
+    // 猜错路径只会得到「目录不存在」，而那是这个探针最容易踩的坑。
+    let given = Path::new(&root);
+    let nt_db = if given.extension().is_some_and(|x| x == "db") {
+        given.parent().expect("nt_msg.db 的父目录").to_path_buf()
+    } else if given.join("nt_msg.db").exists() {
+        given.to_path_buf()
+    } else {
+        // 根目录：往下找一层 <qq>/nt_qq/nt_db。
+        std::fs::read_dir(given)
+            .expect("根目录")
+            .flatten()
+            .map(|e| e.path().join("nt_qq").join("nt_db"))
+            .find(|d| d.join("nt_msg.db").exists())
+            .unwrap_or_else(|| panic!("在 {given:?} 下没找到 <qq>/nt_qq/nt_db/nt_msg.db"))
+    };
+    let mut names: Vec<std::path::PathBuf> = std::fs::read_dir(&nt_db)
+        .expect("nt_db 目录")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "db"))
+        .collect();
+    names.sort();
+    println!("[表调研] nt_db 下 {} 个库", names.len());
+    for path in &names {
+        let label = path.file_name().unwrap().to_string_lossy().to_string();
+        // 与服务器同一条打开路径（偏移 VFS ＋ 只读活连接）。
+        let mut reader = LiveReader::new(path.clone(), key.clone());
+        let Ok(()) = reader.open() else {
+            println!("  {label}: 打不开（可能不是 SQLCipher 或键不同）");
+            continue;
+        };
+        let Ok(conn) = reader.acquire() else { continue };
+        let mut stmt = match conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") {
+            Ok(s) => s,
+            Err(e) => { println!("  {label}: 列表失败 {e}"); continue }
+        };
+        let tables: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        let hits: Vec<&String> = tables
+            .iter()
+            .filter(|t| {
+                let l = t.to_lowercase();
+                l.contains("member") || l.contains("troop") || l.contains("group")
+            })
+            .collect();
+        println!("  {label}: {} 张表；含 member/troop/group 的 {} 张", tables.len(), hits.len());
+        for t in hits {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+                .unwrap_or(-1);
+            println!("      {t}  ({n} 行)");
+        }
+    }
+}
+
+/// 追查 `group_member3` 的结构与样例行（表调研把它指出来了）。
+#[test]
+#[ignore]
+fn probe_group_member3_shape() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("需要 QQFLOW_TEST_DB_ROOT");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("需要 QQFLOW_TEST_DB_KEY");
+    let given = Path::new(&root);
+    let nt_db = if given.extension().is_some_and(|x| x == "db") {
+        given.parent().unwrap().to_path_buf()
+    } else if given.join("nt_msg.db").exists() {
+        given.to_path_buf()
+    } else {
+        std::fs::read_dir(given).unwrap().flatten()
+            .map(|e| e.path().join("nt_qq").join("nt_db"))
+            .find(|d| d.join("nt_msg.db").exists())
+            .expect("找到 nt_db")
+    };
+    let path = nt_db.join("group_info.db");
+    let mut reader = LiveReader::new(path, key.clone());
+    reader.open().expect("打开 group_info.db");
+    let conn = reader.acquire().unwrap();
+    for table in ["group_member3", "group_member_new_ext_info_table", "group_list", "group_detail_info_ver1"] {
+        let sql: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name = ?1", [table], |r| r.get(0))
+            .unwrap_or_else(|e| format!("（拿不到 {table}: {e}）"));
+        println!("=== {table} ===");
+        println!("{sql}");
+        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| r.get(0)).unwrap_or(-1);
+        println!("-- {n} 行；前 3 行：");
+        if let Ok(mut stmt) = conn.prepare(&format!("SELECT * FROM \"{table}\" LIMIT 3")) {
+            let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+            println!("-- 列: {}", cols.join(", "));
+            let rows = stmt.query_map([], |r| {
+                let mut v: Vec<String> = Vec::new();
+                for i in 0..cols.len() {
+                    v.push(match r.get_ref(i) {
+                        Ok(rusqlite::types::ValueRef::Text(b)) => String::from_utf8_lossy(b).chars().take(30).collect(),
+                        Ok(rusqlite::types::ValueRef::Integer(n)) => n.to_string(),
+                        Ok(rusqlite::types::ValueRef::Real(f)) => f.to_string(),
+                        Ok(rusqlite::types::ValueRef::Null) => "NULL".into(),
+                        Ok(rusqlite::types::ValueRef::Blob(b)) => format!("<blob {}>", b.len()),
+                        Err(_) => "?".into(),
+                    });
+                }
+                Ok(v.join(" | "))
+            });
+            if let Ok(rows) = rows {
+                for r in rows.flatten() {
+                    println!("--   {r}");
+                }
+            }
+        }
+    }
+}
+
+/// 每群人数 ＋ 群号与会话 id 的对齐情况。
+#[test]
+#[ignore]
+fn probe_group_roster_counts() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("root");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("key");
+    let given = Path::new(&root);
+    let nt_db = if given.extension().is_some_and(|x| x == "db") {
+        given.parent().unwrap().to_path_buf()
+    } else if given.join("nt_msg.db").exists() { given.to_path_buf() }
+    else {
+        std::fs::read_dir(given).unwrap().flatten()
+            .map(|e| e.path().join("nt_qq").join("nt_db"))
+            .find(|d| d.join("nt_msg.db").exists()).expect("nt_db")
+    };
+    let mut reader = LiveReader::new(nt_db.join("group_info.db"), key.clone());
+    reader.open().expect("group_info.db");
+    let conn = reader.acquire().unwrap();
+    println!("=== group_list 的群号 ===");
+    let mut stmt = conn.prepare("SELECT [60001], [60007] FROM group_list ORDER BY [60001]").unwrap();
+    let groups: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())))
+        .unwrap().flatten().collect();
+    for (id, name) in &groups { println!("  {id}  {name}"); }
+    println!("=== group_member3 每群人数 ===");
+    let mut stmt = conn
+        .prepare("SELECT [60001], COUNT(*) FROM group_member3 GROUP BY [60001] ORDER BY 2 DESC")
+        .unwrap();
+    let counts: Vec<(i64, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+    for (id, n) in &counts { println!("  {id}  {n} 人"); }
+    let with_roster = counts.iter().filter(|(id, _)| groups.iter().any(|(g, _)| g == id)).count();
+    println!("[小结] group_list {} 个群；group_member3 覆盖 {} 个", groups.len(), with_roster);
+    // 会话 id 是否就是群号
+    let mut reader2 = LiveReader::new(nt_db.join("nt_msg.db"), key.clone());
+    reader2.open().expect("nt_msg.db");
+    let conn2 = reader2.acquire().unwrap();
+    let mut stmt = conn2
+        .prepare("SELECT DISTINCT [40021] FROM group_msg_table")
+        .unwrap();
+    let talkers: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().flatten().collect();
+    let matched = talkers.iter().filter(|t| groups.iter().any(|(g, _)| g.to_string() == **t)).count();
+    println!("[小结] 会话里的群 talker {} 个；其中 {} 个在 group_list 里", talkers.len(), matched);
+}
