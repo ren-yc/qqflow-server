@@ -291,7 +291,7 @@ async fn conformance_suite_passes() {
             "harness": "/__harness",
             "health": "/health",
             "messages": "/api/v1/messages",
-            "pull": "/api/v1/sessions/{id}/messages",
+            "pull": "/chatlab/sessions/{id}/messages",
             "push": "/chatlab/push/messages",
             "sessions": "/chatlab/sessions",
         },
