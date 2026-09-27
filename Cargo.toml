@@ -7,8 +7,8 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-async-stream = "0.3"
-axum = "0.8"
+async-stream = { version = "0.3", optional = true }
+axum = { version = "0.8", optional = true }
 base64 = "0.22"
 chrono = "0.4"
 dirs = "6"
@@ -18,14 +18,14 @@ rand = "0.8"
 rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "fs"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-futures-util = "0.3"
+tokio = { optional = true, version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal", "io-util", "fs"] }
+tokio-stream = { optional = true, version = "0.1", features = ["sync"] }
+futures-util = { version = "0.3", optional = true }
 libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"] }
-notify = "8.2"
-notify-debouncer-mini = "0.7"
-tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["trace"] }
+notify = { version = "8.2", optional = true }
+notify-debouncer-mini = { version = "0.7", optional = true }
+tokio-util = { optional = true, version = "0.7", features = ["io"] }
+tower-http = { optional = true, version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenAPI 描述生成。**编译期** derive（无运行时开销），但它确实渗进了 `parser`/`store`：
@@ -33,7 +33,29 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 这是**有意的取舍** —— 替代方案是在 DTO 里复制一份同样的结构体，两份必然漂移。
 # 库边界划定时（core 并入根 package、feature 化的那次改动）应把它换成服务层的 newtype，
 # 届时这些 derive 一起搬走。
-utoipa = { version = "6", features = ["axum_extras"] }
+utoipa = { optional = true, version = "6", features = ["axum_extras"] }
+
+[[bin]]
+name = "qqflow-server"
+path = "src/main.rs"
+# 二进制要建 tokio 运行时并起 HTTP 服务 —— 没有 `server` feature 时它没有意义，
+# 与其编译出一个起不来的 bin，不如让 cargo 直接不构建它。
+required-features = ["server"]
+
+[features]
+default = ["server"]
+
+# 服务层：HTTP/SSE。依赖 axum、tokio 运行时与 utoipa（OpenAPI 描述）。
+server = ["dep:axum", "dep:utoipa", "dep:tower-http", "dep:tokio-stream", "dep:tokio-util", "dep:tokio", "sync"]
+
+# 同步引擎：watcher 与水位线增量。
+sync = ["dep:tokio", "dep:notify", "dep:notify-debouncer-mini", "dep:async-stream", "dep:futures-util", "dep:tokio-stream"]
+
+# 造库/造密钥工具。
+#
+# 两个用途：① 嵌入者写自己的测试时要造一份假库；② 本仓库的集成测试在**独立 crate** 里，
+# 只能看见 pub —— 默认构建下实现面是 pub(crate)（边界由编译器强制），开了它才转成 pub。
+testing = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

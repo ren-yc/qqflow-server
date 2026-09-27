@@ -18,7 +18,12 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::parser::types::{ChatType, MessageRecord};
+// `AppState` 是**服务层**类型（它持有同步引擎与事件总线），只是恰好住在这个模块里。
+// 因此它随 `server` 一起门控：不加这一条，`--no-default-features` 会因为「store 依赖 sync」
+// 而编不过 —— 而那正是「核心面不得依赖可选面」这条边界要拦的东西。
+#[cfg(feature = "server")]
 use crate::sync;
+
 
 /// Key for the conversation map: "g:<groupId>" or "c:<peerUid>".
 pub fn conv_key(chat_type: ChatType, talker: &str) -> String {
@@ -191,6 +196,7 @@ impl Store {
 }
 
 /// Shared application state handed to the HTTP layer and poller tasks.
+#[cfg(feature = "server")]
 pub struct AppState {
     pub store: Arc<RwLock<Store>>,
     pub events: tokio::sync::broadcast::Sender<sync::Event>,

@@ -17,7 +17,10 @@ pub struct SessionInfo {
 }
 
 /// WeFlow-style message row.
-#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+// `ToSchema` 只在服务层需要（schema 是 HTTP 面的东西）。核心面不该依赖 utoipa ——
+// 否则 `--no-default-features` 丢不掉它。
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageOut {
     pub local_id: i64,
@@ -301,6 +304,9 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
 ///
 /// Returns `(page, total_after_filter)`: the caller needs the pre-pagination
 /// count to answer `hasMore` without running the query twice.
+/// **随 `server` 门控**：它返回的是 HTTP 面的 DTO（`ContactOut`），而核心面不该依赖服务层 ——
+/// 不加这一条，`--no-default-features` 会因为「store 依赖 server」而编不过。
+#[cfg(feature = "server")]
 pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> (Vec<crate::server::handlers::contacts::ContactOut>, usize) {
     let kw = keyword.map(|k| k.to_lowercase());
     let mut uid_set: std::collections::BTreeSet<&String> = store.uid_names.keys().collect();

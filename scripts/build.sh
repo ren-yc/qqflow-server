@@ -18,4 +18,13 @@ if [[ "$(uname -s)" == "Darwin" ]] && ! command -v make >/dev/null 2>&1; then
   echo "warning: make not found (openssl-src needs it). macOS: xcode-select --install" >&2
 fi
 
+needs_testing=0
+if [[ $# -gt 0 && ( "$1" == "test" || ( "$1" == "clippy" && " $* " == *" --all-targets "* ) ) ]]; then
+  needs_testing=1
+fi
+case " $* " in *" --features "*|*" --all-features "*|*" --no-default-features "*) needs_testing=0 ;; esac
+if [[ $needs_testing -eq 1 ]]; then
+  set -- "$1" --features testing "${@:2}"
+  echo "build.sh: 已补 --features testing（集成测试需要它才看得见实现面）" >&2
+fi
 exec cargo "$@"
