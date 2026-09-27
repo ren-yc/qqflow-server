@@ -130,7 +130,7 @@ pub fn seed_dataset(conn: &Connection, extra: u32) {
     g(1, "10001", (ts << 32) | 1, "u_a", "张三", 1, "张三群名片", "你好，欢迎加入".as_bytes());
     g(2, "10001", (ts << 32) | 2, "u_b", "李四", 0, "", "收到".as_bytes());
     g(3, "10001", (ts << 32) | 3, "u_a", "张三", 1, "张三群名片", "李四撤回了一条消息\n你猜猜撤回了什么".as_bytes());
-    g(4, "10001", (ts << 32) | 4, "u_b", "李四", 3, "", "群主已将群名修改为「测试群」".as_bytes());
+    g(4, "10001", (ts << 32) | 4, "u_b", "李四", 3, "", "群主已将群名修改为「测试群a」".as_bytes());
     let mut media = vec![0u8; 70_000];
     media[5000..5008].copy_from_slice(b".jpg.exe");
     g(5, "10001", (ts << 32) | 5, "u_c", "王五", 0, "", &media);
@@ -369,7 +369,7 @@ pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
     conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
     conn.execute_batch(
         "CREATE TABLE group_list (id TEXT PRIMARY KEY, name TEXT, remark TEXT);\
-         INSERT INTO group_list VALUES ('10001', '测试群', '');\
+         INSERT INTO group_list VALUES ('10001', '测试群a', '');\
          INSERT INTO group_list VALUES ('20002', '第二群', '');",
     )
     .unwrap();

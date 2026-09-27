@@ -59,7 +59,7 @@ fn an_embedder_can_read_an_account_without_http() {
     assert_eq!(index.group_card(ChatType::C2c, "u_12345", "u_a"), "");
 
     // ⑤ 展示名：群名来自「修改群名」那条系统消息。
-    assert_eq!(index.display_name(ChatType::Group, "10001"), "测试群");
+    assert_eq!(index.display_name(ChatType::Group, "10001"), "测试群a");
     assert!(
         !index.display_name(ChatType::C2c, "u_12345").is_empty(),
         "私聊有对方昵称"

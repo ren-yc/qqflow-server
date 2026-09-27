@@ -360,6 +360,36 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 
 ---
 
+### ChatLab 发现面（GET `/chatlab/sessions`）
+
+规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的会话发现入口。与 `/api/v1/sessions`
+**共用同一份实现**，差别只有默认语义：老面靠 `format=chatlab` 参数切换，新面**天生就是** ChatLab
+形状。**老面一行未改。**
+
+响应（规范形状）：
+
+```json
+{
+  "sessions": [
+    { "id": "10001", "name": "…", "platform": "qq", "type": "group",
+      "messageCount": 0, "lastMessageAt": 1782864000 }
+  ],
+  "page": { "hasMore": true, "nextCursor": "2" }
+}
+```
+
+参数 `keyword`（按名称或 id 模糊匹配）、`limit`、`cursor`（原样回传上一页的 `nextCursor`）。
+
+- **不给 `offset`**：规范明确不建议在发现接口用它（列表变化时会出现重复或漏项）。
+- **`page` 总是给出**：规范说客户端在响应里**未发现** `page` 时按「单次全量结果」处理 —— 那比
+  「靠条数猜有没有截断」明确。
+- **`messageCount` 恒为 `0`**：本仓库不维护每会话条数。**键要留着** —— 下游按它排序，缺键与
+  「是 0」在下游不是同一件事。
+- `memberCount` **本仓库不给**（没有群名册来源）。规范把它列为可选，所以不给是合规的；
+  夹具里的 `capabilities.memberCount` 与之保持一致，避免「声明支持却从不出现」。
+
+排序为最后消息时间降序、`id` 升序 —— 稳定，游标翻页因此不会跳项或重复。
+
 ### ChatLab 通知面（GET `/chatlab/push/messages`）
 
 规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的**通知通道**。与 `/api/v1/push/messages`

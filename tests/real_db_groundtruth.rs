@@ -208,7 +208,10 @@ fn fake_db_names_loaded() {
     assert_eq!(maps.uid_remark.get("u_b"), None, "empty remark stays absent");
     assert_eq!(maps.uid_qq.get("u_a").map(String::as_str), Some("10001"));
     // sibling group_info.db (headed): group id -> name.
-    assert_eq!(maps.group_name.get("10001").map(String::as_str), Some("测试群"));
+    assert_eq!(
+        maps.group_name.get("10001").map(String::as_str),
+        Some("测试群a")
+    );
     assert_eq!(maps.group_name.get("20002").map(String::as_str), Some("第二群"));
 
     // Wire the maps into the store, exactly like init_account does, then
@@ -225,7 +228,7 @@ fn fake_db_names_loaded() {
     assert_eq!(store.display_uid("u_b"), "李四", "no remark/profile row -> message nick");
     assert_eq!(
         store.display_name(ChatType::Group, "10001"),
-        "测试群",
+        "测试群a",
         "group-info name"
     );
     assert_eq!(store.display_name(ChatType::C2c, "u_a"), "张三备注", "c2c remark wins");

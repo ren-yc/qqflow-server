@@ -293,7 +293,7 @@ async fn conformance_suite_passes() {
             "messages": "/api/v1/messages",
             "pull": "/api/v1/sessions/{id}/messages",
             "push": "/chatlab/push/messages",
-            "sessions": "/api/v1/sessions",
+            "sessions": "/chatlab/sessions",
         },
         "authProbed": auth_probed,
         "slots": {
@@ -308,11 +308,15 @@ async fn conformance_suite_passes() {
             "mediaById": true,
             // 本仓库没有回调面（SNS 是微信侧的），如实置 false。
             "sns": false,
-            "memberCount": true,
+                        // 本仓库**没有群名册来源**，因此从不发 `memberCount` —— 声明 true 会让用例去验一个
+            // 永远不会出现的东西（不变量允许缺席，于是它「通过」了，但什么都没验）。
+            // 能力声明的用途正是这个：**声明「我们不做这件事」，而不是声明「我们做不到就跳过」。**
+            // 要让它变 true，得先有一个名册来源（weflow 那边的群元数据加载器就是）。
+            "memberCount": false,
             // Pull 形状的发现面（规范里的 `GET {baseUrl}/sessions`）尚未实现 —— 它是计划里
             // 「ChatLab 适配」那一步的内容。置 false 让相关用例**跳过而不是失败**：契约的
             // 能力机制就是为这种「存在性差异」准备的。实现后翻成 true 即启用。
-            "pullDiscovery": false,
+            "pullDiscovery": true,
             // 同上：Pull 形状的通知面（`GET {baseUrl}/push/messages`，规范要求只带元信息，
             // 不带消息体）也属那一步。
             // SSE 通知面**是存在的**且符合契约（`message.new`/`message.revoke`/`sync` 三种

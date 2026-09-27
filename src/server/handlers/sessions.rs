@@ -41,8 +41,23 @@ pub async fn handler(
     EnvelopeQuery(params): EnvelopeQuery<Params>,
     body: axum::body::Bytes,
 ) -> Result<axum::response::Response, ApiError> {
+    respond(&state, &headers, params, body, false).await
+}
+
+/// `handler` 的本体，带一个「强制 ChatLab 形状」的开关。
+///
+/// `/chatlab/sessions` 用它并传 `true`：Pull 面**天生就是** ChatLab 形状，调用方不该再知道
+/// 有 `format` 这个参数。两条路的其余部分（鉴权、就绪门控、筛选、分页、信封）**逐字一致** ——
+/// 抄一份就会漂移。
+pub(crate) async fn respond(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    params: Params,
+    body: axum::body::Bytes,
+    force_chatlab: bool,
+) -> Result<axum::response::Response, ApiError> {
     let params = merge_body(params, &body).await?;
-    if !authorized(&state, &headers, params.access_token.as_deref()) {
+    if !authorized(state, headers, params.access_token.as_deref()) {
         return Err(ApiError::unauthorized());
     }
     if !state.ready.load(std::sync::atomic::Ordering::SeqCst) {
@@ -56,7 +71,7 @@ pub async fn handler(
         .as_deref()
         .and_then(|c| c.parse::<usize>().ok())
         .unwrap_or(params.offset);
-    let chatlab = params.format.as_deref() == Some("chatlab");
+    let chatlab = force_chatlab || params.format.as_deref() == Some("chatlab");
 
     let store = state.store.read();
     if chatlab {
