@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::parser::types::ChatType;
-use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta, PullEnvelope, PullMessage, PullSync};
+use crate::server::dto::{ChatlabMember, PullEnvelope, PullMessage, PullSync};
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::server::AppState;
 
@@ -148,21 +148,16 @@ pub async fn handler(
     // matching WeFlow. Scanning the whole conversation instead made `members`
     // unbounded and cost a full pass per request.
     let members: Vec<ChatlabMember> = {
-        let mut seen: Vec<&str> = Vec::new();
+        // 去重规则只有一处出处（`server::chatlab`）—— 两个面各写一遍时，改一处忘另一处就会让
+        // 同一个会话在两个面上成员不同。
+        let uids: Vec<String> = page.iter().map(|&i| conv.msgs[i].from_uid.clone()).collect();
         let mut out = Vec::new();
-        for &i in page {
-            let uid = conv.msgs[i].from_uid.as_str();
-            if !uid.is_empty() && !seen.contains(&uid) {
-                seen.push(uid);
-                out.push(ChatlabMember {
-                    account_name: account_name(uid),
-                    // QQ exposes no avatar source; the field is optional in
-                    // ChatLab 0.0.2, so an empty string is the honest answer.
-                    avatar: String::new(),
-                    group_nickname: group_card(uid),
-                    platform_id: uid.to_string(),
-                });
-            }
+        for uid in crate::server::chatlab::dedup_senders(&uids) {
+            out.push(crate::server::chatlab::member(
+                &uid,
+                account_name(&uid),
+                group_card(&uid),
+            ));
         }
         out
     };
@@ -179,20 +174,15 @@ pub async fn handler(
 
     let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
     let body = serde_json::to_value(PullEnvelope {
-        chatlab: ChatlabHeader {
-            exported_at: chrono::Utc::now().timestamp(),
-            generator: "qqflow-server".to_string(),
-            version: "0.0.2".to_string(),
-        },
+        chatlab: crate::server::chatlab::header(),
         members,
         messages,
-        meta: ChatlabMeta {
-            group_id: talker.clone(),
-            name: store.display_name(chat_type, &talker),
+        meta: crate::server::chatlab::meta(
+            chat_type,
+            talker.clone(),
+            store.display_name(chat_type, &talker),
             owner_id,
-            platform: "qq".to_string(),
-            r#type: chat_type.as_str().to_string(),
-        },
+        ),
         sync: PullSync {
             has_more,
             next_since: if has_more { next_since } else { watermark },

@@ -242,22 +242,15 @@ fn chatlab_envelope(
     // Senders in this page, deduped — the undeduped version repeated a member
     // once per message they sent.
     let members: Vec<ChatlabMember> = {
-        let mut seen: Vec<&str> = Vec::new();
-        let mut out = Vec::new();
-        for m in items {
-            let uid = m.sender_username.as_str();
-            if !uid.is_empty() && !seen.contains(&uid) {
-                seen.push(uid);
-                out.push(ChatlabMember {
-                    account_name: account_name(uid),
-                    // QQ 没有头像来源；ChatLab 0.0.2 里该字段可选，空串是诚实的答案。
-                    avatar: String::new(),
-                    group_nickname: group_card(uid),
-                    platform_id: uid.to_string(),
-                });
-            }
-        }
-        out
+        // 去重规则只有一处出处（`server::chatlab`）—— 两个面各写一遍时，改一处忘另一处就会让
+        // 同一个会话在两个面上成员不同。
+        let uids: Vec<String> = items.iter().map(|m| m.sender_username.clone()).collect();
+        crate::server::chatlab::dedup_senders(&uids)
+            .iter()
+            .map(|uid| {
+                crate::server::chatlab::member(uid, account_name(uid), group_card(uid))
+            })
+            .collect()
     };
     let messages: Vec<ChatlabMessage> = items
         .iter()
