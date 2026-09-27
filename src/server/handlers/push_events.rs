@@ -66,10 +66,52 @@ pub async fn handler(
 pub(crate) type Serializer = fn(Event) -> (String, serde_json::Value);
 
 /// WeFlow 兼容面的形状：**整个事件原样序列化**（既有客户端在解析它）。
+///
+/// **只有 `sync` 是例外**：它被收敛成与 weflow 同形的 `{event, watermarks:[{table, watermark}]}`。
+/// 原来它是这个扁平结构体的一个"投影" —— 水位线靠 `lastRowidGroup` / `lastRowidC2c` 两个字段名
+/// 承载，加第三张表就必须再加一个字段，而消费方得靠"字段名 ←→ 表"的约定来配对。
+/// 数组形态把这件事变成数据。
+///
+/// 代价是这一帧**变成破坏性**的（解析旧字段名的下游会拿到缺键）——
+/// 这正是要走 0.6.0 的那一项。
 fn serialize_weflow(ev: Event) -> (String, serde_json::Value) {
     let name = ev.event.clone();
-    let payload = serde_json::to_value(&ev).unwrap_or_default();
+    let payload = if name == "sync" {
+        sync_payload(&ev)
+    } else {
+        serde_json::to_value(&ev).unwrap_or_default()
+    };
     (name, payload)
+}
+
+/// 给键集护栏用的入口。
+///
+/// 测试在**独立 crate** 里，看不见 `pub(crate)`；而这条护栏的价值恰恰在于它断言的是**线上形状**
+/// 而不是某个内部函数 —— 所以这里把它开一个口，而不是让测试自己拼一份等价实现
+/// （自己拼的那份会跟着测试一起漂移，护栏就白设了）。
+pub fn serialize_for_test(ev: Event) -> (String, serde_json::Value) {
+    serialize_weflow(ev)
+}
+
+/// 把扁平事件里的两个 rowid 水位收敛成数组。
+///
+/// `rowid` 是 SQLite 的行号，也是本仓库增量的**全部**游标语义（`read_new` 就按它取新行）。
+/// weflow 那边的水位是 `{create_time, local_id, sort_seq}` 三元组 —— **两者不是同一套语义**，
+/// 跨仓库的消费方必须按 `table` 分支。这一点写在字段文档里，而不是靠"名字一样"蒙混过去。
+fn sync_payload(ev: &Event) -> serde_json::Value {
+    let mut watermarks: Vec<serde_json::Value> = Vec::new();
+    for (table, rowid) in [
+        (crate::store::index::GROUP_TABLE, ev.last_rowid_group),
+        (crate::store::index::C2C_TABLE, ev.last_rowid_c2c),
+    ] {
+        if let Some(n) = rowid {
+            watermarks.push(serde_json::json!({
+                "table": table,
+                "watermark": { "rowid": n },
+            }));
+        }
+    }
+    serde_json::json!({ "event": "sync", "watermarks": watermarks })
 }
 
 /// 组装 SSE 响应。`serialize` 决定帧的形状，其余部分是两面的公共部分。

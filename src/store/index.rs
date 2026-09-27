@@ -21,8 +21,8 @@ use crate::parser::{self};
 
 use super::{conv_key, MediaEntry, Store};
 
-const GROUP_TABLE: &str = "group_msg_table";
-const C2C_TABLE: &str = "c2c_msg_table";
+pub const GROUP_TABLE: &str = "group_msg_table";
+pub const C2C_TABLE: &str = "c2c_msg_table";
 
 /// Spec-derived optional columns actually present in one table
 /// (value-driven: absent columns degrade, never fail the scan).

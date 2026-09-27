@@ -338,7 +338,20 @@ GET /api/v1/push/messages
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
 | `media` | 仅图片/语音/视频消息：媒体元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`urls`，**不含 `localPath`**——推送不携带任何本地路径），缺失时省略 |
 | `mediaId` | 仅 `message.new`：媒体获取键（md5 hex 或 uuid），用于 `GET /api/v1/media/{id}` 直取字节；**仅当索引注册了可读取的本地缓存路径时提供**（与 REST `messages.mediaId` 同规则），否则省略——出现即保证可取，绝不 404 承诺 |
-| `lastRowidGroup` / `lastRowidC2c` | 仅 `sync` 事件：群/私聊表当前水位线（rowid 最大值） |
+| （`sync` 无上面这些字段）| **`sync` 是唯一的例外**：它的载荷收敛成 `{"event":"sync","watermarks":[…]}`，见下 |
+
+**`sync` 的水位线是数组，不是字段。** 原来是 `lastRowidGroup` / `lastRowidC2c` 两个平铺字段 —— 那等于把
+「哪张表」编码进**字段名**里，加第三张表就必须再加一个字段，消费方得靠约定去配对。现在它是数据：
+
+```json
+{"event":"sync","watermarks":[{"table":"group_msg_table","watermark":{"rowid":12345}},
+                                  {"table":"c2c_msg_table","watermark":{"rowid":678}}]}
+```
+
+- **没有水位的表那一项直接不出现** —— 「还没扫过」与「扫过但没数据」在下游是两件事。
+- **`watermark` 的对象形状与 weflow 不同**：这里是 `{"rowid": N}`，weflow 是
+  `{create_time, local_id, sort_seq}` 三元组。**跨仓库的消费方必须按 `table` 分支**，不能因为
+  字段都叫 `watermark` 就当成同一套语义。
 
 ### 示例
 
@@ -351,7 +364,7 @@ event: ready
 data: {"status":"ok"}
 
 event: sync
-data: {"event":"sync","sessionId":"","sessionType":"","rawid":"","content":"","timestamp":1782864000,"lastRowidGroup":1234567890123,"lastRowidC2c":9876543210987}
+data: {"event":"sync","watermarks":[{"table":"group_msg_table","watermark":{"rowid":12345}},{"table":"c2c_msg_table","watermark":{"rowid":678}}]}
 
 id: 1
 event: message.new

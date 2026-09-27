@@ -117,3 +117,43 @@ fn message_revoke_payload_has_no_media() {
     );
     assert!(v.get("media").is_none(), "撤销事件不该有 media：{v}");
 }
+
+/// `sync` 基线帧：水位线收敛成**数组**。
+///
+/// 这条护栏此前**不存在** —— 改动 sync 的键集在仓库里是静默的。它现在钉住两件事：
+///
+/// 1. 键集是 `event` + `watermarks`，**不再**是扁平结构体里那两个 `lastRowid*` 字段；
+/// 2. 「表 ←→ 水位」是**数据**，不是「字段名 ←→ 表」的约定 —— 加第三张表只需往数组里加一项。
+///
+/// 它由 `serialize_weflow` 里的特判产生，所以这条测试同时是那个特判的回归位置。
+#[test]
+fn sync_payload_is_the_converged_watermark_array() {
+    use qqflow_server::server::handlers::push_events::serialize_for_test;
+    let ev = Event::sync(12345, 678, 1_700_000_000);
+    let (name, v) = serialize_for_test(ev);
+    assert_eq!(name, "sync");
+    assert_eq!(keys_of(&v), ["event", "watermarks"], "sync 的键集是契约：{v}");
+    let wms = v["watermarks"].as_array().expect("watermarks 必须是数组");
+    assert_eq!(wms.len(), 2, "两张表各一项：{v}");
+    assert_eq!(wms[0]["table"], "group_msg_table");
+    assert_eq!(wms[0]["watermark"]["rowid"], 12345);
+    assert_eq!(wms[1]["table"], "c2c_msg_table");
+    assert_eq!(wms[1]["watermark"]["rowid"], 678);
+    // 旧的扁平键**不再出现** —— 这正是这一项要走破坏性发布的原因。
+    assert!(v.get("lastRowidGroup").is_none(), "旧键不得残留：{v}");
+    assert!(v.get("content").is_none(), "基线帧没有正文：{v}");
+}
+
+/// 水位为 `None` 时那**一项直接不出现**，而不是给个 `null` 或 `0`。
+///
+/// 「没有水位」与「水位是 0」在下游是两件事：前者是「还没扫过」，后者是「扫过但没数据」。
+#[test]
+fn sync_omits_tables_without_a_watermark() {
+    use qqflow_server::server::handlers::push_events::serialize_for_test;
+    let mut ev = Event::sync(0, 0, 1_700_000_000);
+    ev.last_rowid_c2c = None;
+    let (_, v) = serialize_for_test(ev);
+    let wms = v["watermarks"].as_array().unwrap();
+    assert_eq!(wms.len(), 1, "只有一张表有水位：{v}");
+    assert_eq!(wms[0]["table"], "group_msg_table");
+}
