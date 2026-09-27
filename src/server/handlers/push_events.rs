@@ -54,8 +54,27 @@ pub async fn handler(
                 .and_then(|s| s.parse::<u64>().ok())
         })
         .unwrap_or(0);
-    let replay = state.history.lock().replay_since(last_id);
 
+    Ok(sse_from(state, last_id, serialize_weflow))
+}
+
+/// 事件的序列化器：把一个总线事件变成一个 SSE 帧（`(事件名, 载荷)`）。
+///
+/// 两个面对同一批事件有**不同的形状要求** —— WeFlow 兼容面发完整消息，ChatLab 面只发元信息
+/// （规范：「ChatLab 不假设事件可靠送达」，通知只负责告诉客户端去拉）。参数化这一处，
+/// 其余（鉴权、重放、保活、滞后重基线、关机）两面对**完全一致**。
+pub(crate) type Serializer = fn(Event) -> (String, serde_json::Value);
+
+/// WeFlow 兼容面的形状：**整个事件原样序列化**（既有客户端在解析它）。
+fn serialize_weflow(ev: Event) -> (String, serde_json::Value) {
+    let name = ev.event.clone();
+    let payload = serde_json::to_value(&ev).unwrap_or_default();
+    (name, payload)
+}
+
+/// 组装 SSE 响应。`serialize` 决定帧的形状，其余部分是两面的公共部分。
+pub(crate) fn sse_from(state: Arc<AppState>, last_id: u64, serialize: Serializer) -> impl IntoResponse {
+    let replay = state.history.lock().replay_since(last_id);
     let rx = state.events.subscribe();
     let (wm_g, wm_c) = {
         let store = state.store.read();
@@ -73,7 +92,8 @@ pub async fn handler(
         yield Ok::<_, std::convert::Infallible>(
             SseEvent::default().event("ready").data("{\"status\":\"ok\"}"),
         );
-        for (id, name, payload) in replay {
+        for (id, ev) in replay {
+            let (name, payload) = serialize(ev);
             yield Ok(SseEvent::default()
                 .id(id.to_string())
                 .event(name)
@@ -82,10 +102,17 @@ pub async fn handler(
         }
         // Connection baseline: current watermarks, so a client that had
         // nothing to replay still knows where it stands.
-        yield Ok(SseEvent::default()
-            .event("sync")
-            .json_data(Event::sync(wm_g, wm_c, now))
-            .unwrap_or_else(|_| SseEvent::default().event("sync").data("{}")));
+        //
+        // **必须走 `serialize`**，不能直接吐 `Event::sync(…)` —— 那样会绕过面的形状：
+        // 通知面的基线要带 `generation`，而这里曾经把老面的载荷原样发出去（新面收到的是
+        // 另一个面的形状，且只在「注销后重放」那条用例里才看得出来）。
+        {
+            let (name, payload) = serialize(Event::sync(wm_g, wm_c, now));
+            yield Ok(SseEvent::default()
+                .event(name)
+                .json_data(payload)
+                .unwrap_or_else(|_| SseEvent::default().event("sync").data("{}")));
+        }
 
         let mut bstream = BroadcastStream::new(rx);
         loop {
@@ -108,17 +135,18 @@ pub async fn handler(
                         let store = lag_state.store.read();
                         (store.watermark_group, store.watermark_c2c)
                     };
-                    let resync = Event::sync(g, c, chrono::Utc::now().timestamp());
+                    // 与连接基线同理：**走 `serialize`**，否则通知面会收到老面的形状。
+                    let (name, payload) =
+                        serialize(Event::sync(g, c, chrono::Utc::now().timestamp()));
                     yield Ok(SseEvent::default()
-                        .event("sync")
-                        .json_data(resync)
+                        .event(name)
+                        .json_data(payload)
                         .unwrap_or_else(|_| SseEvent::default().event("sync").data("{}")));
                     continue;
                 }
             };
-            let name = ev.event.clone();
-            let payload = serde_json::to_value(&ev).unwrap_or_default();
-            let id = history.lock().append(name.clone(), payload.clone());
+            let id = history.lock().append(ev.clone());
+            let (name, payload) = serialize(ev);
             yield Ok(SseEvent::default()
                 .id(id.to_string())
                 .event(name)
@@ -127,6 +155,5 @@ pub async fn handler(
         }
     });
 
-    Ok(Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(25)).text("ping")))
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25)).text("ping"))
 }

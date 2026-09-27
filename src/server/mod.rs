@@ -118,12 +118,35 @@ pub enum BindOutcome {
     Occupied { qq: String, status: AccountStatus },
 }
 
+/// **事件基线代号**：注销账号时递增。
+///
+/// 为什么需要它：注销会清掉重放缓冲里的条目，而**事件 id 计数器保留**（否则新账号的事件 id 会
+/// 从旧客户端已经见过的号段重新开始，它们会以为那些事件已经收过）。于是客户端带着旧的
+/// `Last-Event-ID` 重连时，看到的是一个**空的重放**加**跳号的 id** —— 它无法区分「注销后新账号
+/// 刚开始」与「自己漏收了」。基线里带上代号，客户端一比就知道该丢弃本地状态重新拉。
+///
+/// 进程级而不是每账号：事件总线与重放历史本来就是进程级的。
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 当前的基线代号，见 [`GENERATION`]。
+pub fn current_generation() -> u64 {
+    GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 推进基线代号（注销时调用）。
+pub fn bump_generation() -> u64 {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
 /// One buffered SSE event (WeFlow contract: replay cap 1000, TTL 10 min).
+///
+/// **存的是原始事件，不是序列化后的载荷。** 载荷形状是**视图**的事：两个面对同一个事件有不同的
+/// 形状要求（WeFlow 兼容面发完整消息，ChatLab 面只发元信息）。存序列化结果的话，后加的那个面
+/// 重放时会吐出**另一个面的形状** —— 而且这种错在只连新面时看不出来。
 pub struct HistoryItem {
     pub id: u64,
     pub at: std::time::Instant,
-    pub name: String,
-    pub payload: serde_json::Value,
+    pub event: crate::sync::events::Event,
 }
 
 #[derive(Default)]
@@ -137,13 +160,12 @@ impl HistoryBuf {
     pub const TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
     /// Append an event and return its id (monotonic).
-    pub fn append(&mut self, name: String, payload: serde_json::Value) -> u64 {
+    pub fn append(&mut self, event: crate::sync::events::Event) -> u64 {
         self.last_id += 1;
         self.items.push_back(HistoryItem {
             id: self.last_id,
             at: std::time::Instant::now(),
-            name,
-            payload,
+            event,
         });
         while self.items.len() > Self::MAX {
             self.items.pop_front();
@@ -164,12 +186,14 @@ impl HistoryBuf {
     }
 
     /// Events with id > `since`, still within the TTL window.
-    pub fn replay_since(&self, since: u64) -> Vec<(u64, String, serde_json::Value)> {
+    ///
+    /// 返回**事件本身** —— 由调用它的那个面决定怎么序列化（见 [`HistoryItem`] 的说明）。
+    pub fn replay_since(&self, since: u64) -> Vec<(u64, crate::sync::events::Event)> {
         let now = std::time::Instant::now();
         self.items
             .iter()
             .filter(|i| i.id > since && now.duration_since(i.at) < Self::TTL)
-            .map(|i| (i.id, i.name.clone(), i.payload.clone()))
+            .map(|i| (i.id, i.event.clone()))
             .collect()
     }
 }
@@ -279,6 +303,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/contacts", get(contacts::handler).post(contacts::handler))
         .route("/api/v1/group-members", get(group_members::handler).post(group_members::handler))
         .route("/api/v1/push/messages", get(push_events::handler).post(push_events::handler))
+        // ── ChatLab 适配面（新增，**不改老路由**）──────────────────────────
+        //
+        // 规范把 `baseUrl` 定义为 `/chatlab`。它与 `/api/v1/*` **共用同一份实现与同一条总线**，
+        // 差别只在帧的形状：老面发完整事件，通知面只发元信息。
+        .route(
+            "/chatlab/push/messages",
+            axum::routing::get(chatlab_push::handler),
+        )
         .route("/api/v1/sync", get(sync::handler).post(sync::handler))
         .fallback(unknown_path)
         .method_not_allowed_fallback(method_not_allowed)
@@ -590,6 +622,9 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
         (talkers, had_index)
     };
     state.history.lock().clear_items();
+    // 代号与清条目**同时**推进：客户端据此区分「注销后新账号刚开始」与「自己漏收了」。
+    // 事件 id 计数器**不动** —— 见 `GENERATION` 的说明。
+    bump_generation();
     let _ = state.events.send(Event::sync(0, 0, chrono::Utc::now().timestamp()));
 
     // 4. Reset the account entry. A scanned account reverts to `awaiting_key`
@@ -1145,15 +1180,23 @@ mod tests {
     /// `Last-Event-ID` resumes from event ids, so the counter must survive a
     /// clear. Restarting at 1 would leave a client holding `last-event-id:
     /// 500` receiving nothing until 500 new events had accumulated.
+    /// 造一个只关心 `event` 名的测试事件 —— 缓冲现在存的是**原始事件**（不是序列化后的载荷），
+    /// 所以测试要构造事件而不是 JSON。
+    fn test_event(name: &str) -> Event {
+        let mut ev = Event::sync(1, 2, 1_700_000_000);
+        ev.event = name.to_string();
+        ev
+    }
+
     #[test]
     fn clear_items_drops_events_but_keeps_the_id_counter() {
         let mut h = HistoryBuf::default();
-        assert_eq!(h.append("message.new".into(), serde_json::json!({"a": 1})), 1);
-        assert_eq!(h.append("message.new".into(), serde_json::json!({"a": 2})), 2);
+        assert_eq!(h.append(test_event("message.new")), 1);
+        assert_eq!(h.append(test_event("message.new")), 2);
         assert_eq!(h.replay_since(0).len(), 2);
         h.clear_items();
         assert!(h.replay_since(0).is_empty(), "buffered events are gone");
-        assert_eq!(h.append("sync".into(), serde_json::json!({})), 3, "ids keep climbing");
+        assert_eq!(h.append(test_event("sync")), 3, "ids keep climbing");
     }
 
     #[tokio::test]

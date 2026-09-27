@@ -360,6 +360,30 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 
 ---
 
+### ChatLab 通知面（GET `/chatlab/push/messages`）
+
+规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的**通知通道**。与 `/api/v1/push/messages`
+是**同一条总线、同一套连接机制**（鉴权、`Last-Event-ID` 重放、保活、滞后重基线、关机自收），
+差别只有**帧的形状**：
+
+| | `/api/v1/push/messages` | `/chatlab/push/messages` |
+|---|---|---|
+| 载荷 | 整个事件（含 `content` 与媒体元数据）| **只带标识与时间** |
+| 定位 | WeFlow 兼容面 —— 已有客户端在解析它 | 规范里的通知通道 |
+
+```json
+{ "event": "message.new", "eventId": "…", "platformMessageId": null, "sessionId": "…", "timestamp": 1700000000 }
+```
+
+- **为什么不带正文**：规范对这条通道的定位是「仅通知：ChatLab 不假设 SSE 事件可靠送达」——
+  客户端收到后**去拉**那一页。带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就
+  没有歧义。**契约套件里有一条断言就查这个**（帧里出现 `content` 或 `messages` 即失败）。
+- 基线类事件（`session.sync`）额外带 **`generation`**（注销时递增）：客户端据此区分「注销后新
+  账号刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它，两者在协议上是同一
+  件事。
+- **老面一行未改。**
+
+
 ## 3. 获取消息
 
 > 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）；Body 字段优先于 Query 参数

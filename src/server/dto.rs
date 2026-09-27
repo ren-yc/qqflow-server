@@ -372,3 +372,37 @@ pub struct GroupMember {
     pub remark: String,
     pub wxid: String,
 }
+
+// ── ChatLab 通知帧 ────────────────────────────────────────
+
+/// `/chatlab/push/messages` 的通知帧：**只带元信息，不带正文**。
+///
+/// 规范对这条通道的定位是「仅通知：不假设事件可靠送达」—— 客户端收到后**去拉**那一页。
+/// 带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。
+///
+/// `eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条
+/// 消息在平台上的 id（拉取时用它定位）。撤回事件里 `platformMessageId` 是被撤回那条的 id。
+///
+/// 基线类事件（如 `session.sync`）没有对应的消息，两个 id 都为 `null` —— 它们只告诉客户端
+/// 「水位变了，去拉」。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationFrame {
+    /// 事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：只解析 `data:` 行的客户端
+    /// 也要能分辨类型。
+    pub event: String,
+    /// 事件通道自己的标识；基线事件为 `null`。
+    pub event_id: Option<String>,
+    /// 平台消息 id；取不到时为 `null`（键保留）。
+    pub platform_message_id: Option<String>,
+    /// 所属会话；基线事件也可能带（它属于某个账号）。
+    pub session_id: Option<String>,
+    /// 事件时刻（秒）。
+    pub timestamp: i64,
+    /// **基线事件才有**：事件基线代号，注销时递增。
+    ///
+    /// 客户端据此区分「注销后新账号刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。
+    /// 少了它，这两种情况在协议上是同一件事。消息类事件不带这个键。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
