@@ -88,6 +88,8 @@ pub(crate) async fn respond(
                     message_count: 0,
                     name: s.display_name.clone(),
                     platform: "qq".to_string(),
+                    // 群名册里的人数（私聊没有名册 ⇒ 这个键不出现）。
+                    member_count: store.chatroom_roster.get(&s.username).map(|r| r.len()),
                     r#type: if s.r#type == 2 { "group" } else { "private" }.to_string(),
                 }
             })

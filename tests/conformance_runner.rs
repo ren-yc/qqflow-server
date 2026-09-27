@@ -184,6 +184,9 @@ fn harness_router(
                         // `nt_msg.db` —— 不 materialize 就等于没写。第一版把这两行连同显式同步
                         // 一起删掉了，症状又是「SSE 收不到事件」。
                         common::materialize_source(&nt_db);
+    // 同族库：群名册与群名片住在 `group_info.db` 里（消息库之外）。没有它，`memberCount`
+    // 永远不会出现 —— 而不变量允许缺席，于是那条用例会「通过」却什么都没验。
+    common::write_fake_group_info(&nt_db);
                         // 与 weflow 的 harness 对齐：显式同步一次，让「追加 → 可见 → 广播」
                         // 成为确定的事，而不是等 Watcher 的时序。
                         let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
@@ -308,11 +311,8 @@ async fn conformance_suite_passes() {
             "mediaById": true,
             // 本仓库没有回调面（SNS 是微信侧的），如实置 false。
             "sns": false,
-                        // 本仓库**没有群名册来源**，因此从不发 `memberCount` —— 声明 true 会让用例去验一个
-            // 永远不会出现的东西（不变量允许缺席，于是它「通过」了，但什么都没验）。
-            // 能力声明的用途正是这个：**声明「我们不做这件事」，而不是声明「我们做不到就跳过」。**
-            // 要让它变 true，得先有一个名册来源（weflow 那边的群元数据加载器就是）。
-            "memberCount": false,
+                        // 名册来源是 `group_info.db` 的 `group_member3`（见 `store::group_meta`）。
+            "memberCount": true,
             // Pull 形状的发现面（规范里的 `GET {baseUrl}/sessions`）尚未实现 —— 它是计划里
             // 「ChatLab 适配」那一步的内容。置 false 让相关用例**跳过而不是失败**：契约的
             // 能力机制就是为这种「存在性差异」准备的。实现后翻成 true 即启用。

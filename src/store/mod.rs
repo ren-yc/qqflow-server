@@ -6,6 +6,7 @@
 //! startup into a HashMap index and keep it incrementally updated by the
 //! poller — a single source of truth for both HTTP queries and SSE events.
 
+pub mod group_meta;
 pub mod index;
 pub mod media;
 pub mod media_export;
@@ -96,6 +97,11 @@ pub struct Store {
     /// Display scope is the group the card was seen in (SSE source_name,
     /// chatlab members) — never c2c chats or the global contact lists.
     pub group_cards: HashMap<String, HashMap<String, String>>,
+    /// 群号 → 成员 uid（群名册）。**顺序稳定**（加载时排过序）。
+    ///
+    /// 它是「**我们知道的**成员」，不是「群的确切人数」：来源是本地缓存，可能少于真实值。
+    /// `/chatlab/sessions` 的 `memberCount` 用它 —— 文档里写明这个区别，下游才不会拿它当断言。
+    pub chatroom_roster: HashMap<String, Vec<String>>,
     /// Media lookup: md5 hex / uuid -> local cache file, built from the
     /// structured media metadata at index time. First-wins, but a stale
     /// entry (QQ cleared its cache) is refreshed by a later row with a

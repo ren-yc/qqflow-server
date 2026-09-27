@@ -368,9 +368,14 @@ pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
     conn.execute_batch(
-        "CREATE TABLE group_list (id TEXT PRIMARY KEY, name TEXT, remark TEXT);\
-         INSERT INTO group_list VALUES ('10001', '测试群a', '');\
-         INSERT INTO group_list VALUES ('20002', '第二群', '');",
+        "CREATE TABLE group_list ([60001] INTEGER PRIMARY KEY, [60007] TEXT);\
+         INSERT INTO group_list VALUES (10001, '测试群a');\
+         INSERT INTO group_list VALUES (20002, '第二群');\
+         CREATE TABLE group_member3 ([60001] INTEGER, [1000] TEXT, [64003] TEXT, [20002] TEXT);\
+         INSERT INTO group_member3 VALUES (10001, 'u_a', '张三群名片', '猫毛过敏');\
+         INSERT INTO group_member3 VALUES (10001, 'u_b', '', '嗯啊');\
+         INSERT INTO group_member3 VALUES (10001, 'u_c', '王五名片', 'largefatpig');\
+         INSERT INTO group_member3 VALUES (20002, 'u_a', '', '');",
     )
     .unwrap();
     drop(conn);

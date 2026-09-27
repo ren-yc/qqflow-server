@@ -397,6 +397,8 @@ pub fn build_with(
         key,
         &super::names::KnownKeys::from_store(&st),
     );
+    // 群名册与群名片（另一个库；缺失时全为空，启动照常）。
+    super::group_meta::apply_group_meta(&mut st, super::group_meta::load_group_meta(nt_db_dir, key));
     Ok(st)
 }
 

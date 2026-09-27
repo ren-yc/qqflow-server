@@ -242,6 +242,25 @@ fn fake_db_names_loaded() {
         "王五备注",
         "c2c remark wins over profile nick (no conversation)"
     );
+
+    // 群名册与群名片来自 `group_info.db` 的 `group_member3`（消息库之外）。这里直接调加载器：
+    // 这条测试手工调的是 `load_names`（不是 `build_with`），所以群元数据也得手工调一次。
+    // 服务器走的是 `build_with` —— 它内部按同样的顺序调这两个。
+    let meta = qqflow_server::store::group_meta::load_group_meta(&nt_db, FAKE_KEY);
+    let roster = meta.roster.get("10001").expect("10001 应当有名册（夹具写了 group_member3）");
+    assert_eq!(roster.len(), 3, "夹具写了 3 个成员：{roster:?}");
+    assert!(roster.contains(&"u_a".to_string()), "u_a 在名册里");
+    assert_eq!(meta.member_count("10001"), Some(3), "memberCount 用名册长度");
+    assert_eq!(meta.member_count("99999"), None, "没有名册 ⇒ 没有数字，而不是 0");
+    let cards = meta.cards.get("10001").expect("10001 应当有群名片");
+    assert_eq!(cards.get("u_a").map(String::as_str), Some("张三群名片"));
+    assert_eq!(cards.get("u_c").map(String::as_str), Some("王五名片"));
+    assert_eq!(cards.get("u_b"), None, "空名片不入表（「没有」与「是空串」不是同一件事）");
+    assert_eq!(meta.group_names.get("10001").map(String::as_str), Some("测试群a"));
+    // 灌进 store 之后，会话侧的 `memberCount` 才有来源。
+    // 用上面已经建好的 `store`（`conn` 在 `drop(reader)` 之后已经不能再用 —— 它借着 reader）。
+    qqflow_server::store::group_meta::apply_group_meta(&mut store, meta);
+    assert_eq!(store.chatroom_roster.get("10001").map(Vec::len), Some(3));
 }
 
 /// Structured image rows flow through the whole pipeline: the spec-shaped
@@ -2148,4 +2167,56 @@ fn probe_group_roster_counts() {
     let talkers: Vec<String> = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().flatten().collect();
     let matched = talkers.iter().filter(|t| groups.iter().any(|(g, _)| g.to_string() == **t)).count();
     println!("[小结] 会话里的群 talker {} 个；其中 {} 个在 group_list 里", talkers.len(), matched);
+}
+
+/// `group_list` 的数字列 vs 名册人数：判明哪个是「当前人数」。
+#[test]
+#[ignore]
+fn probe_group_list_numeric_columns() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("root");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("key");
+    let given = Path::new(&root);
+    let nt_db = if given.extension().is_some_and(|x| x == "db") { given.parent().unwrap().to_path_buf() }
+    else if given.join("nt_msg.db").exists() { given.to_path_buf() }
+    else {
+        std::fs::read_dir(given).unwrap().flatten()
+            .map(|e| e.path().join("nt_qq").join("nt_db"))
+            .find(|d| d.join("nt_msg.db").exists()).expect("nt_db")
+    };
+    let mut reader = LiveReader::new(nt_db.join("group_info.db"), key.clone());
+    reader.open().expect("group_info.db");
+    let conn = reader.acquire().unwrap();
+    let cols: Vec<String> = {
+        let s = conn.prepare("SELECT * FROM group_list LIMIT 1").unwrap();
+        s.column_names().iter().map(|x| x.to_string()).collect()
+    };
+    // 名册人数
+    let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    {
+        let mut s = conn.prepare("SELECT [60001], COUNT(*) FROM group_member3 GROUP BY [60001]").unwrap();
+        for r in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))).unwrap().flatten() {
+            counts.insert(r.0, r.1);
+        }
+    }
+    println!("列: {}", cols.join(", "));
+    println!("群号 | 名册人数 | {}", cols.iter().filter(|c| *c != "60001").cloned().collect::<Vec<_>>().join(" | "));
+    for id in [161709383i64, 383701514, 572549239, 1103224045, 1105123028] {
+        let mut vals: Vec<String> = Vec::new();
+        for (i, c) in cols.iter().enumerate() {
+            if c == "60001" { continue }
+            let v: String = conn
+                .query_row(&format!("SELECT [{c}] FROM group_list WHERE [60001] = ?1"), [id], |r| {
+                    Ok(match r.get_ref(0) {
+                        Ok(rusqlite::types::ValueRef::Integer(n)) => n.to_string(),
+                        Ok(rusqlite::types::ValueRef::Text(b)) => String::from_utf8_lossy(b).chars().take(14).collect(),
+                        Ok(rusqlite::types::ValueRef::Null) => "-".into(),
+                        _ => "?".into(),
+                    })
+                })
+                .unwrap_or_else(|_| "?".into());
+            vals.push(v);
+            let _ = i;
+        }
+        println!("{id} | {} | {}", counts.get(&id).copied().unwrap_or(-1), vals.join(" | "));
+    }
 }

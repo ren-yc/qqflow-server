@@ -312,12 +312,28 @@ pub struct Page {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionChatlab {
+    /// 会话在数据源里的唯一标识，可直接用作拉取路径。
     pub id: String,
+    /// 最新消息时间戳（秒）。
     pub last_message_at: i64,
+    /// 消息总数。**恒为 `0`**：本仓库不维护每会话条数。
+    ///
+    /// 键要留着 —— 下游按它排序，缺键与「是 0」在下游不是同一件事。
     pub message_count: i64,
+    /// 会话名称（群名/联系人名）。
     pub name: String,
+    /// 平台标识。
     pub platform: String,
+    /// `group` / `private`。
     pub r#type: String,
+    /// 群成员数 —— **可选**：只有群名册加载得到时才出现（私聊、或名册缺失时不出现这个键）。
+    ///
+    /// **它是「我们知道的成员数」，不是「群的确切人数」**：来源是本地缓存，可能少于真实值。
+    /// 拿它做展示预估可以，拿它做「群里一共几个人」的断言不行。
+    ///
+    /// 「没有名册」与「名册是空的」在下游是两件事：前者不该被读成 0，所以是可选键而不是给 0。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<usize>,
 }
 
 // ── 联系人 ────────────────────────────────────────────────
