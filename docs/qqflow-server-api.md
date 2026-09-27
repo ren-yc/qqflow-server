@@ -360,6 +360,31 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 
 ---
 
+### 接入配方（四阶段，已用真实账号走通）
+
+把 ChatLab 的 `baseUrl` 设为 `http://127.0.0.1:5032/chatlab` 即可。下面是规范的四阶段与每一步
+在本服务上的**实测结果**（真实账号，一个 6321 条的群）：
+
+| 阶段 | 请求 | 实测 |
+|---|---|---|
+| ① 发现 | `GET /chatlab/sessions?limit=50` | 29 个会话（`page.hasMore=false` ⇒ 单页全量）|
+| ② 全量 | `GET /chatlab/sessions/{id}/messages?since=0&limit=500`，用 `sync.nextSince` 续拉 | **6321 条 / 13 页**收敛 |
+| ③ 增量 | `GET …/messages?since={lastPullAt}` | 返回 `since` 之后的增量（实测 321 条）|
+| ④ 通知 | `GET /chatlab/push/messages`（SSE，可选）| 立刻收到 `ready` 基线帧 |
+
+**服务是零账号启动的**（客户端驱动）：先 `POST /api/v1/accounts` 传入 `{qq, key, db_path}`，再轮询
+`GET /api/v1/accounts` 到 `state == "ready"`。在此之前业务端点返回 `503`（`/health` 返回 `starting`），
+这是**有意的** —— 索引没建完确实查不了。
+
+**分页语义**（阶段二的关键）：
+
+- `sync.hasMore` 为真时必须**继续拉**，并把 `sync.nextSince` 原样作为下次的 `since`。
+- `since` 是**排他**下界：用 `nextSince` 续拉不会重复取到边界那一秒，也不会跳过它。
+- 支持 `limit` 分页时 `sync` 块**必须**给（规范：缺了它 ChatLab 不保证自动续拉）。
+
+**`messageCount` 恒为 `0`**：本仓库不维护每会话条数。**键要留着** —— 下游按它排序，缺键与「是 0」
+在下游不是同一件事。`memberCount` **不给**（没有群名册来源），夹具的能力声明与之保持一致。
+
 ### ChatLab 发现面（GET `/chatlab/sessions`）
 
 规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的会话发现入口。与 `/api/v1/sessions`
