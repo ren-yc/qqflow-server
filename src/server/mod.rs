@@ -23,7 +23,7 @@ use crate::db::live::LiveReader;
 use crate::db::scan::DbInfo;
 use crate::sync;
 use crate::sync::Event;
-use crate::store::{index, AppState, Store};
+use crate::store::{index, Store};
 
 /// Per-account readiness state (serialized as-is into the token-protected
 /// `GET /api/v1/accounts`; `/health` reports the coarser [`AccountPhase`]).
@@ -905,6 +905,41 @@ pub async fn run_with_shutdown(
         }
     }
     Ok(())
+}
+
+// `AppState` 从 `store` 搬到这里。它本来就是**服务层**类型：字段引用的是 `AccountState` /
+// `AccountRegistry` / `HistoryBuf`，全在 `server` 里 —— 之前放在 `store` 只是历史原因，
+// 代价是「核心面依赖可选面」（`--no-default-features` 下必须为它加 cfg 才能编译）。
+//
+// 搬家之后那条 cfg 不再需要：它就在 `server` 里，而 `server` 本来就随 feature 门控。
+
+/// Shared application state handed to the HTTP layer and poller tasks.
+#[cfg(feature = "server")]
+pub struct AppState {
+    pub store: Arc<RwLock<Store>>,
+    pub events: tokio::sync::broadcast::Sender<sync::Event>,
+    /// One entry per loaded account: qq number -> readiness state.
+    pub accounts: Arc<RwLock<Vec<crate::server::AccountState>>>,
+    /// True once all account indexes are built.
+    pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Access token (Bearer header / access_token query / POST body).
+    pub token: Arc<String>,
+    /// Per-account sync engines; powers the manual-sync endpoint and the
+    /// change-driven poll tasks.
+    pub sync: Arc<sync::SyncEngine>,
+    /// Client-driven account registry (paths, watch config, shutdown).
+    pub init: crate::server::AccountRegistry,
+    /// Media export root (`media=1` on /api/v1/messages copies here, WeFlow
+    /// exportPath semantics); `--media-export-dir`, default `<data-dir>/api-media`.
+    pub export_root: Arc<std::path::PathBuf>,
+    /// Base URL for exported media links (`http://{host}:{port}`).
+    pub base_url: Arc<String>,
+    /// SSE replay history for Last-Event-ID (1000 items / 10 min TTL).
+    pub history: Arc<parking_lot::Mutex<crate::server::HistoryBuf>>,
+    /// Shutdown broadcast. Live SSE streams subscribe so they can end
+    /// themselves rather than holding the graceful drain open for the whole
+    /// grace period.
+    pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[cfg(test)]

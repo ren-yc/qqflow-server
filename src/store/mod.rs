@@ -13,16 +13,9 @@ pub mod names;
 pub mod query;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 
 use crate::parser::types::{ChatType, MessageRecord};
-// `AppState` 是**服务层**类型（它持有同步引擎与事件总线），只是恰好住在这个模块里。
-// 因此它随 `server` 一起门控：不加这一条，`--no-default-features` 会因为「store 依赖 sync」
-// 而编不过 —— 而那正是「核心面不得依赖可选面」这条边界要拦的东西。
-#[cfg(feature = "server")]
-use crate::sync;
 
 
 /// Key for the conversation map: "g:<groupId>" or "c:<peerUid>".
@@ -203,34 +196,6 @@ impl Store {
     }
 }
 
-/// Shared application state handed to the HTTP layer and poller tasks.
-#[cfg(feature = "server")]
-pub struct AppState {
-    pub store: Arc<RwLock<Store>>,
-    pub events: tokio::sync::broadcast::Sender<sync::Event>,
-    /// One entry per loaded account: qq number -> readiness state.
-    pub accounts: Arc<RwLock<Vec<crate::server::AccountState>>>,
-    /// True once all account indexes are built.
-    pub ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Access token (Bearer header / access_token query / POST body).
-    pub token: Arc<String>,
-    /// Per-account sync engines; powers the manual-sync endpoint and the
-    /// change-driven poll tasks.
-    pub sync: Arc<sync::SyncEngine>,
-    /// Client-driven account registry (paths, watch config, shutdown).
-    pub init: crate::server::AccountRegistry,
-    /// Media export root (`media=1` on /api/v1/messages copies here, WeFlow
-    /// exportPath semantics); `--media-export-dir`, default `<data-dir>/api-media`.
-    pub export_root: Arc<std::path::PathBuf>,
-    /// Base URL for exported media links (`http://{host}:{port}`).
-    pub base_url: Arc<String>,
-    /// SSE replay history for Last-Event-ID (1000 items / 10 min TTL).
-    pub history: Arc<parking_lot::Mutex<crate::server::HistoryBuf>>,
-    /// Shutdown broadcast. Live SSE streams subscribe so they can end
-    /// themselves rather than holding the graceful drain open for the whole
-    /// grace period.
-    pub shutdown: tokio::sync::watch::Sender<bool>,
-}
 
 #[cfg(test)]
 mod tests {

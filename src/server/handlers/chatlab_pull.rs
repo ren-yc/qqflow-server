@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::parser::types::ChatType;
 use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta, PullEnvelope, PullMessage, PullSync};
 use crate::server::error::{ApiError, EnvelopeQuery};
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, parse_time_bound};
 

@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::constant_time_eq;
 use crate::server::error::ApiError;
-use crate::store::AppState;
+use crate::server::AppState;
 
 /// A switch parameter accepted as a JSON bool (POST body transport) or as
 /// `"1"`/`"true"`/`"0"`/`"false"` strings (query-string transport) — the

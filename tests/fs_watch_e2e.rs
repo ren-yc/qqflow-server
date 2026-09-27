@@ -141,7 +141,7 @@ async fn deregister_stops_the_watch_task() {
     let src = nt_db.join("nt_msg.db");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = Arc::new(qqflow_server::store::AppState {
+    let state = Arc::new(qqflow_server::server::AppState {
         store: Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default())),
         events: tokio::sync::broadcast::channel::<Event>(256).0,
         accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),

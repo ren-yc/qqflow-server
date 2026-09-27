@@ -17,7 +17,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use serde::Deserialize;
 
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, media_content_type};
 use crate::server::error::{ApiError, EnvelopeQuery};

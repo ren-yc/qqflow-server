@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::server::dto::{Page, SessionChatlab, SessionNative, SessionsChatlab, SessionsNative};
 use crate::server::error::{ApiError, EnvelopeQuery};
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, merge_body};
 

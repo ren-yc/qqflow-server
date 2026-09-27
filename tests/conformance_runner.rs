@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use qqflow_server::server::{build_router, AccountRegistry};
-use qqflow_server::store::AppState;
+use qqflow_server::server::AppState;
 use qqflow_server::sync::SyncEngine;
 
 const TOKEN: &str = "conformance-runner-token-0123456789";

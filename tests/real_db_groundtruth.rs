@@ -26,7 +26,7 @@ use qqflow_server::db::scan;
 use qqflow_server::parser::types::{seq_to_time, ChatType, MsgType};
 use qqflow_server::server::{build_router, AccountRegistry, AccountState, AccountStatus};
 use qqflow_server::store::query::{query_messages, MessageOut, MessageQuery};
-use qqflow_server::store::AppState;
+use qqflow_server::server::AppState;
 use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
 use tower::ServiceExt;

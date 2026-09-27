@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::server::dto::Contacts;
 use crate::server::error::{ApiError, EnvelopeQuery};
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, merge_body};
 

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::server::error::{ApiError, EnvelopeQuery};
-use crate::store::AppState;
+use crate::server::AppState;
 use crate::sync::events::Event;
 
 use super::authorized;

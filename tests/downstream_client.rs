@@ -30,7 +30,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use parking_lot::RwLock;
 use qqflow_server::server::{build_router, AccountRegistry};
-use qqflow_server::store::AppState;
+use qqflow_server::server::AppState;
 use qqflow_server::sync::SyncEngine;
 use serde_json::{json, Value};
 use tower::ServiceExt;

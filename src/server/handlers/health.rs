@@ -17,7 +17,7 @@ use axum::Json;
 
 use crate::server::dto::Health;
 use crate::server::{bound_account, AccountPhase};
-use crate::store::AppState;
+use crate::server::AppState;
 
 pub async fn handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let status = if state.ready.load(Ordering::SeqCst) { "ok" } else { "starting" };

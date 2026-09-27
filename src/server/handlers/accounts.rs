@@ -33,7 +33,7 @@ use crate::server::{
     begin_indexing, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
     DeregisterOutcome,
 };
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, merge_body, FlexBool};
 

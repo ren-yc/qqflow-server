@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::store::media_export::{self, ExportContext, ExportOptions};
 use crate::store::query::{query_messages, MessageOut, MessageQuery};
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, merge_body, parse_time_bound, FlexBool};
 use crate::server::dto::{

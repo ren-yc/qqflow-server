@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::parser::types::ChatType;
 use crate::server::dto::{GroupMember, GroupMembers};
 use crate::server::error::{ApiError, EnvelopeQuery};
-use crate::store::AppState;
+use crate::server::AppState;
 
 use super::{authorized, merge_body};
 
