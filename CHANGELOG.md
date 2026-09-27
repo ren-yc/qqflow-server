@@ -3,6 +3,39 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-09-27
+
+ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下）。下游需按迁移表逐项核对。
+
+### 破坏性变更
+
+| 变更 | 改了什么 | 怎么迁 | 过渡期 |
+|---|---|---|---|
+| **`end=YYYYMMDD`** | 由「当天 0 点」变「当天 **23:59:59**」 | 若依赖旧语义，改用显式时刻参数 | **不适用** —— 唯一已知下游零影响（实测：只用 `start`）|
+| **SSE `sync` 载荷** | weflow 统一为 `{event,generation,watermarks:[…]}`；qqflow 由平铺的 `lastRowidGroup`/`lastRowidC2c` 收敛为 `{event,watermarks:[{table,watermark}]}` | 订阅者若解析 `sync`，按新形状改 | **不适用** —— 唯一已知下游零影响（实测：显式忽略 `sync`）|
+| **注销后重放** | 清重放条目 ＋ **保留** id 计数器 ＋ 基线带 `generation` | 依赖 `Last-Event-ID` 的下游需处理 `generation`（它区分「换了个账号」与「自己漏收了」）| **不适用** —— 唯一已知下游零影响 |
+| **媒体 URL 去 token** | URL 不再内嵌 `?access_token=` | 旧的 `split("?",1)[0]` 写法**仍兼容**（不报错），可简化 | **不适用** —— 向后兼容 |
+| **`message.new` 媒体字段** | weflow 补一个**过滤后的** `mediaId`（只在导出根下确有文件时出现），`md5` **保留** | 无 —— 纯增量 | **不适用** |
+
+### 新增
+
+- **ChatLab 适配面 `/chatlab/*`**（`baseUrl` 指向 `http://127.0.0.1:PORT/chatlab` 即可）：
+  - `GET /chatlab/sessions` —— Pull 形状的发现面（`keyword` / `limit` / `cursor`）；
+  - `GET /chatlab/sessions/{id}/messages` —— Pull 面；
+  - `GET /chatlab/push/messages` —— **通知面**：只发元信息（`eventId` / `sessionId` / `timestamp` /
+    `platformMessageId?`），**不发消息体**。规范对这条通道的定位是「仅通知，不假设事件可靠送达」，
+    客户端收到后**去拉**那一页。
+  - **老面 `/api/v1/*` 的路由集合与默认语义不变** —— 不关心新能力可以不迁。
+- **SSE 连接建立就发一帧 `sync` 基线**：没有它，客户端在「连上」到「第一次水位变化」之间是盲的。
+- **`generation`**：注销时递增，两个 SSE 面发同一个计数器。
+- **群名册**（读 QQ 的 `group_info.db`）：`/chatlab/sessions` 现在发 `memberCount`（**我们知道的**成员数，
+  本地缓存，可能少于真值），群名片与群昵称也可用了。
+- **接入配方写在 `docs/*-api.md` 里**（四阶段 ＋ 实测数字 ＋ 接入者会踩的坑）。
+
+### 修复
+
+- `mediaId` **只在取得到字节时才通告**（「出现即可取」是承诺，不是尽力而为）。
+
 ## [0.5.1] - 2026-08-28
 
 启动日志补一条账号扫描计数，其余为文档修订。**无接口变更，0.5.0 客户端无需改动。**

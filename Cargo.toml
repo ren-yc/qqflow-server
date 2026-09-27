@@ -1,6 +1,6 @@
 [package]
 name = "qqflow-server"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 description = "Headless HTTP API + SSE service for reading local QQ NT chat records (WeFlow-compatible interface)"
 license = "MIT"
