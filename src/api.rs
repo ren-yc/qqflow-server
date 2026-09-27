@@ -18,8 +18,11 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::parser::types::{ChatType, MessageRecord};
 use crate::store::Store;
+
+// 承诺面放出去的是**数据本身** —— 它们的字段就是契约（嵌入者要读它们）。
+// `Store` **不在**这一列里：它的字段是内部布局，直接放出去等于把每个字段都变成契约。
+pub use crate::parser::types::{ChatType, MessageRecord};
 
 pub use crate::store::{Conversation, NameMaps, conv_key};
 
