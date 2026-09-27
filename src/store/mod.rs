@@ -33,19 +33,27 @@ pub fn conv_key(chat_type: ChatType, talker: &str) -> String {
     }
 }
 
+/// 一个会话（一段聊天）与它的消息。
+///
+/// 从 [`crate::api`] 拿到它时，字段就是契约的一部分 —— 群名片/全局昵称的区分、消息的
+/// 排序依据这类事都写在字段文档里。
 #[derive(Debug, Default)]
 pub struct Conversation {
+    /// 群聊还是私聊。
     pub chat_type: ChatType,
+    /// 对端标识：群聊是群号，私聊是对方 uid。
     pub talker: String,
     /// Display name: group name (from "修改群名" system messages) or peer nickname.
     pub name: String,
     /// Messages ordered by (ts, rowid); `dirty` marks append-only changes
     /// that need a lazy re-sort before querying.
     pub msgs: Vec<MessageRecord>,
+    /// 追加过消息、还没重排（查询前会自动排）。
     pub dirty: bool,
 }
 
 impl Conversation {
+    /// 若有追加，按 `(ts, rowid)` 重排 —— 查询前不必手动调。
     pub fn ensure_sorted(&mut self) {
         if self.dirty {
             self.msgs.sort_by_key(|m| (m.ts, m.rowid));
