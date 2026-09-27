@@ -68,3 +68,35 @@ fn an_embedder_can_read_an_account_without_http() {
     // ⑥ 发送者展示名走的是与群名片不同的优先级链。
     assert_eq!(index.display_sender(ChatType::Group, "10001", "u_a"), "张三群名片");
 }
+
+/// 嵌入者要能**持续跟进**，而不只是读一次。
+///
+/// 这条路是 `api::Sync`：首次全量 → 增量 `poll_once` → `drain_events` → 用 `Index` 读。
+/// 事件走自有队列而不是 tokio 的 `broadcast` —— 调用方不必处理 `Lagged`。
+#[test]
+fn an_embedder_can_follow_updates_without_tokio() {
+    let dir = std::env::temp_dir().join(format!("qqflow_embed_sync_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nt_db = dir.join("nt_db");
+    let (writer, main) = common::open_fake_source(&nt_db, 0);
+
+    // ① 首次全量。
+    let mut sync = api::Sync::open(&main, common::FAKE_KEY, common::FAKE_QQ).expect("首次全量");
+    let before = sync.index().messages(ChatType::Group, "10001").len();
+    assert!(before > 0);
+
+    // ② 往源库追加一条，再轮询 —— 索引里能看到，事件队列里也有提示。
+    common::append_group_row(&writer, 7, "增量新增");
+    common::materialize_source(&nt_db);
+    let new = sync.poll_once().expect("增量轮询");
+    assert_eq!(new, 1, "追加的那条应当被发现");
+    let after = sync.index().messages(ChatType::Group, "10001").len();
+    assert_eq!(after, before + 1, "读到的条数随之增加");
+
+    // 事件是**提示**：拿到它应当去读那一页，而不是把内容当权威。
+    let events = sync.drain_events();
+    assert!(!events.is_empty(), "应当有事件提示");
+    // 取走即消费：再取一次是空的。
+    assert!(sync.drain_events().is_empty(), "事件取走即消费");
+}

@@ -41,7 +41,10 @@ pub struct AccountSync {
     pub qq: String,
     pub reader: Arc<Mutex<LiveReader>>,
     pub store: Arc<RwLock<Store>>,
-    pub tx: broadcast::Sender<Event>,
+    /// 内部事件总线。服务层的 SSE 直接订阅它 —— **这不是承诺面**：它要求调用方用 tokio 的
+    /// `broadcast` 并处理 `RecvError::Lagged`，而嵌入者不该被绑到这两件事上（见
+    /// [`crate::api::Sync::drain_events`]）。
+    pub(crate) tx: broadcast::Sender<Event>,
     /// Set when a sync failed; the poll loop then retries even though the
     /// reader state is unchanged.
     retry: AtomicBool,

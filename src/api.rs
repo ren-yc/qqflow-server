@@ -136,3 +136,116 @@ impl Index {
             .unwrap_or_default()
     }
 }
+
+/// 增量同步的嵌入者视图（需要 `sync` feature）。
+///
+/// ## 为什么不是直接给出 `sync::AccountSync`
+///
+/// 那个类型带 `pub` 的 `reader` / `store` / `tx` 字段（内部模块要写它们）—— 放出去等于把索引的
+/// 内部布局与「事件总线是 broadcast」都变成契约，而这正是承诺面要避免的。
+///
+/// 这里只留嵌入者**驱动更新**所需的那几样，而且事件走 [`Sync::drain_events`] 而不是 tokio 的
+/// `broadcast` —— 后者要求调用方处理 `RecvError::Lagged`，那是实现细节。
+///
+/// ## 典型用法
+///
+/// ```no_run
+/// use std::path::Path;
+/// use std::time::Duration;
+/// use qqflow_server::api;
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let db = Path::new("/path/to/<qq>/nt_qq/nt_db/nt_msg.db");
+/// let mut sync = api::Sync::open(db, "<key>", "<qq>")?;   // 首次全量
+/// loop {
+///     std::thread::sleep(Duration::from_secs(1));
+///     sync.poll_once()?;                    // 增量
+///     for ev in sync.drain_events() {       // 事件是**提示**，不是数据
+///         let _ = ev;
+///     }
+///     let _ = sync.index().conversations();  // 读
+/// }
+/// # }
+/// ```
+#[cfg(feature = "sync")]
+pub struct Sync {
+    inner: crate::sync::AccountSync,
+    store: Arc<RwLock<Store>>,
+    rx: tokio::sync::broadcast::Receiver<crate::sync::Event>,
+}
+
+#[cfg(feature = "sync")]
+impl Sync {
+    /// 建索引并返回一个可继续增量的句柄。**同步**：真实账号是秒级到十几秒。
+    ///
+    /// `qq` 是账号号（同步引擎用它做注册键），`db_path` 是 `nt_msg.db` **文件**。
+    /// 与 [`open`] 的区别是它**留着**同步引擎 —— 想「一次读完就走」的用 [`open`]，想持续跟进的
+    /// 用这个。
+    pub fn open(
+        db_path: &std::path::Path,
+        key: &str,
+        qq: &str,
+    ) -> anyhow::Result<Self> {
+        let db_dir = db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        // 与 `api::open` 走**同一段**（含 QQ 自有的头偏移那一步）—— 只是这里留着 reader，
+        // 因为后面还要靠它做增量。
+        let (reader, st) = crate::store::index::open_reader_and_build(db_path, key)?;
+        let store = Arc::new(RwLock::new(st));
+        let (tx, rx) = tokio::sync::broadcast::channel(1024);
+        let inner = crate::sync::AccountSync::new(
+            qq.to_string(),
+            Arc::new(parking_lot::Mutex::new(reader)),
+            store.clone(),
+            tx,
+            db_path.to_path_buf(),
+            db_dir,
+            key.to_string(),
+        );
+        Ok(Self { inner, store, rx })
+    }
+
+    /// 读当前索引。与 [`Sync`] 共享同一份数据，`poll_once` 之后立刻可见。
+    pub fn index(&self) -> Index {
+        Index::new(self.store.clone())
+    }
+
+    /// 跑一轮增量，返回**新增消息条数**。
+    ///
+    /// 没有变化时是廉价的（只比对库文件的时间戳）。**由调用方决定节奏** —— 本 crate 不替你起
+    /// 后台线程，因为「多久轮一次」取决于你要多快看到新消息，而那只有你知道。
+    pub fn poll_once(&self) -> anyhow::Result<usize> {
+        Ok(self.inner.poll_once()?.len())
+    }
+
+    /// 取走自上次调用以来积压的事件（按发生顺序）。
+    ///
+    /// 嵌入者用它消费增量，**不需要**接触 tokio 的 `broadcast`，也不需要处理 `Lagged`：队列满
+    /// 了就丢最旧的，返回的就是还在的那些。与「读游标」相比，它不需要调用方维护任何状态 ——
+    /// 取走即消费。
+    ///
+    /// **代价**：事件不保证送达（队列有界、服务会重启），所以调用方应当把它当**提示**：收到
+    /// 新消息事件就去读那一页，而不是把事件内容当权威。规范对事件通道也是这个定位。
+    ///
+    /// 为什么不是 `&self`：它要动接收端的游标。
+    pub fn drain_events(&mut self) -> Vec<crate::sync::Event> {
+        let mut out = Vec::new();
+        loop {
+            match self.rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                // `Lagged` 说明调用方太慢，中间的事件已被丢弃 —— 剩下的仍然取走。
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+}
+
+// 事件类型属于承诺面：嵌入者要能读它的字段才用得上 `drain_events`。
+#[cfg(feature = "sync")]
+pub use crate::sync::Event;
+#[cfg(feature = "sync")]
+pub use crate::sync::events::PushMedia;

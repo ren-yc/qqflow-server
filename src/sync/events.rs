@@ -25,18 +25,25 @@ use crate::parser::types::{ChatType, MediaInfo};
 #[serde(rename_all = "camelCase")]
 pub struct PushMedia {
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 文件 uuid（QQ 的媒体标识之一）。
     pub uuid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 原文件的 md5；取不到时为 `None`。
     pub md5: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 建议的文件名，可直接用于导出路径的最后一段。
     pub file_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 字节数。
     pub size: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 像素宽（图片/视频）。
     pub width: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 像素高（图片/视频）。
     pub height: Option<i32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// CDN 地址（原图/缩略图）。
     pub urls: Vec<String>,
 }
 
@@ -56,18 +63,31 @@ impl From<&MediaInfo> for PushMedia {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+/// 推送给订阅者的事件。
+///
+/// **事件是提示，不是数据。** 它不保证送达（队列有界、服务会重启），也不保证顺序完整 ——
+/// 收到「有新消息」的正确反应是**去读那一页**，而不是把事件内容当权威。
 pub struct Event {
+    /// 事件名（`message.new` / `message.revoke` / `session.sync` …）。
     pub event: String,
+    /// 所属会话：群聊是群号，私聊是对方 uid。
     pub session_id: String,
+    /// 会话类型（`group` / `private`），与 HTTP 面的取值一致。
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 群名；私聊或取不到时为 `None`。
     pub group_name: Option<String>,
+    /// 消息的平台 id —— 撤回事件里它是**被撤回那条**的 id。
     pub rawid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 发送者头像地址；没有时为 `None`。
     pub avatar_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 发送者展示名（群里优先用群名片）。
     pub source_name: Option<String>,
+    /// 消息正文（或 `[图片]` 一类的占位）。
     pub content: String,
+    /// 事件时刻（秒）。
     pub timestamp: i64,
     /// Structured media metadata for image/voice/video messages — a
     /// serialization view WITHOUT the raw QQ cache path (see [`PushMedia`]).
@@ -80,12 +100,15 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// `session.sync` 事件带的水位线：群表已索引到的 rowid。
     pub last_rowid_group: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// 同上，私聊表。
     pub last_rowid_c2c: Option<i64>,
 }
 
 impl Event {
+    /// 造一条「新消息」事件。
     #[allow(clippy::too_many_arguments)] // one constructor per event kind
     pub fn message_new(
         chat_type: ChatType,

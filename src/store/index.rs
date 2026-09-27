@@ -388,21 +388,37 @@ pub fn build_with(
     Ok(st)
 }
 
-/// 打开账号库、上密钥、建全量索引 —— **嵌入者的入口**。
+/// 打开账号库并建全量索引，**把 reader 一并交回**。
+///
+/// 分成这一层是因为两种用法都要它、但结局不同：一次读完就走（[`open_and_build`]）拿到索引后
+/// 就把连接放掉；要持续增量的（`api::Sync`）得留着连接。**中间那段不许各写一遍** —— 它包含
+/// 「QQ 自有的头偏移」这个全部要点，抄一份就多一份会漂移的实现。
+pub fn open_reader_and_build(
+    db_path: &std::path::Path,
+    key: &str,
+) -> anyhow::Result<(crate::db::live::LiveReader, Store)> {
+    let mut reader = crate::db::live::LiveReader::new(db_path.to_path_buf(), key.to_string());
+    reader.open()?;
+    let nt_db_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let st = {
+        let conn = reader.acquire()?;
+        build_with(conn, nt_db_dir, key)?
+    };
+    Ok((reader, st))
+}
+
+/// 打开账号库、上密钥、建全量索引 —— **一次读完就走**的入口。
 ///
 /// `db_path` 是 `nt_msg.db` **文件**（不是目录）：本仓库的库带 QQ 自有的明文头偏移，由自定义
 /// VFS 处理，所以必须经 [`crate::db::live::LiveReader`] 打开，不能裸 `Connection::open`。
 ///
-/// 服务层不走这里 —— 它建完之后还要留着那条连接做增量，所以直接用 [`build_with`]。
+/// 要持续增量的用 [`open_reader_and_build`]（`api::Sync` 走那条）。
 pub fn open_and_build(
     db_path: &std::path::Path,
     key: &str,
 ) -> anyhow::Result<Store> {
-    let mut reader = crate::db::live::LiveReader::new(db_path.to_path_buf(), key.to_string());
-    reader.open()?;
-    let conn = reader.acquire()?;
-    let nt_db_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    build_with(conn, nt_db_dir, key)
+    let (_reader, st) = open_reader_and_build(db_path, key)?;
+    Ok(st)
 }
 pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> Result<Store> {
     let mut store = Store {
