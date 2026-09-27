@@ -214,10 +214,13 @@ impl ParsedMessage {
 /// A single chat record (row from group_msg_table / c2c_msg_table).
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
+    /// 库内自增行号，同一 `ts` 下的最终定序依据。
     pub rowid: i64,
     /// Column "40001": message seq (high 32 bits carry the unix timestamp).
     pub seq: i64,
+    /// 发送时刻（秒）。
     pub ts: i64,
+    /// 群聊还是私聊 —— 它决定 `talker` 该按群号还是 uid 解读。
     pub chat_type: ChatType,
     /// Group: group id ("40021"); c2c: peer uid ("40020").
     pub talker: String,
@@ -243,25 +246,38 @@ pub struct MessageRecord {
     /// Column "40850": inner number of the message this one replies to.
     /// `None` when the column is absent, or zero (= no reply / not applicable).
     pub reply_inner_seq: Option<i64>,
+    /// 解析后的内容视图（正文、媒体、引用、撤回）。
     pub parsed: ParsedMessage,
 }
 
+/// 这段聊天是群还是私聊。
+///
+/// 它同时决定 `talker` 该怎么解读（群号 vs uid），以及群名片**是否**参与展示 —— 名片只在
+/// 群里有意义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatType {
+    /// 群聊：`talker` 是群号。
     #[default]
     Group,
+    /// 私聊：`talker` 是对方 uid。
     C2c,
 }
 
 impl ChatType {
-    /// WeFlow session `type`: 2 = group, 1 = private.
+    /// WeFlow 会话 `type` 的取值：**2 = 群，1 = 私聊**。
+    ///
+    /// 与 [`ChatType::as_str`] **不是同一套编号**：那个是字符串形式，这个是给 WeFlow 兼容面用的数字。
     pub fn weflow_code(self) -> i64 {
         match self {
             ChatType::Group => 2,
             ChatType::C2c => 1,
         }
     }
+    /// 稳定的字符串形式（`group` / `private`）—— 与 JSON 编码一致，可直接进日志或比较。
+    ///
+    /// 它是**排序与去重**的依据（[`crate::api::Index::conversations`] 就按它排），所以这几个值
+    /// 属于对外契约。
     pub fn as_str(self) -> &'static str {
         match self {
             ChatType::Group => "group",
