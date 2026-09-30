@@ -1,0 +1,19 @@
+{
+  "body": {
+    "index_cleared": false,
+    "purged_dirs": 0,
+    "purged_media": false,
+    "qq": "10001",
+    "state": "not_registered",
+    "success": true
+  },
+  "keys": [
+    "index_cleared",
+    "purged_dirs",
+    "purged_media",
+    "qq",
+    "state",
+    "success"
+  ],
+  "status": 200
+}

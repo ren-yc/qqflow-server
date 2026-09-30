@@ -136,6 +136,9 @@ pub struct AccountQqMismatch {
 ///
 /// 消息项直接复用 `store::query::MessageOut` —— 它已经是类型化定义，条件键也已用
 /// `skip_serializing_if` 表达，不另建平行 struct（两份迟早漂移）。
+///
+/// `media=1` 导出**本页**消息的媒体文件，页大小受 `limit` 约束（默认 100、上限 10000）——
+/// 这个闸门必须留在描述里：下游只能靠它规划分批策略，而它此前只存在于散文文档。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesNative {

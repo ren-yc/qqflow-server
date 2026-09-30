@@ -63,6 +63,9 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
   处理，而不是当成「所有字段都可能存在」。
 - **描述随 DTO 变**。改 DTO 就会改它；`tests/openapi.rs` 保证描述自身自洽（每个 `$ref` 都能
   解析、operationId 唯一、多形状确实用 `oneOf`），golden 快照保证它的变更有人看过。
+- **字节面与 SSE 面如实标注媒体类型**：媒体路由是 `application/octet-stream`（binary），
+  推送面是 `text/event-stream`；端点级 `description` 携带各面的对外闸门（limit 默认/上限、
+  单页 5000、重放缓冲 1000 条/600 秒等）——生成的客户端不必再翻散文文档找这些数字。
 
 错误响应（401/404/405/400 等）**不在描述里**：它们是跨端点的统一信封，见上文「鉴权规范」后的
 错误信封说明。

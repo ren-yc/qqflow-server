@@ -2075,6 +2075,9 @@ mod golden {
             ("messages-chatlab", "GET", format!("/api/v1/messages?talker=10001&limit=50&chatlab=1&access_token={t}"), None),
             ("messages-media", "GET", format!("/api/v1/messages?talker=10001&limit=50&media=1&access_token={t}"), None),
             ("pull", "GET", format!("/api/v1/sessions/10001/messages?limit=50&access_token={t}"), None),
+            // ---- ChatLab 适配面（与老面共用实现，但它是独立路由，各钉各的快照）----
+            ("chatlab-sessions", "GET", format!("/chatlab/sessions?access_token={t}"), None),
+            ("chatlab-pull", "GET", format!("/chatlab/sessions/10001/messages?limit=50&access_token={t}"), None),
             ("contacts", "GET", format!("/api/v1/contacts?access_token={t}"), None),
             (
                 "group-members",
@@ -2125,6 +2128,15 @@ mod golden {
                 "accounts-deregister",
                 "POST",
                 format!("/api/v1/accounts/10001/deregister?access_token={t}"),
+                None,
+            ),
+            // 注销之后再走 DELETE 别名：状态确定（账号已不在），快照记的是「注销一个不存在账号」
+            // 的信封。字节面（/api/v1/media/*）与 SSE 面（/api/v1/push/*）不是 JSON，进不了这份
+            // 清单——它们的描述缺口由 src/server/openapi.rs 的端点表兜住。
+            (
+                "accounts-delete",
+                "DELETE",
+                format!("/api/v1/accounts/10001?access_token={t}"),
                 None,
             ),
         ]
