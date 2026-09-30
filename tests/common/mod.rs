@@ -367,10 +367,17 @@ pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
     let _ = std::fs::remove_file(&path);
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
+    // 群主表：夹具造得与真库同形（`group_detail_info_ver1.[60001]` 群号 → `[60002]` 群主 uid，
+    // 列名与类型照抄真库的最小可用子集）。两个群各设一名群主，且**群主必须在该群的发言者集合里**
+    // —— group-members 面返回的是发言者，群主缺席时 isOwner 全为 false，
+    // 「每群恰一个 true」这条断言在夹具路径上就验不了。10001 的 u_b、20002 的 u_a 都在下面的群消息里发言。
     conn.execute_batch(
         "CREATE TABLE group_list ([60001] INTEGER PRIMARY KEY, [60007] TEXT);\
          INSERT INTO group_list VALUES (10001, '测试群a');\
          INSERT INTO group_list VALUES (20002, '第二群');\
+         CREATE TABLE group_detail_info_ver1 ([60001] INTEGER PRIMARY KEY, [60002] TEXT);\
+         INSERT INTO group_detail_info_ver1 VALUES (10001, 'u_b');\
+         INSERT INTO group_detail_info_ver1 VALUES (20002, 'u_a');\
          CREATE TABLE group_member3 ([60001] INTEGER, [1000] TEXT, [64003] TEXT, [20002] TEXT);\
          INSERT INTO group_member3 VALUES (10001, 'u_a', '张三群名片', '猫毛过敏');\
          INSERT INTO group_member3 VALUES (10001, 'u_b', '', '嗯啊');\

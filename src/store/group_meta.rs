@@ -1,10 +1,18 @@
 //! 群元数据加载器：读同族库 `group_info.db`，填群名册与群名片。
 //!
 //! 与消息库**分属不同文件**，所以要单独打开一次（同样带 QQ 自有的头偏移与 SQLCipher）。
-//! 两张表：
+//! 三张表：
 //!
 //! - `group_member3`：`60001` 群号 → `1000` 成员 uid，另带 `64003` 群名片、`20002` 群昵称、`1002` QQ 号；
-//! - `group_list`：`60001` 群号 → `60007` 群名。
+//! - `group_list`：`60001` 群号 → `60007` 群名；
+//! - `group_detail_info_ver1`：`60001` 群号 → `60002` **群主 uid**。
+//!
+//! 群主列的判据（真库探针实测，见 `tests/real_db_groundtruth.rs` 的
+//! `probe_group_owner_candidates`）：`[60002]` 共 29 行、23 个不同值——**不是**「本人」
+//! （那会是 1 个值）；每个群在**自己的名册内恰有一个**命中（29/29 群，命中分布 `(1, 29)`）
+//! ——这是群主的形状。两个落选候选也留痕：`group_list` 无群主列（`60026` 全 NULL、
+//! `60267` 与名册零命中）；`group_member3.[64002]` 是管理员形状（29 行、仅 11 群有），
+//! 不是「每群恰一」，不能当群主用。
 //!
 //! **群昵称是「每个群各自一份」的** —— 同一个人在不同群的昵称不同。所以它跟名片放在一起
 //! （按会话隔离），**不进全局的 uid 昵称表**：那会把某一个群的称呼泄漏到私聊、联系人与推送里。
@@ -29,6 +37,9 @@ pub struct GroupMeta {
     pub cards: HashMap<String, HashMap<String, String>>,
     /// 成员 uid → QQ 号（`1002`）。
     pub member_qq: HashMap<String, String>,
+    /// 群号 → 群主 uid（源 `group_detail_info_ver1.[60002]`）。缺表/缺库时为空，
+    /// 调用方据此让 `isOwner` 全为 `false` —— 降级是常态，不是错误。
+    pub owners: HashMap<String, String>,
 }
 
 impl GroupMeta {
@@ -110,12 +121,25 @@ pub fn load_group_meta(nt_db_dir: &Path, key: &str) -> GroupMeta {
         }
     }
 
+    // 群主（`group_detail_info_ver1.[60002]`）。判据与两个落选候选见模块头注释。
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT [60001], [60002] FROM group_detail_info_ver1 \
+         WHERE [60002] IS NOT NULL AND [60002] <> ''",
+    ) && let Ok(rows) = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    }) {
+        for (group, uid) in rows.flatten() {
+            out.owners.insert(group.to_string(), uid);
+        }
+    }
+
     tracing::debug!(
-        "[group-meta] 群 {} 个；有名册的 {} 个；名片 {} 条；成员 QQ {} 条",
+        "[group-meta] 群 {} 个；有名册的 {} 个；名片 {} 条；成员 QQ {} 条；有群主的 {} 个",
         out.group_names.len(),
         out.roster.len(),
         out.cards.values().map(|m| m.len()).sum::<usize>(),
-        out.member_qq.len()
+        out.member_qq.len(),
+        out.owners.len()
     );
     out
 }
@@ -139,5 +163,8 @@ pub fn apply_group_meta(store: &mut Store, meta: GroupMeta) {
     }
     for (uid, qq) in meta.member_qq {
         store.names.uid_qq.entry(uid).or_insert(qq);
+    }
+    for (group, owner) in meta.owners {
+        store.chatroom_owner.insert(group, owner);
     }
 }

@@ -380,6 +380,8 @@ pub struct GroupMember {
     pub display_name: String,
     pub group_nickname: String,
     pub is_friend: bool,
+    /// 群主标记：由 `group_detail_info_ver1.[60002]` 解析，**每群恰一个 `true`**；
+    /// 群主不在本页（发言者集合）或缺群主数据时全为 `false`。键恒保留。
     pub is_owner: bool,
     /// **条件键**：只有请求带 `includeMessageCounts=1` 时才出现 —— 不是 `0`，是**没有这个
     /// 键**。客户端据「键在不在」判断自己拿到的是计数还是占位，恒出现会让这个判据失效。

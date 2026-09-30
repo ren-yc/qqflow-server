@@ -438,6 +438,7 @@
               "type": "boolean"
             },
             "isOwner": {
+              "description": "群主标记：由 `group_detail_info_ver1.[60002]` 解析，**每群恰一个 `true`**；\n群主不在本页（发言者集合）或缺群主数据时全为 `false`。键恒保留。",
               "type": "boolean"
             },
             "messageCount": {
@@ -1871,6 +1872,7 @@
     "isFriend",
     "type",
     "isOwner",
+    "description",
     "type",
     "messageCount",
     "description",

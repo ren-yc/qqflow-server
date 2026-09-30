@@ -933,7 +933,9 @@ GET /api/v1/group-members
 - `members[].displayName` / `members[].nickname`（该群消息内首见昵称）；`members[].groupNickname`（本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID）
 - `members[].remark`（来自 `profile_info.db` 的 `20009`；未设置备注的成员为空串）
 - `members[].alias` / `members[].avatarUrl`（v1 恒为空串）
-- `members[].isOwner` / `members[].isFriend`（v1 恒为 `false`）
+- `members[].isOwner`（群主标记：由 `group_info.db::group_detail_info_ver1.[60002]` 解析——
+  **每群恰一个 `true`**；群主不在本页、或缺 `group_info.db`/该表时全为 `false`，键恒保留）
+- `members[].isFriend`（v1 恒为 `false`）
 - `members[].messageCount`（仅 `includeMessageCounts=1` 时返回）
 
 ---

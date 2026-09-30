@@ -444,15 +444,23 @@ async fn downstream_client_real_db() {
             assert!(v["updatedAt"].is_number());
             let members = v["members"].as_array().unwrap();
             assert!(!members.is_empty(), "group conversation must have members");
+            let mut owners = 0usize;
             for m in members {
                 assert!(m["wxid"].is_string());
                 assert!(m["displayName"].is_string());
                 assert!(m["groupNickname"].is_string());
                 assert!(m["messageCount"].is_number(), "includeMessageCounts=1");
-                assert_eq!(m["isOwner"], false);
+                assert!(m["isOwner"].is_boolean());
+                if m["isOwner"].as_bool().unwrap_or(false) {
+                    owners += 1;
+                }
                 assert_eq!(m["isFriend"], false);
             }
-            println!("[CLIENT] group-members({gid}): {} rows", members.len());
+            // 夹具的两个群各设一名群主、且群主都在发言者集合里 —— 新契约：每群恰一个 true。
+            // 降级路径（没有群主数据 ⇒ 全 false）由 api_smoke 的 group-members 快照覆盖：
+            // 它的夹具手工构造 store、不带群主数据，那两份快照钉的正是降级形态。
+            assert_eq!(owners, 1, "群主必须在成员表里，且每群恰有一个");
+            println!("[CLIENT] group-members({gid}): {} rows, {owners} owner", members.len());
 
             // POST transport, `talker` alias for chatroomId.
             let (s, v) = client_post(

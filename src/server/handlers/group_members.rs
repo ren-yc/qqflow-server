@@ -93,7 +93,12 @@ pub async fn handler(
                 display_name: nick.clone(),
                 group_nickname: group_nick,
                 is_friend: false,
-                is_owner: false,
+                // 群主：本群恰一个 true（群主不在发言者集合、或缺群主数据时全 false）。
+                // 判据与真库实测见 `store::group_meta` 模块头注释。
+                is_owner: store
+                    .chatroom_owner
+                    .get(room)
+                    .is_some_and(|owner| owner == uid),
                 message_count: with_counts.then(|| counts.get(uid).copied().unwrap_or(0)),
                 nickname: nick,
                 remark,

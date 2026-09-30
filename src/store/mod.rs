@@ -102,6 +102,10 @@ pub struct Store {
     /// 它是「**我们知道的**成员」，不是「群的确切人数」：来源是本地缓存，可能少于真实值。
     /// `/chatlab/sessions` 的 `memberCount` 用它 —— 文档里写明这个区别，下游才不会拿它当断言。
     pub chatroom_roster: HashMap<String, Vec<String>>,
+    /// 群号 → 群主 uid（源 `group_detail_info_ver1.[60002]`，判据见 `group_meta` 模块头）。
+    ///
+    /// 缺 `group_info.db` / 缺该表时为空 —— `isOwner` 随之全 `false`，降级是常态不是错误。
+    pub chatroom_owner: HashMap<String, String>,
     /// Media lookup: md5 hex / uuid -> local cache file, built from the
     /// structured media metadata at index time. First-wins, but a stale
     /// entry (QQ cleared its cache) is refreshed by a later row with a

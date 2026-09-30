@@ -257,10 +257,27 @@ fn fake_db_names_loaded() {
     assert_eq!(cards.get("u_c").map(String::as_str), Some("王五名片"));
     assert_eq!(cards.get("u_b"), None, "空名片不入表（「没有」与「是空串」不是同一件事）");
     assert_eq!(meta.group_names.get("10001").map(String::as_str), Some("测试群a"));
+    // 群主同样从真表读：`group_detail_info_ver1.[60002]`（判据与真库实测见模块头注释）。
+    assert_eq!(
+        meta.owners.get("10001").map(String::as_str),
+        Some("u_b"),
+        "群主来自 group_detail_info_ver1.[60002]"
+    );
+    assert_eq!(meta.owners.get("20002").map(String::as_str), Some("u_a"));
+    assert_eq!(
+        meta.owners.get("99999"),
+        None,
+        "没有群主数据的群 ⇒ None（isOwner 全 false，而不是错值）"
+    );
     // 灌进 store 之后，会话侧的 `memberCount` 才有来源。
     // 用上面已经建好的 `store`（`conn` 在 `drop(reader)` 之后已经不能再用 —— 它借着 reader）。
     qqflow_server::store::group_meta::apply_group_meta(&mut store, meta);
     assert_eq!(store.chatroom_roster.get("10001").map(Vec::len), Some(3));
+    assert_eq!(
+        store.chatroom_owner.get("10001").map(String::as_str),
+        Some("u_b"),
+        "apply 之后 handler 才取得到群主"
+    );
 }
 
 /// Structured image rows flow through the whole pipeline: the spec-shaped
@@ -2220,3 +2237,182 @@ fn probe_group_list_numeric_columns() {
         println!("{id} | {} | {}", counts.get(&id).copied().unwrap_or(-1), vals.join(" | "));
     }
 }
+
+/// `group_info.db` 的**列结构**调研（只打印表结构与行数——按探针纪律，不打印任何行值）。
+///
+/// 动机：群成员项的 `isOwner` 要接真实数据，先确认群主信息是否存在于本仓已读的库里；
+/// 若不存在，就如实登记为「本仓无数据源」，而不是硬造一个恒 `false` 的字段继续对下游撒谎。
+/// 用法与其它真库探针一致（`#[ignore]` ＋ 环境变量门控）：
+///   QQFLOW_TEST_DB_ROOT  QQFLOW_TEST_DB_KEY
+#[test]
+#[ignore]
+fn probe_group_info_schema_only() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("root");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("key");
+    let given = Path::new(&root);
+    let nt_db = if given.extension().is_some_and(|x| x == "db") {
+        given.parent().unwrap().to_path_buf()
+    } else if given.join("nt_msg.db").exists() {
+        given.to_path_buf()
+    } else {
+        std::fs::read_dir(given)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().join("nt_qq").join("nt_db"))
+            .find(|d| d.join("nt_msg.db").exists())
+            .expect("找到 nt_db")
+    };
+    let mut reader = LiveReader::new(nt_db.join("group_info.db"), key);
+    reader.open().expect("打开 group_info.db");
+    let conn = reader.acquire().unwrap();
+    let tables: Vec<(String, Option<String>)> = {
+        let mut stmt = conn
+            .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect()
+    };
+    println!("[schema] group_info.db 共 {} 张表（只列结构与计数）", tables.len());
+    for (name, sql) in &tables {
+        println!("=== {name} ===");
+        if let Some(s) = sql {
+            println!("{s}");
+        }
+        let n: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| r.get(0))
+            .unwrap_or(-1);
+        println!("-- {n} 行");
+    }
+}
+
+/// 群主候选列的**聚合统计**（只输出计数与枚举分布——不输出任何 uid、群名等标识）。
+///
+/// 承接 `probe_group_info_schema_only`：结构里没有直书 owner 的列，这里用三类统计消歧——
+/// ① 候选 TEXT 列是否 uid 形态（纯数字且长度 ≥9）；
+/// ② 该 uid 是否落在**本群名册**内（群主必在名册，故「每群恰 1 个命中」是群主的形状）；
+/// ③ `group_member3.[64002]` 若是角色类枚举，应呈现「每群至多若干行」的分布。
+/// 若三类都拼不出「每群恰一」的形状，就如实登记为本仓无数据源。
+///
+/// **实测结论（本机真库，2026-09-27）**：`group_detail_info_ver1.[60002]` 29 行 / 23 个不同值
+/// （排除「本人」假设），名册命中分布 `(1, 29)` —— 每群恰一 ⇒ 判为群主，已接线
+///（`store::group_meta` 模块头有同款留痕）。落选：`group_list.60026` 全 NULL、`60267` 零命中；
+/// `[64002]` 呈管理员形状（29 行、仅 11 群），不满足「每群恰一」。
+/// 用法与其它真库探针一致（`#[ignore]` ＋ 环境变量门控）：
+///   QQFLOW_TEST_DB_ROOT  QQFLOW_TEST_DB_KEY
+#[test]
+#[ignore]
+fn probe_group_owner_candidates() {
+    let root = std::env::var("QQFLOW_TEST_DB_ROOT").expect("root");
+    let key = std::env::var("QQFLOW_TEST_DB_KEY").expect("key");
+    let given = Path::new(&root);
+    let nt_db = if given.extension().is_some_and(|x| x == "db") {
+        given.parent().unwrap().to_path_buf()
+    } else if given.join("nt_msg.db").exists() {
+        given.to_path_buf()
+    } else {
+        std::fs::read_dir(given)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().join("nt_qq").join("nt_db"))
+            .find(|d| d.join("nt_msg.db").exists())
+            .expect("找到 nt_db")
+    };
+    let mut reader = LiveReader::new(nt_db.join("group_info.db"), key);
+    reader.open().expect("打开 group_info.db");
+    let conn = reader.acquire().unwrap();
+
+    // 表名清单（结构级信息）。
+    let names: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .flatten()
+            .collect()
+    };
+    println!("[tables] {}", names.join(", "));
+
+    // ① uid 形态计数：纯数字、长度 ≥9、非空。
+    for (table, col) in [
+        ("group_list", "60026"),
+        ("group_list", "60267"),
+        ("group_detail_info_ver1", "60002"),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*), SUM(CASE WHEN [{col}] IS NOT NULL AND [{col}] <> '' AND length([{col}]) >= 9 AND [{col}] NOT GLOB '*[^0-9]*' THEN 1 ELSE 0 END), SUM(CASE WHEN [{col}] IS NULL OR [{col}] = '' THEN 1 ELSE 0 END) FROM \"{table}\""
+        );
+        let (total, uid_shaped, empty) = conn
+            .query_row(&sql, [], |r| {
+                Ok::<(i64, Option<i64>, Option<i64>), rusqlite::Error>((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                ))
+            })
+            .unwrap_or((-1, None, None));
+        println!(
+            "[uid形态] {table}.[{col}]: 共 {total} 行，uid 形态 {}，空/NULL {}",
+            uid_shaped.unwrap_or(-1),
+            empty.unwrap_or(-1)
+        );
+    }
+
+    // ② 每群命中名册的候选数分布（候选 uid ∈ 本群 group_member3.[1000]）。
+    for (owner_table, gid_col, uid_col) in [
+        ("group_detail_info_ver1", "60001", "60002"),
+        ("group_list", "60001", "60026"),
+        ("group_list", "60001", "60267"),
+    ] {
+        let sql = format!(
+            "SELECT hits, COUNT(*) FROM ( SELECT d.[{gid_col}] AS g, COUNT(m.[1000]) AS hits FROM {owner_table} d LEFT JOIN group_member3 m ON m.[60001] = d.[{gid_col}] AND m.[1000] = d.[{uid_col}] WHERE d.[{uid_col}] IS NOT NULL AND d.[{uid_col}] <> '' GROUP BY d.[{gid_col}] ) GROUP BY hits ORDER BY hits"
+        );
+        let mut stmt = conn.prepare(&sql).expect("命中分布 SQL");
+        let dist: Vec<(i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        println!(
+            "[名册命中] {owner_table}.[{uid_col}] 每群命中数分布（命中数 → 群数）: {dist:?}"
+        );
+    }
+
+    // ②' [60002] 的去重值计数：若 29 群共享同一个值，它是「本人」而不是群主；
+    //    每群一个、值各不相同才是群主的形状。
+    {
+        let (rows, distinct): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT [60002]) FROM group_detail_info_ver1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        println!("[去重] group_detail_info_ver1.[60002]: {rows} 行，{distinct} 个不同值");
+    }
+
+    // ③ group_member3.[64002]：若为角色枚举，按值看「有几个群用到它」与「每群几行」。
+    let values: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT [64002] FROM group_member3 WHERE [64002] IS NOT NULL ORDER BY [64002]")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().flatten().collect()
+    };
+    for v in values {
+        let sql = format!(
+            "SELECT COUNT(*), SUM(c), MAX(c) FROM ( SELECT [60001], COUNT(*) AS c FROM group_member3 WHERE [64002] = {v} GROUP BY [60001] )"
+        );
+        let (gids, sum, max): (i64, Option<i64>, Option<i64>) = conn
+            .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap_or((-1, None, None));
+        println!(
+            "[角色候选] [64002]={v}: 覆盖 {gids} 群，合计 {} 行，单群最多 {} 行",
+            sum.unwrap_or(-1),
+            max.unwrap_or(-1)
+        );
+    }
+}
+
+
