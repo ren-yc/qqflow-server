@@ -3,6 +3,11 @@
 无头 HTTP API + SSE 服务：读取本地 QQ NT 版聊天记录（SQLCipher 解密 `nt_msg.db`）。
 独立实现，接口形态参考 **WeFlow HTTP API**。
 
+> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server"]`（连带 axum、tokio 与
+> utoipa）——嵌入者必须显式关掉默认 feature，否则会把整个服务栈拉进依赖树。feature 矩阵、
+> 承诺面（`pub mod api`）与真库示例见 [docs/architecture.md](docs/architecture.md) 的「库面与
+> feature」与 [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
+
 ## 范围
 
 - ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头；直读实时源库（QQ 运行中可读，无镜像）
@@ -19,12 +24,13 @@
 | Windows | Rust MSVC toolchain + Visual Studio（Desktop C++ 工作负载）+ [Strawberry Perl](https://strawberryperl.com) | `powershell -File scripts\build.ps1 build` |
 | Linux | Rust + `build-essential`（gcc/make；perl 系统自带） | `bash scripts/build.sh build` |
 | macOS | Rust + Xcode Command Line Tools（`xcode-select --install`；perl 系统自带） | `bash scripts/build.sh build` |
+| 全平台 | **Python 3**（提交钩子的编号扫描与一致性套件执行器；纯标准库，无第三方包） | `python scripts/forbidden_refs.py --tree`（提交前自检） |
 
 构建需源码编译 SQLCipher + OpenSSL，故要求 C 工具链与 perl；wrapper 会自动定位 MSVC 环境与 Perl/nasm（Windows 专属），并透传全部 cargo 参数（`test`/`clippy`/`build --release` 等同理）。工具链由 `rust-toolchain.toml` 锁定。
 
-## 隐私检查钩子
+## 提交钩子（隐私 + 编号引用）
 
-本仓库的隐私扫描通过 git pre-commit 钩子执行。`.git/hooks/` 不受版本控制，
+本仓库的**隐私扫描**与**编号引用扫描**都通过 git 钩子执行。`.git/hooks/` 不受版本控制，
 因此**克隆后需手动装一次**（可重复执行，幂等）：
 
 ```powershell
@@ -32,16 +38,21 @@ powershell -File scripts\install-hooks.ps1   # Windows
 bash scripts/install-hooks.sh                # Linux/macOS
 ```
 
-钩子在每次 `git commit` 前运行 `scripts/check-privacy.sh`，扫描暂存内容中的
-本机特定信息（QQ 号、数据库密钥、账号路径、用户名）。命中即中止提交并列出文件。
+- `pre-commit` 跑两项：`scripts/check-privacy.sh`（暂存内容里的本机信息：QQ 号、数据库密钥、
+  账号路径、用户名）与 `python scripts/forbidden_refs.py`（指向仓库外材料的编号引用）；
+- `commit-msg` 对**提交信息**跑同一支编号扫描器；
+- 两个检查**都执行、任一失败即阻止**；退出码 `2`（扫描未执行）同样按拒绝处理——**空 diff 不等于干净**。
+
 手动单次执行：
 
 ```bash
 bash scripts/check-privacy.sh
+python scripts/forbidden_refs.py --tree    # 全量跟踪文件
 ```
 
-若 bash 不可用，钩子会**报错并阻止提交**（而非放行），以免扫描被静默跳过。
-确有需要绕过时用 `git commit --no-verify`。
+bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）——失败开放的检查等于没有检查。
+`git commit --no-verify` **仅限**「工具确实不可用、且已人工完成等价复核」，并须在提交信息写明原因；
+**不得**用它跳过隐私检查或编号引用检查来「先提交再说」。CI 会对全量跟踪文件与提交信息各再扫一遍。
 
 ## 发布
 
