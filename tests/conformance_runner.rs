@@ -184,9 +184,6 @@ fn harness_router(
                         // `nt_msg.db` —— 不 materialize 就等于没写。第一版把这两行连同显式同步
                         // 一起删掉了，症状又是「SSE 收不到事件」。
                         common::materialize_source(&nt_db);
-    // 同族库：群名册与群名片住在 `group_info.db` 里（消息库之外）。没有它，`memberCount`
-    // 永远不会出现 —— 而不变量允许缺席，于是那条用例会「通过」却什么都没验。
-    common::write_fake_group_info(&nt_db);
                         // 与 weflow 的 harness 对齐：显式同步一次，让「追加 → 可见 → 广播」
                         // 成为确定的事，而不是等 Watcher 的时序。
                         let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
@@ -216,6 +213,11 @@ async fn conformance_suite_passes() {
     let (writer, _main) = common::open_fake_source(&nt_db, 0);
     let writer = Arc::new(parking_lot::Mutex::new(writer));
     let src = nt_db.join("nt_msg.db");
+    // 同族库 `group_info.db`（群名、名册、群名片、群主）必须在**注册之前**就位：
+    // store 的这些映射在注册建索引时一次性读入，之后再写也不会重新加载 —— 先前它只在
+    // harness 追加消息时才写（注册时表还没出生），名册与群主全程为空，
+    // `memberCount` 不出现（不变量允许缺席，于是「通过」却什么都没验）、群主断言拿 0 个。
+    common::write_fake_group_info(&nt_db);
 
     let state = app_state(dir.join("export"));
     let app = build_router(state.clone()).merge(harness_router(writer.clone(), nt_db.clone(), state.clone()));
@@ -285,13 +287,14 @@ async fn conformance_suite_passes() {
     }
 
     let fx = json!({
-        "contractVersion": "0.2.2",
+        "contractVersion": "0.3.0",
         "platform": "qq",
         "generatedBy": "qqflow-server tests/conformance_runner.rs",
         "endpoints": {
             "accounts": "/api/v1/accounts",
             "contacts": "/api/v1/contacts",
             "harness": "/__harness",
+            "group-members": "/api/v1/group-members",
             "health": "/health",
             "messages": "/api/v1/messages",
             "pull": "/chatlab/sessions/{id}/messages",

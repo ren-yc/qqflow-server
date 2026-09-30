@@ -24,6 +24,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::db::decrypt::open_live_mode;
+
 use super::{conv_key, Store};
 
 /// 一次加载的结果。
@@ -60,13 +62,20 @@ pub fn load_group_meta(nt_db_dir: &Path, key: &str) -> GroupMeta {
     if !path.is_file() {
         return out;
     }
-    // 与消息库同一条打开路径（偏移 VFS ＋ 只读活连接）。
-    let mut reader = crate::db::live::LiveReader::new(path, key.to_string());
-    if reader.open().is_err() {
-        tracing::debug!("[group-meta] group_info.db 打不开，群名片与人数退化为空");
-        return out;
-    }
-    let Ok(conn) = reader.acquire() else { return out };
+    // 与 `names` 同规的打开方式：先按 QQ 自有头偏移开，失败再回退**平文**（无头）。
+    // 少了回退就会静默变成「空表」——偏移打开无头文件在解密校验处失败，而本函数的设计
+    // 是「失败即空、不报错」，于是群名、名册、群主一起消失且没有任何告警
+    //（夹具的 profile_info 就是无头的，这条回退正是它们的契约）。
+    let conn = match open_live_mode(&path, key, true).or_else(|e| {
+        tracing::debug!("[group-meta] 偏移打开失败，回退平文: {e:#}");
+        open_live_mode(&path, key, false)
+    }) {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::debug!("[group-meta] group_info.db 打不开，群名片与人数退化为空: {e:#}");
+            return out;
+        }
+    };
 
     // 群名。
     if let Ok(mut stmt) = conn.prepare("SELECT [60001], [60007] FROM group_list")
