@@ -316,14 +316,14 @@ async fn conformance_suite_passes() {
             "sns": false,
                         // 名册来源是 `group_info.db` 的 `group_member3`（见 `store::group_meta`）。
             "memberCount": true,
-            // Pull 形状的发现面（规范里的 `GET {baseUrl}/sessions`）尚未实现 —— 它是计划里
-            // 「ChatLab 适配」那一步的内容。置 false 让相关用例**跳过而不是失败**：契约的
-            // 能力机制就是为这种「存在性差异」准备的。实现后翻成 true 即启用。
+            // Pull 形状的发现面（`GET /chatlab/sessions`）已实现：置 true 让相关用例实跑。
+            // （此处曾写着「尚未实现、置 false 跳过」——能力翻真后注释没跟上；
+            // 注释与取值矛盾比没有注释更误导，故改写。）
             "pullDiscovery": true,
-            // 同上：Pull 形状的通知面（`GET {baseUrl}/push/messages`，规范要求只带元信息，
-            // 不带消息体）也属那一步。
-            // SSE 通知面**是存在的**且符合契约（`message.new`/`message.revoke`/`sync` 三种
-            // 事件都通过套件断言）—— 先前写 false 是我的推断，不是实测。
+            // SSE 通知面（`GET /chatlab/push/messages`，规范要求只带元信息、不带消息体）
+            // 存在且符合契约：`message.new`/`message.revoke`/`sync` 三种事件都通过套件断言，
+            // 置 true 实跑。先前写 false 的理由是「规范要求……」这类**读规范读出的推断**，
+            // 被套件实测推翻（event_notification_shape 对现行载荷通过）——推断不该当作结论。
             "pullNotification": true,
             "roles": false,
             "sse": true,
