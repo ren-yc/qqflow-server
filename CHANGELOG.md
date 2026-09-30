@@ -5,17 +5,15 @@
 
 ## [0.6.0] - 2026-09-27
 
-ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下）。下游需按迁移表逐项核对。
+ChatLab 适配层上线，**并接受一次破坏性发布**（三项，见下）。下游需按迁移表逐项核对。
 
 ### 破坏性变更
 
 | 变更 | 改了什么 | 怎么迁 | 过渡期 |
 |---|---|---|---|
-| **`end=YYYYMMDD`** | 由「当天 0 点」变「当天 **23:59:59**」 | 若依赖旧语义，改用显式时刻参数 | **不适用** —— 唯一已知下游零影响（实测：只用 `start`）|
-| **SSE `sync` 载荷** | weflow 统一为 `{event,generation,watermarks:[…]}`；qqflow 由平铺的 `lastRowidGroup`/`lastRowidC2c` 收敛为 `{event,watermarks:[{table,watermark}]}` | 订阅者若解析 `sync`，按新形状改 | **不适用** —— 唯一已知下游零影响（实测：显式忽略 `sync`）|
+| **SSE `sync` 载荷** | qqflow 由平铺的 `lastRowidGroup`/`lastRowidC2c` 收敛为 `{event,watermarks:[{table,watermark}]}`（weflow 同批统一为带 `generation` 的水位线数组） | 订阅者若解析 `sync`，按新形状改 | **不适用** —— 唯一已知下游零影响（实测：显式忽略 `sync`）|
 | **注销后重放** | 清重放条目 ＋ **保留** id 计数器 ＋ 基线带 `generation` | 依赖 `Last-Event-ID` 的下游需处理 `generation`（它区分「换了个账号」与「自己漏收了」）| **不适用** —— 唯一已知下游零影响 |
-| **媒体 URL 去 token** | URL 不再内嵌 `?access_token=` | 旧的 `split("?",1)[0]` 写法**仍兼容**（不报错），可简化 | **不适用** —— 向后兼容 |
-| **`message.new` 媒体字段** | weflow 补一个**过滤后的** `mediaId`（只在导出根下确有文件时出现），`md5` **保留** | 无 —— 纯增量 | **不适用** |
+| **媒体地址改根相对** | `mediaUrl` 由 `http://host:port/api/v1/media/…` 变为 `/api/v1/media/…`，不再把服务基址烤进响应（本仓此前**从未内嵌 token**，与 weflow 的「去 token」不是同一件事）| 按自己的 `base_url` 拼接后再请求；把相对路径当完整 URL 直接用的写法**会失败** | **不适用** —— 发布即生效、无并行期，需随升级同步改 |
 
 ### 新增
 
@@ -35,6 +33,9 @@ ChatLab 适配层上线，**并接受一次破坏性发布**（五项，见下�
 ### 修复
 
 - `mediaId` **只在取得到字节时才通告**（「出现即可取」是承诺，不是尽力而为）。
+- 空 talker 的行不再生成会话：真库里因此出现过一个 id 为空串的会话（`GET /api/v1/sessions`
+  会多出这一项，`GET /api/v1/messages?talker=`（空）也会把这些行当正常会话返回）——现在两者
+  都按「无此会话」处理。
 
 ## [0.5.1] - 2026-08-28
 
