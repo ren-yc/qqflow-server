@@ -925,7 +925,9 @@ pub async fn run_with_shutdown(
 // 搬家之后那条 cfg 不再需要：它就在 `server` 里，而 `server` 本来就随 feature 门控。
 
 /// Shared application state handed to the HTTP layer and poller tasks.
-#[cfg(feature = "server")]
+///
+/// 不需要 `#[cfg(feature = "server")]`：本模块本身就随该 feature 门控（上面的注释解释了
+/// 搬家之后那条 cfg 为什么是多余的）。
 pub struct AppState {
     pub store: Arc<RwLock<Store>>,
     pub events: tokio::sync::broadcast::Sender<sync::Event>,

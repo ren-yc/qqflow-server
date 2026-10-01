@@ -99,19 +99,28 @@ pub fn serialize_for_test(ev: Event) -> (String, serde_json::Value) {
 /// weflow 那边的水位是 `{create_time, local_id, sort_seq}` 三元组 —— **两者不是同一套语义**，
 /// 跨仓库的消费方必须按 `table` 分支。这一点写在字段文档里，而不是靠"名字一样"蒙混过去。
 fn sync_payload(ev: &Event) -> serde_json::Value {
-    let mut watermarks: Vec<serde_json::Value> = Vec::new();
+    use crate::server::dto::{SyncFrame, WatermarkEntry, WatermarkValue};
+    // 走**类型**而不是 `json!`：这一帧此前是手拼的，键名写错编译不过；而它是 SSE 面上的
+    // 输出，没有 golden 快照护栏（快照的模型是一次请求一次响应）——键集由 sse_shape 的断言
+    // 盯着，形状本身则由这里的类型盯住。`to_value` 与 `json!` 一样按字母序输出，
+    // 因此键序不变。
+    let mut watermarks: Vec<WatermarkEntry> = Vec::new();
     for (table, rowid) in [
         (crate::store::index::GROUP_TABLE, ev.last_rowid_group),
         (crate::store::index::C2C_TABLE, ev.last_rowid_c2c),
     ] {
         if let Some(n) = rowid {
-            watermarks.push(serde_json::json!({
-                "table": table,
-                "watermark": { "rowid": n },
-            }));
+            watermarks.push(WatermarkEntry {
+                table: table.to_string(),
+                watermark: WatermarkValue { rowid: n },
+            });
         }
     }
-    serde_json::json!({ "event": "sync", "watermarks": watermarks })
+    serde_json::to_value(SyncFrame {
+        event: "sync".to_string(),
+        watermarks,
+    })
+    .unwrap_or_default()
 }
 
 /// 组装 SSE 响应。`serialize` 决定帧的形状，其余部分是两面的公共部分。

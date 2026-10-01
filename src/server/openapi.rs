@@ -55,7 +55,10 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::SessionNative,
     crate::server::dto::SessionsChatlab,
     crate::server::dto::SessionsNative,
+    crate::server::dto::SyncFrame,
     crate::server::dto::SyncResult,
+    crate::server::dto::WatermarkEntry,
+    crate::server::dto::WatermarkValue,
     crate::server::handlers::contacts::ContactOut,
     crate::store::query::MessageOut,
 )))]

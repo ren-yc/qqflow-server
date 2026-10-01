@@ -3,6 +3,21 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 文档（如实化，无行为变化）
+
+- **通知帧的 `platformMessageId` 说明改为如实**：本面**不下发**该字段（键保留、值恒为 `null`）。
+  事件里的 `rawid` 是本仓库自己的行号，不是平台消息号（拉取面用的是 `seq`）；此前 DTO 文档承诺
+  「撤回事件里它是被撤回那条的 id」，而实现写 `null` —— 承诺与实现不符，且规范里该字段是可选的。
+- `/chatlab/sessions` 的响应示例补上漏掉的 `count` 键（实际响应一直有它）。
+
+### 变更（内部，输出逐字节不变）
+
+- `sync` 帧从手拼 `json!` 改为**类型化 DTO**（`SyncFrame` / `WatermarkEntry` / `WatermarkValue`），
+  三个类型已登记进 `/openapi.json` 的 `components.schemas`（此前这一帧在描述里没有对应类型）。
+  键集与键序不变：SSE 的键集护栏与一致性套件都通过。
+- `/openapi.json` 里通知帧的 `description` 随上面第一条改动（DTO 文档注释直接进描述）。
 ## [0.6.1] - 2026-10-01
 
 门禁与文档收口。**响应形状未变** —— 新增的是接口描述里的两条操作与更严的门禁。

@@ -402,7 +402,12 @@ pub struct GroupMember {
 /// 带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就没有歧义。
 ///
 /// `eventId` 与 `platformMessageId` 是**两个不同的号**：前者是事件通道自己的标识，后者是那条
-/// 消息在平台上的 id（拉取时用它定位）。撤回事件里 `platformMessageId` 是被撤回那条的 id。
+/// 消息在平台上的 id（拉取时用它定位）。
+///
+/// **本面当前不下发 `platformMessageId`**（键保留、值恒为 `null`）：事件里的 `rawid` 是本仓库
+/// 自己的行号，**不是**平台消息号（拉取面的 `platformMessageId` 用的是 `seq`）；把它翻过去
+/// 需要在**推送热路径**上逐事件查一次索引，而规范里这个字段是**可选**的。定位消息请用
+/// **拉取面**返回的 `platformMessageId`。
 ///
 /// 基线类事件（如 `session.sync`）没有对应的消息，两个 id 都为 `null` —— 它们只告诉客户端
 /// 「水位变了，去拉」。
@@ -427,3 +432,39 @@ pub struct NotificationFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
 }
+
+// ── SSE `sync` 帧 ────────────────────────────────────────
+
+/// `sync` 帧 —— 老面与通知面**共用同一形状**（收敛之后）。
+///
+/// 水位线是**数组**而不是两个具名字段：原来它靠 `lastRowidGroup` / `lastRowidC2c` 两个字段名
+/// 承载，加第三张表就得再加一个字段，而消费方只能靠「字段名 ←→ 表」的约定配对。数组把这件事
+/// 变成数据。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SyncFrame {
+    /// 事件名（`sync`）。
+    pub event: String,
+    /// 各表的水位线。
+    pub watermarks: Vec<WatermarkEntry>,
+}
+
+/// 一张表的水位。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct WatermarkEntry {
+    /// 表名。
+    pub table: String,
+    /// 水位值。
+    pub watermark: WatermarkValue,
+}
+
+/// 水位值。
+///
+/// **与 weflow 不是同一套语义**：那边是 `{create_time, local_id, sort_seq}` 三元组，这里是
+/// SQLite 行号（`read_new` 就是按它取新行的）。跨仓库的消费方必须按 `table` 分支，
+/// 而不是靠「名字一样」蒙混过去。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct WatermarkValue {
+    /// SQLite 行号。
+    pub rowid: i64,
+}
+
