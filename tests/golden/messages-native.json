@@ -4,8 +4,7 @@
     "hasMore": false,
     "media": {
       "count": 1,
-      "enabled": true,
-      "exportPath": "<volatile>"
+      "enabled": true
     },
     "messages": [
       {
@@ -24,12 +23,12 @@
           "width": 640
         },
         "mediaId": "aabbccddeeff00112233445566778899",
-        "mediaType": "image",
         "parsedContent": "[image]",
         "rawContent": "[image]",
         "senderName": "李四",
         "senderUsername": "u_b",
-        "serverId": "113737825910786"
+        "serverId": "113737825910786",
+        "type": "image"
       },
       {
         "content": "你好",
@@ -53,7 +52,6 @@
     "media",
     "count",
     "enabled",
-    "exportPath",
     "messages",
     "content",
     "createTime",
@@ -69,12 +67,12 @@
     "uuid",
     "width",
     "mediaId",
-    "mediaType",
     "parsedContent",
     "rawContent",
     "senderName",
     "senderUsername",
     "serverId",
+    "type",
     "content",
     "createTime",
     "isSend",

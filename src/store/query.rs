@@ -14,6 +14,9 @@ pub struct SessionInfo {
     pub r#type: i64,
     pub last_timestamp: i64,
     pub unread_count: i64,
+    /// 该会话在索引里的消息条数（= 真实条数，不是占位）。ChatLab 面的 messageCount 用它 ——
+    /// 恒 0 的占位会让下游按它排序时拿到一列无意义的数字。
+    pub message_count: usize,
 }
 
 /// WeFlow-style message row.
@@ -38,8 +41,10 @@ pub struct MessageOut {
     pub content: String,
     pub raw_content: String,
     pub parsed_content: String,
+    /// 消息行上的媒体类型（image / voice / video）。键名是 type：它与媒体对象内部的名字空间
+    /// 无关，改名的理由是「同一个概念在两面用两个名字」比位置差异更难记。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<String>,
+    pub r#type: Option<String>,
     /// Structured media metadata (image/voice/video); absent for text etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<crate::parser::types::MediaInfo>,
@@ -54,6 +59,16 @@ pub struct MessageOut {
     pub media_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_local_path: Option<String>,
+    /// 本行的 mediaFileName 能不能当**句柄**用（导出批次填写，未导出恒 false）。
+    ///
+    /// 判据是「名字按内容唯一」：取自 store 键（md5 hex / uuid）或形状是 32 位十六进制摘要。
+    /// 同名异内容的文件可能躺在别的会话里，而按名取字节是跨会话解析的 —— 只有这两类名字才
+    /// 承诺「出现即可取」。
+    ///
+    /// 它**不序列化**：判据只服务于「这个名字能不能回填成句柄」，字段一旦下发就会有人拿它
+    /// 当契约。
+    #[serde(skip)]
+    pub media_export_handle_ok: bool,
     /// `platformMessageId` of the message this one replies to.
     ///
     /// **Omitted when the target cannot be pinned down** — see
@@ -82,12 +97,13 @@ impl MessageOut {
             content: r.parsed.content.clone(),
             raw_content: r.parsed.content.clone(),
             parsed_content: r.parsed.content.clone(),
-            media_type: r.parsed.msg_type.media_type_str().map(String::from),
+            r#type: r.parsed.msg_type.media_type_str().map(String::from),
             media: r.parsed.media.clone(),
             media_id: r.parsed.media.as_ref().and_then(|m| m.key()).map(str::to_string),
             media_file_name: None,
             media_url: None,
             media_local_path: None,
+            media_export_handle_ok: false,
             // Filled by the query layer, which is the only place that can see
             // the whole conversation a candidate must be found in.
             reply_to_message_id: None,
@@ -293,6 +309,7 @@ pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset
             r#type: c.chat_type.weflow_code(),
             last_timestamp: conv_last_ts(c),
             unread_count: 0,
+            message_count: c.msgs.len(),
         })
         .collect()
 }
@@ -351,5 +368,6 @@ mod tests {
         let sessions = query_sessions(&store, None, 10, 0);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].last_timestamp, 200, "newest ts, not the unsorted tail");
+        assert_eq!(sessions[0].message_count, 2, "messageCount 是索引里的真实条数");
     }
 }

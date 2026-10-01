@@ -1,4 +1,4 @@
-//! GET|POST /api/v1/contacts — people who appeared in chat records.
+//! GET /api/v1/contacts — people who appeared in chat records.
 //! v1 derives contacts from the uid->nickname map (no separate contact DB).
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ pub struct Params {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 

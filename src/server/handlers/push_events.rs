@@ -1,4 +1,4 @@
-//! GET|POST /api/v1/push/messages — SSE event stream.
+//! GET /api/v1/push/messages — SSE event stream.
 //!
 //! WeFlow contract: `ready` first, then a `sync` event carrying the current
 //! rowid watermarks (qqflow-server extension), then `message.new` /
@@ -25,7 +25,7 @@ use super::authorized;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Params {
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
     /// Last-Event-ID as a query param, for clients that cannot set the header
     /// (the browser `EventSource` API has no way to send one).
@@ -118,6 +118,9 @@ fn sync_payload(ev: &Event) -> serde_json::Value {
     }
     serde_json::to_value(SyncFrame {
         event: "sync".to_string(),
+        // 基线代号**恒出现**：注销时递增，客户端据此区分「注销后新账号刚开始」与「自己漏收了」。
+        // 少了它，这两种情况在协议上是同一件事。
+        generation: crate::server::current_generation(),
         watermarks,
     })
     .unwrap_or_default()

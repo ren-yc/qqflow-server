@@ -1,6 +1,7 @@
 //! Endpoint handlers (WeFlow-compatible paths and shapes).
 
 pub mod accounts;
+pub mod chatlab_messages;
 pub mod chatlab_pull;
 pub mod chatlab_sessions;
 pub mod chatlab_push;
@@ -87,12 +88,12 @@ pub fn parse_time_bound(s: &str, is_end: bool) -> Option<i64> {
     s.parse::<i64>().ok()
 }
 
-/// Verify the token from any of the five accepted transports (see
-/// [`crate::server::auth`]): the `Authorization: Bearer` / `X-Api-Key`
-/// headers, or `access_token` / `token` in the query string or POST JSON
-/// body. `query_token` is whichever of the latter the caller's `Params`
-/// resolved — `#[serde(alias = "token")]` folds the two key spellings into
-/// one field, and `merge_body` folds query and body into one struct.
+/// Verify the token from either accepted transport (see
+/// [`crate::server::auth`]): the `Authorization: Bearer` header, or
+/// `access_token` in the query string. `query_token` is the handler's
+/// resolved `access_token` field; `merge_body` folds the query params into
+/// one struct, but **never carries the credential keys in from the body** —
+/// body 里的同名键既不是通道，也不该覆盖查询串里的值。
 pub fn authorized(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> bool {
     let header_token = crate::server::auth::from_headers(headers);
     [query_token, header_token.as_deref()]
@@ -104,10 +105,10 @@ pub fn authorized(state: &AppState, headers: &HeaderMap, query_token: Option<&st
 /// Merge query params with a POST JSON body (WeFlow contract: POST
 /// parameters live in the JSON body). Body fields win when present and
 /// non-null; an empty or non-JSON body leaves the query params as-is.
-/// This also makes the body-carried `access_token` work: auth accepts five
-/// transports and they must be interchangeable, so folding the body in must
-/// not drop the token
-/// (see `tests/api_smoke.rs::every_auth_transport_is_accepted`).
+///
+/// **凭据键例外**：`access_token` / `token` 从 body 里被跳过。鉴权只剩两条通道
+/// （Bearer 头与查询串），如果把 body 里的同名键合进来，这条规则就会被一次合并静默绕过 ——
+/// 而绕过它只需要把 token 挪进 JSON。
 ///
 /// The handler extracts the raw body as `Bytes` (not `Option<Bytes>` —
 /// axum's `Option<T>` only implements `FromRequestParts`, so it cannot be
@@ -130,16 +131,18 @@ where
         .map_err(|e| ApiError::bad_request(format!("参数序列化失败: {e}")))?;
     if let Some(m) = merged.as_object_mut() {
         for (k, val) in obj {
+            // 凭据**只走请求头与查询串**：body 里的同名键既不是通道，也不该覆盖查询串里的值。
+            if k == "access_token" || k == "token" {
+                continue;
+            }
             if !val.is_null() {
                 m.insert(k.clone(), val.clone());
             }
         }
         // Drop the None-defaults (`access_token: null`, ...) that the query
-        // struct serialized. With `#[serde(alias = "token")]`, leaving them
-        // in makes a body `{"token": "abc"}` collide with the null
-        // `access_token` key and serde rejects the merge as a duplicate
-        // field — the exact 400 the body-transport test caught. Query keys
-        // are never null (absent keys serialize as null only for `Option`
+        // struct serialized: leaving them in makes serde reject a query key
+        // that the body also carried as a duplicate field. Query keys are
+        // never null (absent keys serialize as null only for `Option`
         // defaults; body nulls are skipped above), so this is lossless.
         m.retain(|_, v| !v.is_null());
     }

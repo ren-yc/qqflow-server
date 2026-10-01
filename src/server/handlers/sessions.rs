@@ -1,5 +1,8 @@
-//! GET|POST /api/v1/sessions — session list, newest last-message first.
-//! `format=chatlab` returns the ChatLab Pull session shape.
+//! GET /api/v1/sessions — 会话列表（**只输出原生形状**）。
+//!
+//! ChatLab 形状走 `/chatlab/sessions`（见 `chatlab_sessions`）。两个面共用本函数的其余部分
+//! （鉴权、筛选、稳定排序、切片），但**分页参数不共用**：老面只认 `offset`，ChatLab 形状认
+//! `cursor`（同时接受 `offset`）。一刀切会让「换个面就该换参数」这件事静默失效。
 
 use std::sync::Arc;
 
@@ -22,12 +25,11 @@ pub struct Params {
     pub limit: usize,
     #[serde(default)]
     pub offset: usize,
-    /// `page.nextCursor` 的回传入参；解析不了就退回 `offset`。
+    /// `page.nextCursor` 的回传入参。**只有 ChatLab 形状解析它** —— 老面继续接受它会让
+    /// 「换个面就该换参数」静默失效（调用方以为自己在翻页，其实一直拿第一页）。
     #[serde(default)]
     pub cursor: Option<String>,
     #[serde(default)]
-    pub format: Option<String>,
-    #[serde(default, alias = "token")]
     pub access_token: Option<String>,
 }
 
@@ -44,11 +46,10 @@ pub async fn handler(
     respond(&state, &headers, params, body, false).await
 }
 
-/// `handler` 的本体，带一个「强制 ChatLab 形状」的开关。
+/// `handler` 的本体，带一个「本面就是 ChatLab 形状」的开关。
 ///
-/// `/chatlab/sessions` 用它并传 `true`：Pull 面**天生就是** ChatLab 形状，调用方不该再知道
-/// 有 `format` 这个参数。两条路的其余部分（鉴权、就绪门控、筛选、分页、信封）**逐字一致** ——
-/// 抄一份就会漂移。
+/// `/chatlab/sessions` 用它并传 `true`：那个面**天生就是** ChatLab 形状，调用方不必知道还有
+/// 另一种。两条路的其余部分（鉴权、就绪门控、筛选、分页、信封）**逐字一致** —— 抄一份就会漂移。
 pub(crate) async fn respond(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -64,17 +65,20 @@ pub(crate) async fn respond(
         return Err(ApiError::not_ready());
     }
     let limit = params.limit.clamp(1, 10000);
-    // `cursor` 是 `page.nextCursor` 的回传入参；解析不了就退回 `offset`，
-    // 与其它参数一样「坏值退化为默认而不是报错」。
-    let offset = params
-        .cursor
-        .as_deref()
-        .and_then(|c| c.parse::<usize>().ok())
-        .unwrap_or(params.offset);
-    let chatlab = force_chatlab || params.format.as_deref() == Some("chatlab");
+    // 分页模型按面分开：ChatLab 形状认 `cursor`（`page.nextCursor` 的回传入参，解析不了就退回
+    // `offset`，与其它参数一样「坏值退化为默认而不是报错」）；老面**只认 offset**。
+    let offset = if force_chatlab {
+        params
+            .cursor
+            .as_deref()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(params.offset)
+    } else {
+        params.offset
+    };
 
     let store = state.store.read();
-    if chatlab {
+    if force_chatlab {
         // ChatLab 把**没有 page 块**的响应读作「这就是完整一页」，所以截断必须显式
         // 告知，否则第 limit 条之后的会话会被静默丢掉。总数与列表共用同一个谓词。
         let total = crate::store::query::count_sessions(&store, params.keyword.as_deref());
@@ -84,8 +88,8 @@ pub(crate) async fn respond(
                 SessionChatlab {
                     id: s.username.clone(),
                     last_message_at: s.last_timestamp,
-                    // 本仓库不维护每会话条数，恒为 0（**键要留着**：下游按它排序）。
-                    message_count: 0,
+                    // 真值（索引里的条数）。恒 0 的占位会让下游按它排序时拿到一列无意义的数字。
+                    message_count: s.message_count as i64,
                     name: s.display_name.clone(),
                     platform: "qq".to_string(),
                     // 群名册里的人数（私聊没有名册 ⇒ 这个键不出现）。

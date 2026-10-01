@@ -1,14 +1,16 @@
 {
   "body": {
-    "index_cleared": false,
+    "index_cleared": true,
+    "previous_status": "ready",
     "purged_dirs": 0,
     "purged_media": false,
     "qq": "10001",
-    "state": "not_registered",
+    "state": "deregistered",
     "success": true
   },
   "keys": [
     "index_cleared",
+    "previous_status",
     "purged_dirs",
     "purged_media",
     "qq",

@@ -33,6 +33,11 @@
         "accountName": "李四",
         "content": "[image]",
         "groupNickname": "",
+        "media": {
+          "fileName": "aabb.png",
+          "md5": "aabbccddeeff00112233445566778899",
+          "type": "image"
+        },
         "platformMessageId": "113737825910786",
         "sender": "u_b",
         "timestamp": 26481,
@@ -78,6 +83,10 @@
     "accountName",
     "content",
     "groupNickname",
+    "media",
+    "fileName",
+    "md5",
+    "type",
     "platformMessageId",
     "sender",
     "timestamp",

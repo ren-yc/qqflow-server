@@ -1,8 +1,8 @@
 //! **ChatLab 形状的唯一序列化出处。**
 //!
-//! ChatLab 面有四个消费者：REST 的 `format=chatlab`、Pull 面、批量导出、MCP 输出。它们**必须给出
-//! 同一个形状** —— 否则「同一份数据、两个面、字段不一样」会在下游变成一堆按来源分叉的解析代码，
-//! 而那种分叉只有在某一面改字段时才会暴露。
+//! ChatLab 面有三个消费者：消息面、Pull 面、批量导出。它们**必须给出同一个形状** —— 否则
+//! 「同一份数据、两个面、字段不一样」会在下游变成一堆按来源分叉的解析代码，而那种分叉只有在
+//! 某一面改字段时才会暴露。
 //!
 //! 这个模块负责**字段怎么填**；`server/dto.rs` 负责**字段叫什么**。分开是因为后者能给 OpenAPI 用
 //! （schema 由类型生成），而前者要读 store。
@@ -12,7 +12,7 @@
 //! 事），要么得在公共函数里分派两种输入（那只是把重复挪了个地方）。**成员、表头、平台常量这三样
 //! 是逐字重复的，所以只抽这三样。**
 
-use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta};
+use crate::server::dto::{ChatlabHeader, ChatlabMember, ChatlabMeta, MediaBrief};
 
 /// 生成器标识。两个面共用同一个值：下游按它区分「谁产出的」。
 pub(crate) const GENERATOR: &str = "qqflow-server";
@@ -66,6 +66,25 @@ pub(crate) fn member(uid: &str, account_name: String, group_nickname: String) ->
         group_nickname,
         platform_id: uid.to_string(),
     }
+}
+
+/// 一条消息的媒体元数据（拉取面与消息面**同形**）；无媒体、或类型归不到 image/voice/video 时
+/// 返回 `None`（调用方据此**省略整个 media 键**）。
+///
+/// 它是**元数据**，不是「字节可取」的承诺：`fileName` 只有在导出确实写出了本地副本、且名字
+/// 由内容摘要派生之后才是可取句柄 —— 那一步由调用方在导出批次之后回填（见
+/// `handlers::chatlab_messages`）。`md5` 取不到时省略该键：未导出不等于没有摘要。
+pub(crate) fn media_brief(
+    kind: Option<&str>,
+    media: Option<&crate::parser::types::MediaInfo>,
+) -> Option<MediaBrief> {
+    let media = media?;
+    let kind = kind.filter(|k| !k.is_empty())?;
+    Some(MediaBrief {
+        file_name: media.file_name.clone().unwrap_or_default(),
+        md5: media.md5.clone().filter(|s| !s.is_empty()),
+        r#type: kind.to_string(),
+    })
 }
 
 /// 一页里的发送者去重（`members` 的集合，首次出现序）。

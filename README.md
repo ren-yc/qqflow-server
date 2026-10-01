@@ -13,7 +13,8 @@
 - ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头；直读实时源库（QQ 运行中可读，无镜像）
 - ✅ 数据读取：全量扫描建内存索引 + 文件系统事件驱动的增量同步（notify watch + 慢速兜底轮询）
 - ✅ 服务封装：axum HTTP + SSE，WeFlow 参考端点与字段
-- ✅ 媒体：`GET /api/v1/media/{id}` 从 QQ 本地缓存直服；`media=1` 按需导出（`--media-export-dir`）经路径式路由提供
+- ✅ 媒体：`GET /api/v1/media/{id}` 从 QQ 本地缓存直服，未命中再按导出文件名在导出根下解析；
+  `media=1` 按需导出（`--media-export-dir`）
 - ✅ 三平台：Windows / Linux / macOS
 - ❌ **不做密钥提取**：密钥由外部工具提供（`QQBackup/qq-win-db-key` 等），运行期注册（见下）
 
@@ -104,17 +105,20 @@ curl -X POST http://127.0.0.1:5032/api/v1/accounts \
 | `GET/POST /health`、`/api/v1/health` | 健康检查（免鉴权，标量：`status` + `version` + `account`） |
 | `POST /api/v1/accounts` | 注册账号：`qq` + `key` + 可选 `db_path`（客户端驱动启动） |
 | `GET /api/v1/accounts` | 账号明细（需鉴权）：`qq` / `state` / `message_count` / `error` / `db_path` |
-| `DELETE /api/v1/accounts/{qq}` | 注销账号，恢复未注册状态（别名 `POST /api/v1/accounts/{qq}/deregister`；`purge_media` 默认 false） |
-| `GET/POST /api/v1/messages` | `talker` 必填；`limit/offset/start/end/keyword/chatlab/format`；`media`/`meiti` 触发媒体导出，`image`/`tupian`/`voice`/`vioce`/`video`/`emoji` 子开关 |
-| `GET/POST /api/v1/sessions` | 会话列表（`format=chatlab` 输出 ChatLab 形态） |
+| `DELETE /api/v1/accounts/{qq}` | 注销账号，恢复未注册状态（`purge_media` 默认 false；POST 别名已删除） |
+| `GET /api/v1/messages` | `talker` 必填；`limit/offset/start/end/keyword`；`media=1` 触发媒体导出，`image`/`voice`/`video`/`emoji` 子开关（原生/富数据形状） |
+| `GET /api/v1/sessions` | 会话列表（原生形状；只认 `offset`） |
+| `GET /chatlab/sessions` | ChatLab 发现面（`keyword`/`limit`/`cursor`；`messageCount` 是真值） |
+| `GET /chatlab/messages` | ChatLab 消息面（原 `?chatlab=1` 的新家；`count` 是本页条数、消息升序、翻页走 `page`） |
 | `GET /api/v1/sessions/{id}/messages` | ChatLab Pull 增量同步（`since/end/limit/offset` + `sync` 块） |
-| `GET/POST /api/v1/contacts` | 联系人（消息中出现过的 UID ∪ 档案/映射 UID；`alias` 承载 QQ 号） |
-| `GET/POST /api/v1/group-members` | 群成员（`chatroomId`，`includeMessageCounts`） |
-| `GET/POST /api/v1/media/{id}`、`/api/v1/media/{talker}/{mediaType}/{file}` | 媒体直服（本地缓存）/ 导出文件服务 |
-| `GET/POST /api/v1/push/messages` | SSE：`ready`（就绪基线）→ `sync`（含水位线）→ `message.new` / `message.revoke`（帧带 `id:` 序号，断线重连可 `Last-Event-ID` 回放最近 1000 条 / 10 分钟）；媒体消息携带 `media` 元数据（**无本地路径**）与可直取的 `mediaId` |
+| `GET /api/v1/contacts` | 联系人（消息中出现过的 UID ∪ 档案/映射 UID；`alias` 承载 QQ 号） |
+| `GET /api/v1/group-members` | 群成员（`chatroomId`，`includeMessageCounts`；成员集合＝名册 ∪ 发言人） |
+| `GET /api/v1/media/{id}` | **唯一**的取字节路由：`id` 是 store 键（本地缓存）或导出文件名（导出根回落），同名多命中时内容一致才服务 |
+| `GET /api/v1/push/messages` | SSE：`ready`（就绪基线）→ `sync`（含水位线）→ `message.new` / `message.revoke`（帧带 `id:` 序号，断线重连可 `Last-Event-ID` 回放最近 1000 条 / 10 分钟）；媒体消息携带 `media` 元数据（**无本地路径**）与可直取的 `mediaId` |
 | `GET/POST /api/v1/sync` | 手动同步（增量读取 + 名称映射刷新，返回新增消息） |
 
-鉴权五方式：`Authorization: Bearer <token>` / `X-Api-Key: <token>` / `?access_token=`（SSE 推荐）/ `?token=` / POST JSON Body 的 `access_token`|`token`。
+鉴权两种方式：`Authorization: Bearer <token>` / `?access_token=`（SSE 推荐）。`X-Api-Key`、`?token=`
+与 POST JSON Body 里的凭据键已删除；读端点只接受 GET（POST 返回 405）。
 
 ```bash
 curl -H "Authorization: Bearer <token>" "http://127.0.0.1:5032/api/v1/sessions"

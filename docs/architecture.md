@@ -211,9 +211,14 @@ tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（四条数�
 
 **跨仓库差异**（两个仓库的 DTO **不共用**，正是因为这些键级差异）：`group-members` 的
 `messageCount` 在本仓库是**条件键**（不带 `includeMessageCounts=1` 时**整个键不出现**），
-而 weflow 恒输出该键（值 0）；本仓库的 ChatLab 消息项**没有** `replyToMessageId`；原生消息的
-媒体形状完全不同（`mediaId`/`mediaType` ＋ `{fileName,height,localPath,md5,size,uuid,width}`）。
+而 weflow 恒输出该键（值 0）；原生消息的媒体形状不同（`mediaId` ＋
+`{fileName,height,localPath,md5,size,uuid,width}`，而消息行上的类型键两边都是 `type`）。
 照抄另一个仓库的 DTO 会**改坏契约**。
+
+**取字节只有一条路**：`GET /api/v1/media/{id}`。`id` 先按 store 键（md5 hex / uuid，索引登记过
+的本地缓存路径）解析，未命中再按**导出文件名**在导出根下扫四个类型目录；同名多命中时**内容一致
+才服务**（不一致 404），且只有内容摘要派生的名字才被当作句柄下发（见 §3.1）。
+服务端只在下发句柄的那几处 stat 自己的会话目录，扫描只发生在取字节时。
 
 ## 工程与工具链
 

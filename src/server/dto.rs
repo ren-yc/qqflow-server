@@ -132,7 +132,7 @@ pub struct AccountQqMismatch {
 }
 // ── 消息（原生面）─────────────────────────────────────────
 
-/// `GET|POST /api/v1/messages`（原生面）。
+/// `GET /api/v1/messages`（原生面）。
 ///
 /// 消息项直接复用 `store::query::MessageOut` —— 它已经是类型化定义，条件键也已用
 /// `skip_serializing_if` 表达，不另建平行 struct（两份迟早漂移）。
@@ -152,30 +152,48 @@ pub struct MessagesNative {
 
 /// 本页的导出能力/状态。
 ///
-/// `exportPath` 在**未请求导出时是空串**（不是省略）——「空串 = 没有导出」与「有路径 =
-/// 导出了」的区别是下游的判据。
+/// `exportPath` 只在**本次请求真的执行了导出**时出现（那时它是导出根）。空串会被读成
+/// 「有路径、只是空的」，而「没导出」与「导出到空路径」在下游是两件事。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaEnvelope {
     pub count: usize,
     pub enabled: bool,
-    pub export_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export_path: Option<String>,
 }
 
 // ── 消息（ChatLab 混合面）─────────────────────────────────
 
-/// `GET|POST /api/v1/messages?chatlab=1`。
+/// `GET /chatlab/messages`（消息面）。
+///
+/// **不带 `success`**：它输出的是数据信封，而 `success` 是「操作结果」的语言 —— 两者同时
+/// 出现时，读者无法判断 `count`/`page` 是否可信。翻页信息一律走 `page`，与发现面同规。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct MessagesChatlab {
+pub struct ChatlabMessages {
     pub chatlab: ChatlabHeader,
+    /// **本页条数**（不是总数）—— 总数不在这个面上表达，分页语义由 `page` 承担。
     pub count: usize,
-    pub has_more: bool,
     pub members: Vec<ChatlabMember>,
     pub messages: Vec<ChatlabMessage>,
     pub meta: ChatlabMeta,
-    pub success: bool,
+    pub page: Page,
     pub talker: String,
+}
+
+/// 一条消息的媒体**元数据**（拉取面与消息面同形）。
+///
+/// 它**不是**「字节可取」的承诺：无媒体时整个键省略；`fileName` 只有在导出确实写出了本地
+/// 副本、且名字由内容键派生之后才是可取句柄（那时它是**实际导出文件名**），否则它只是这条消息
+/// 自带的文件名。`md5` 取不到时省略该键 —— 未导出不等于没有摘要。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaBrief {
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    pub r#type: String,
 }
 
 /// ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）—— 快照里靠时钟哨兵掩码。
@@ -213,17 +231,24 @@ pub struct ChatlabMember {
     pub platform_id: String,
 }
 
-/// 混合面的 ChatLab 消息项。
+/// 消息面的 ChatLab 消息项。
 ///
-/// **没有 `replyToMessageId`** —— 与 `weflow-server` 的同名面**不同**（那边有）。
-/// 不要在两个仓库间统一这个差异。
+/// 三个面（原生面、消息面、拉取面）在 `replyToMessageId` 与 `media` 上**同规**：无引用时
+/// 省略该键（规范把它列为可选 *string*，给 `null` 会让信任类型的读者拿到解析不了的值），
+/// 无媒体时省略整个 `media` 键。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatlabMessage {
     pub account_name: String,
     pub content: String,
     pub group_nickname: String,
+    /// 媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaBrief>,
     pub platform_message_id: String,
+    /// **无引用时省略该键**（不是给 `null`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
     pub sender: String,
     pub timestamp: i64,
     pub r#type: i64,
@@ -253,6 +278,9 @@ pub struct PullMessage {
     pub account_name: String,
     pub content: String,
     pub group_nickname: String,
+    /// 媒体元数据；无媒体时**整个键省略**（见 `MediaBrief`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaBrief>,
     pub platform_message_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
@@ -295,7 +323,7 @@ pub struct SessionNative {
     pub username: String,
 }
 
-/// `GET /api/v1/sessions?format=chatlab`。
+/// `GET /chatlab/sessions`（ChatLab 形状的会话发现面）。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SessionsChatlab {
     pub count: usize,
@@ -319,9 +347,7 @@ pub struct SessionChatlab {
     pub id: String,
     /// 最新消息时间戳（秒）。
     pub last_message_at: i64,
-    /// 消息总数。**恒为 `0`**：本仓库不维护每会话条数。
-    ///
-    /// 键要留着 —— 下游按它排序，缺键与「是 0」在下游不是同一件事。
+    /// 消息总数（索引里该会话的条数）。**键恒保留** —— 缺键与「是 0」在下游不是同一件事。
     pub message_count: i64,
     /// 会话名称（群名/联系人名）。
     pub name: String,
@@ -341,7 +367,7 @@ pub struct SessionChatlab {
 
 // ── 联系人 ────────────────────────────────────────────────
 
-/// `GET|POST /api/v1/contacts`。
+/// `GET /api/v1/contacts`。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Contacts {
@@ -356,7 +382,7 @@ pub struct Contacts {
 
 // ── 群成员 ────────────────────────────────────────────────
 
-/// `GET|POST /api/v1/group-members`。
+/// `GET /api/v1/group-members`（成员集合是名册 ∪ 发言人）。
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMembers {
@@ -367,7 +393,11 @@ pub struct GroupMembers {
     pub from_cache: bool,
     pub members: Vec<GroupMember>,
     pub success: bool,
-    /// **毫秒级**墙钟（缓存写入时间）。快照靠时钟哨兵掩码。
+    /// **毫秒级**墙钟，取值是**本次响应的生成时刻**。
+    ///
+    /// **它不表示索引新鲜度** —— 想要「这份成员表有多旧」的客户端拿不到答案（本仓没有记录索引
+    /// 构建时刻）。weflow 的同名字段是索引构建完成时刻，两仓含义不同：这是**允许差异**，
+    /// 写在这里而不是留给调用方猜。（快照靠时钟哨兵掩码。）
     pub updated_at: i64,
 }
 
@@ -417,11 +447,17 @@ pub struct NotificationFrame {
     /// 事件名。帧头（`event:` 行）与载荷里各有一份，**不是**重复：只解析 `data:` 行的客户端
     /// 也要能分辨类型。
     pub event: String,
-    /// 事件通道自己的标识；基线事件为 `null`。
+    /// 事件通道自己的标识；基线事件**省略该键**（不是给 `null`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
-    /// 平台消息 id；取不到时为 `null`（键保留）。
+    /// 平台消息 id；取不到时**省略该键**。撤回帧里它是被撤回那条消息的平台号，
+    /// `message.new` 不带（见类型头注释）。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub platform_message_id: Option<String>,
-    /// 所属会话；基线事件也可能带（它属于某个账号）。
+    /// 所属会话；基线事件也可能带（它属于某个账号）。**空串当作没有** ——
+    /// 基线事件的 `session_id` 是空串，而 `skip_serializing_if` 对空串无效，
+    /// 所以由调用方在构造时显式映射成 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// 事件时刻（秒）。
     pub timestamp: i64,
@@ -444,6 +480,9 @@ pub struct NotificationFrame {
 pub struct SyncFrame {
     /// 事件名（`sync`）。
     pub event: String,
+    /// 事件基线代号，注销时递增。**恒出现**（不是条件键）：客户端据此区分「注销后新账号刚开始」
+    /// （该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它，这两种情况在协议上是同一件事。
+    pub generation: u64,
     /// 各表的水位线。
     pub watermarks: Vec<WatermarkEntry>,
 }

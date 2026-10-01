@@ -28,7 +28,7 @@ use super::authorized;
 
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct Params {
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
     /// Last-Event-ID 作为查询参数，给设不了头的客户端（浏览器 `EventSource` 就没法发头）。
     #[serde(default, alias = "last_event_id")]
@@ -80,9 +80,12 @@ fn serialize_notification(ev: Event) -> (String, serde_json::Value) {
     };
     let frame = NotificationFrame {
         event: name.clone(),
+        // 空串**显式映射成 None**：基线事件（如 session.sync）没有会话，而
+        // skip_serializing_if 对空串无效 —— 不映射就会下发一个空的 sessionId，
+        // 读者无法把它与「真的有一个空 id 的会话」区分开。
         event_id: if is_message { Some(ev.rawid.clone()) } else { None },
         platform_message_id: None,
-        session_id: Some(ev.session_id.clone()),
+        session_id: (!ev.session_id.is_empty()).then(|| ev.session_id.clone()),
         timestamp: ev.timestamp,
         generation,
     };

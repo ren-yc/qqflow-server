@@ -42,7 +42,7 @@ pub struct Params {
     pub qq: Option<String>,
     pub key: Option<String>,
     pub db_path: Option<String>,
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 
@@ -53,7 +53,7 @@ pub struct Params {
 /// proxy logs and shell history.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ListParams {
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 
@@ -248,12 +248,12 @@ pub async fn handler(
 pub struct DeleteParams {
     #[serde(default)]
     pub purge_media: FlexBool,
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 
-/// `DELETE /api/v1/accounts/{qq}` (and the `POST .../{qq}/deregister` alias)
-/// — undo a registration and return the server to its unregistered state.
+/// `DELETE /api/v1/accounts/{qq}` — undo a registration and return the server to its
+/// unregistered state. （`POST .../{qq}/deregister` 别名已删除：注销只有一条路。）
 ///
 /// The `qq` in the path is a safety interlock, not a selector: there is only
 /// ever one binding, so naming the wrong account is a client bug worth

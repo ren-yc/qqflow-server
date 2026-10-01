@@ -1,11 +1,8 @@
-//! GET|POST /api/v1/messages — query messages of one session.
+//! GET /api/v1/messages — 原生/富数据形状的消息查询。
 //!
-//! WeFlow contract: `talker` required; `limit` (1..=10000, default 100),
-//! `offset`, `start`/`end` (YYYYMMDD or unix seconds), `keyword`,
-//! `chatlab`/`format` output switch. The `media` param is accepted for
-//! WeFlow compatibility (media rides on every message via `MessageOut.media`
-//! and bytes are served by /api/v1/media/{id}); the envelope reports
-//! `media.enabled=true` with the page's media count.
+//! ChatLab 形状走 /chatlab/messages（见 chatlab_messages）。本模块保留**两个面共用**的部分
+//! （参数合成、查询、导出批次）：同一批参数在两个面上给出不同的页，是最难查的一类漂移 ——
+//! 两面各抄一份时，改一处忘另一处不会有任何东西变红。
 
 use std::sync::Arc;
 
@@ -20,10 +17,7 @@ use crate::store::query::{query_messages, MessageOut, MessageQuery};
 use crate::server::AppState;
 
 use super::{authorized, merge_body, parse_time_bound, FlexBool};
-use crate::server::dto::{
-    ChatlabHeader, ChatlabMember, ChatlabMessage, ChatlabMeta, MediaEnvelope, MessagesChatlab,
-    MessagesNative,
-};
+use crate::server::dto::{MediaEnvelope, MessagesNative};
 use crate::server::error::{ApiError, EnvelopeQuery};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -36,28 +30,21 @@ pub struct Params {
     pub start: Option<String>,
     pub end: Option<String>,
     pub keyword: Option<String>,
-    /// ChatLab output switch — bool (POST body) or "1"/"true" (query).
+    /// 媒体导出开关：true 时**真正导出本页**的媒体，并回填每条消息的导出字段。
     #[serde(default)]
-    pub chatlab: FlexBool,
-    #[serde(default)]
-    pub format: Option<String>,
-    /// WeFlow media export switch (alias `meiti`) — true exports this
-    /// page's media and fills mediaFileName/mediaUrl/mediaLocalPath.
-    /// Accepted as JSON bool or "1"/"true" (see `FlexBool`).
-    #[serde(default, alias = "meiti")]
     pub media: FlexBool,
-    /// Per-kind export sub-switches (default on; false / "0" disables;
-    /// `tupian`/`vioce` are the WeFlow spellings).
-    #[serde(default, alias = "tupian")]
+    /// 分类型子开关（默认开；false / "0" 关掉）。
+    #[serde(default)]
     pub image: FlexBool,
-    #[serde(default, alias = "vioce")]
+    #[serde(default)]
     pub voice: FlexBool,
     #[serde(default)]
     pub video: FlexBool,
-    /// Recognized but inert in v1: QQ emoji carry display text, no files.
+    /// 本仓库暂无可导出的 emoji 文件（QQ 的 emoji 只带展示文本），保留同样的开关以免
+    /// 参数面与 weflow 分叉。
     #[serde(default)]
     pub emoji: FlexBool,
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 
@@ -65,71 +52,99 @@ fn default_limit() -> usize {
     100
 }
 
-pub async fn handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    EnvelopeQuery(params): EnvelopeQuery<Params>,
-    body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
-    let params = merge_body(params, &body).await?;
-    if !authorized(&state, &headers, params.access_token.as_deref()) {
-        return Err(ApiError::unauthorized());
-    }
-    if !state.ready.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(ApiError::not_ready());
-    }
-    let talker = params.talker.as_deref().ok_or_else(|| ApiError::bad_request("缺少必填参数 talker"))?;
-    let limit = params.limit.clamp(1, 10000);
-    let q = MessageQuery {
+/// 把两个面共用的参数合成一次查询。
+///
+/// **参数怎么解释只有这一处**：时间界（`YYYYMMDD` 的 end 覆盖整天）、关键词大小写、
+/// `limit` 上限、`talker` 必填 —— 任一条在两处各写一遍就会漂移，而漂移的表现是
+/// 「同一批参数在两个面上给出不同的页」。
+pub(crate) fn build_query<'a>(
+    talker: Option<&'a str>,
+    limit: usize,
+    offset: usize,
+    start: Option<&str>,
+    end: Option<&str>,
+    keyword: Option<&'a str>,
+) -> Result<MessageQuery<'a>, ApiError> {
+    let talker = talker
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::bad_request("缺少必填参数 talker"))?;
+    Ok(MessageQuery {
         talker,
         limit,
-        offset: params.offset,
-        start: params.start.as_deref().and_then(|s| parse_time_bound(s, false)),
-        end: params.end.as_deref().and_then(|s| parse_time_bound(s, true)),
-        keyword: params.keyword.as_deref(),
-    };
-    let (items, has_more) = {
-        let store = state.store.read();
-        query_messages(&store, &q)
-    };
-
-    let chatlab = params.chatlab.is_true() || params.format.as_deref() == Some("chatlab");
-    let media_on = params.media.is_true();
-
-    let body = if chatlab {
-        // ChatLab output carries no export envelope (WeFlow parity).
-        chatlab_envelope(&state, talker, &items, has_more)
-    } else if media_on {
-        // WeFlow-shaped export: copy this page's media into the export
-        // root, fill per-message mediaFileName/mediaUrl/mediaLocalPath.
-        export_envelope(&state, talker, has_more, &params, items).await?
-    } else {
-        // No media param: capability envelope unchanged (compat) — media
-        // metadata still rides on every message.
-        let media_count = items.iter().filter(|m| m.media.is_some()).count();
-        envelope(
-            talker,
-            items.len(),
-            has_more,
-            MediaEnvelope {
-                count: media_count,
-                enabled: true,
-                export_path: String::new(),
-            },
-            items,
-        )
-    };
-    Ok(Json(body))
+        offset,
+        start: start.and_then(|s| parse_time_bound(s, false)),
+        // 上界取**当天末刻**：end=20250101 读作「到 1 月 1 日为止」，取当天 0 点会让那一整天
+        // 被静默排除在外。
+        end: end.and_then(|s| parse_time_bound(s, true)),
+        keyword: keyword.filter(|k| !k.is_empty()),
+    })
 }
 
-/// WeFlow message-envelope shape — one shared builder for the media=1 and
-/// compat paths so the contract field set cannot drift between them.
+/// 一次导出请求的分类型开关。
+pub(crate) struct MediaSwitches {
+    pub image: bool,
+    pub voice: bool,
+    pub video: bool,
+    pub emoji: bool,
+}
+
+impl MediaSwitches {
+    pub(crate) fn from_flags(
+        image: &FlexBool,
+        voice: &FlexBool,
+        video: &FlexBool,
+        emoji: &FlexBool,
+    ) -> Self {
+        Self {
+            image: !image.is_false(),
+            voice: !voice.is_false(),
+            video: !video.is_false(),
+            emoji: !emoji.is_false(),
+        }
+    }
+}
+
+/// 执行一批导出（阻塞池），返回填好导出字段的消息与成功条数。
+///
+/// 调用点必须在**读 guard 的 scope 之外**：guard 不是 Send，跨 await 拿着它编译不过。
+/// store 的媒体表在这里取一次快照（`media_entries`）—— 行自身的缓存路径缺失时
+/// （缓存索引兜底救回来的那些）导出走登记项，于是 `media=1` 与取字节用同一个来源。
+pub(crate) async fn run_export(
+    state: &AppState,
+    talker: &str,
+    switches: MediaSwitches,
+    items: Vec<MessageOut>,
+) -> Result<(Vec<MessageOut>, usize), ApiError> {
+    let opts = ExportOptions {
+        image: switches.image,
+        voice: switches.voice,
+        video: switches.video,
+        emoji: switches.emoji,
+    };
+    let (media_root, media_entries) = {
+        let store = state.store.read();
+        (store.media_root.clone(), store.media.clone())
+    };
+    let ctx = ExportContext {
+        root: state.export_root.as_ref().clone(),
+        base_url: state.base_url.as_str().to_string(),
+        talker: talker.to_string(),
+    };
+    tokio::task::spawn_blocking(move || {
+        media_export::export_page(&ctx, &opts, media_root.as_deref(), &media_entries, items)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("媒体导出任务异常: {e}")))
+}
+
+/// WeFlow 消息信封形状 —— 两条路径（导出 / 不导出）共用同一个构造点，
+/// 契约字段集就不会在它们之间漂移。
 fn envelope(
     talker: &str,
     count: usize,
     has_more: bool,
     media: MediaEnvelope,
-    messages: Vec<crate::store::query::MessageOut>,
+    messages: Vec<MessageOut>,
 ) -> Value {
     // 构造 DTO 后 `to_value`：`json!` 与 `to_value` 都经 BTreeMap（键被排序），因此**输出
     // 逐字节不变**，而类型化构造让「键名写错」变成编译错误。
@@ -144,156 +159,67 @@ fn envelope(
     .expect("消息信封必须可序列化")
 }
 
-/// WeFlow-shaped media export envelope (`media=1` / `meiti`): exports the
-/// page's media files into `<exportRoot>/<talker>/<kind>/<file>` and fills
-/// the per-message export fields; `count` = successfully exported messages.
-/// Missing sources (QQ cleared the cache) are skipped gracefully.
-///
-/// The copy loop runs on the blocking pool — export is real file IO and
-/// must never stall the tokio workers (concurrent exports would starve
-/// every other request, including SSE keep-alives).
-async fn export_envelope(
-    state: &AppState,
-    talker: &str,
-    has_more: bool,
-    params: &Params,
-    items: Vec<MessageOut>,
-) -> Result<Value, ApiError> {
-    let opts = ExportOptions {
-        image: !params.image.is_false(),
-        voice: !params.voice.is_false(),
-        video: !params.video.is_false(),
-        emoji: !params.emoji.is_false(),
-    };
-    let (media_root, media_entries) = {
+pub async fn handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    EnvelopeQuery(params): EnvelopeQuery<Params>,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let params = merge_body(params, &body).await?;
+    // 鉴权只看**查询串**：POST body 不是鉴权通道。
+    if !authorized(&state, &headers, params.access_token.as_deref()) {
+        return Err(ApiError::unauthorized());
+    }
+    if !state.ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::not_ready());
+    }
+    let limit = params.limit.clamp(1, 10000);
+    let q = build_query(
+        params.talker.as_deref(),
+        limit,
+        params.offset,
+        params.start.as_deref(),
+        params.end.as_deref(),
+        params.keyword.as_deref(),
+    )?;
+    let media_on = params.media.is_true();
+    let switches = MediaSwitches::from_flags(&params.image, &params.voice, &params.video, &params.emoji);
+
+    let (items, has_more) = {
         let store = state.store.read();
-        // `media_entries` = registered store.media snapshot: rows without a
-        // "45812" (cache-index-fallback rescues) export from their
-        // registered entry, so media=1 and /api/v1/media/{id} agree on one
-        // source per mediaId.
-        (store.media_root.clone(), store.media.clone())
+        query_messages(&store, &q)
     };
-    let ctx = ExportContext {
-        root: state.export_root.as_ref().clone(),
-        base_url: state.base_url.as_str().to_string(),
-        talker: talker.to_string(),
+
+    let (messages, media) = if media_on {
+        // WeFlow 形状的导出：把本页的媒体拷进导出根，并回填每条消息的导出字段。
+        let (messages, exported) = run_export(&state, q.talker, switches, items).await?;
+        (
+            messages,
+            MediaEnvelope {
+                count: exported,
+                enabled: true,
+                // 只有真的执行了导出才给导出根：「没导出」与「导出到空路径」在下游是两件事。
+                export_path: Some(state.export_root.to_string_lossy().into_owned()),
+            },
+        )
+    } else {
+        // 未请求导出：能力信封照旧，媒体元数据仍随每条消息下发。
+        let media_count = items.iter().filter(|m| m.media.is_some()).count();
+        (
+            items,
+            MediaEnvelope {
+                count: media_count,
+                enabled: true,
+                export_path: None,
+            },
+        )
     };
-    let export_path = ctx.root.to_string_lossy().into_owned();
-    let (messages, exported) = tokio::task::spawn_blocking(move || {
-        media_export::export_page(&ctx, &opts, media_root.as_deref(), &media_entries, items)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("媒体导出任务异常: {e}")))?;
-    Ok(envelope(
-        talker,
+
+    Ok(Json(envelope(
+        q.talker,
         messages.len(),
         has_more,
-        MediaEnvelope {
-            count: exported,
-            enabled: true,
-            export_path,
-        },
+        media,
         messages,
-    ))
-}
-
-/// ChatLab-style envelope for /api/v1/messages (meta + members + messages).
-///
-/// Carries the same outer keys as the native face (`talker` / `count` /
-/// `hasMore`): a client that picks the ChatLab shape should not have to switch
-/// to a different paging model just because it asked for different message
-/// bodies. `count` is the page size, matching the native face.
-fn chatlab_envelope(
-    state: &AppState,
-    talker: &str,
-    items: &[crate::store::query::MessageOut],
-    has_more: bool,
-) -> Value {
-    let store = state.store.read();
-    // find_conversation falls back to the other chat type, so an all-digit
-    // c2c peer uid resolves to its real conversation (and real meta.type).
-    let conv = store.find_conversation(talker);
-    let chat_type = conv
-        .map(|c| c.chat_type)
-        .unwrap_or_else(|| crate::store::query::classify_talker(talker).0);
-    let name = conv
-        .map(|c| store.display_name(c.chat_type, &c.talker))
-        .unwrap_or_else(|| talker.to_string());
-    // `accountName` (the account's own name) and `groupNickname` (the
-    // per-conversation group card "40090") are SEPARATE in ChatLab — same
-    // split as `chatlab_pull`. `MessageOut.senderName` is the card-wins merge
-    // of the two and keeps that meaning on the native surface, so resolve both
-    // halves independently here instead of reusing it for both keys.
-    let conv_key = conv.map(|c| crate::store::conv_key(c.chat_type, &c.talker));
-    let account_name = |uid: &str| store.display_uid(uid);
-    let group_card = |uid: &str| -> String {
-        if chat_type != crate::parser::types::ChatType::Group {
-            return String::new();
-        }
-        conv_key
-            .as_ref()
-            .and_then(|key| store.group_cards.get(key))
-            .and_then(|cards| cards.get(uid))
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_default()
-    };
-
-    // Senders in this page, deduped — the undeduped version repeated a member
-    // once per message they sent.
-    let members: Vec<ChatlabMember> = {
-        // 去重规则只有一处出处（`server::chatlab`）—— 两个面各写一遍时，改一处忘另一处就会让
-        // 同一个会话在两个面上成员不同。
-        let uids: Vec<String> = items.iter().map(|m| m.sender_username.clone()).collect();
-        crate::server::chatlab::dedup_senders(&uids)
-            .iter()
-            .map(|uid| {
-                crate::server::chatlab::member(uid, account_name(uid), group_card(uid))
-            })
-            .collect()
-    };
-    let messages: Vec<ChatlabMessage> = items
-        .iter()
-        .rev() // chatlab is chronological
-        .map(|m| ChatlabMessage {
-            account_name: account_name(&m.sender_username),
-            content: m.content.clone(),
-            group_nickname: group_card(&m.sender_username),
-            platform_message_id: m.server_id.clone(),
-            sender: m.sender_username.clone(),
-            timestamp: m.create_time,
-            // Canonical ChatLab 0.0.2 code. `localType` is the native space, so
-            // recover the variant first (see `MsgType::from_code`).
-            r#type: crate::parser::types::MsgType::from_code(m.local_type).chatlab_type(),
-        })
-        .collect();
-    serde_json::to_value(MessagesChatlab {
-        chatlab: ChatlabHeader {
-            exported_at: chrono::Utc::now().timestamp(),
-            generator: "qqflow-server".to_string(),
-            version: "0.0.2".to_string(),
-        },
-        count: messages.len(),
-        has_more,
-        members,
-        messages,
-        meta: ChatlabMeta {
-            group_id: talker.to_string(),
-            name,
-            // Same as the Pull face: the bound account. Only one account ever
-            // holds the binding, so the first Ready entry is unambiguous.
-            owner_id: state
-                .accounts
-                .read()
-                .iter()
-                .find(|a| a.state.is_ready())
-                .map(|a| a.qq.clone())
-                .unwrap_or_default(),
-            platform: "qq".to_string(),
-            r#type: chat_type.as_str().to_string(),
-        },
-        success: true,
-        talker: talker.to_string(),
-    })
-    .expect("ChatLab 信封必须可序列化")
+    )))
 }

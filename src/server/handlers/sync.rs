@@ -27,7 +27,7 @@ use super::{authorized, merge_body};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Params {
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 

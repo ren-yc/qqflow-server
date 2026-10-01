@@ -250,9 +250,12 @@ async fn health_discloses_no_account_detail() {
     assert!(accounts[1]["db_path"].is_null(), "no registry entry -> no path");
 }
 
-/// The detail endpoint accepts the same five token transports as every other
-/// authenticated route, and refuses the request without one. It is NOT
-/// ready-gated: a client polls it precisely while the account is `indexing`.
+/// The detail endpoint accepts the two remaining token transports and refuses
+/// everything else. It is NOT ready-gated: a client polls it precisely while
+/// the account is `indexing`.
+///
+/// 负向断言是这条用例的重点：`X-Api-Key` 与 `?token=` 此前各有正向断言，删通道时
+/// 「只删实现、留下断言」会让测试变红；而「只删断言、留下实现」不会有任何东西变红。
 #[tokio::test]
 async fn accounts_detail_auth_channels() {
     let state = state_with(Store::default(), false);
@@ -278,13 +281,24 @@ async fn accounts_detail_auth_channels() {
 
     for (uri, headers) in [
         ("/api/v1/accounts", vec![("authorization", "Bearer test-token-123456")]),
-        ("/api/v1/accounts", vec![("x-api-key", tok)]),
         ("/api/v1/accounts?access_token=test-token-123456", vec![]),
-        ("/api/v1/accounts?token=test-token-123456", vec![]),
     ] {
         let (s, v) = common::get_json(app.clone(), uri, &headers).await;
         assert_eq!(s, StatusCode::OK, "transport {uri} {headers:?} rejected: {v}");
         assert_eq!(v["accounts"][0]["state"], "indexing", "not ready-gated");
+    }
+
+    // 已删除的通道**不再被接受**：它们必须是 401 的那一支（而不是仍然 200）。
+    for (uri, headers) in [
+        ("/api/v1/accounts", vec![("x-api-key", tok)]),
+        ("/api/v1/accounts?token=test-token-123456", vec![]),
+    ] {
+        let (s, _) = common::get_json(app.clone(), uri, &headers).await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "已删除的通道必须 401：{uri} {headers:?}"
+        );
     }
 }
 
@@ -301,68 +315,114 @@ async fn sync_no_auth() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
-/// All five documented auth transports must be accepted (weflow-server
-/// parity). `X-Api-Key` and the `token` query/body spelling were previously
-/// rejected, so a client written against the shared contract got a 401 on two
-/// of the five forms the docs promise.
+/// 两条鉴权通道（Bearer 头与 `?access_token=` 查询参数）等价；被删掉的三条写法必须被拒。
+///
+/// 曾经有五条：`X-Api-Key`、`?token=` 与 POST body 里的同名键。每多一条通道就多一处
+/// 凭据会被复制到的地方（请求体、代理日志、客户端抓包），而它们鉴权的是同一个东西。
+/// 本用例把「只剩两条」钉住：只删实现、留下断言时它变红；只删断言、留下实现时不会有任何东西变红。
 #[tokio::test]
-async fn every_auth_transport_is_accepted() {
+async fn two_auth_transports_are_accepted_and_the_rest_are_not() {
     const TOKEN: &str = "test-token-123456";
 
-    // 1. Authorization: Bearer  2. X-Api-Key
-    for (name, value) in [("authorization", format!("Bearer {TOKEN}")), ("x-api-key", TOKEN.into())] {
-        let app = build_router(test_state());
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/sessions")
-                    .method("GET")
-                    .header(name, value.clone())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "header transport {name} rejected");
-    }
-
-    // 3. ?access_token=   4. ?token=
-    for key in ["access_token", "token"] {
-        let (s, _) = call(
-            build_router(test_state()),
-            &format!("/api/v1/sessions?{key}={TOKEN}"),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK, "query transport ?{key}= rejected");
-    }
-
-    // 5. the same two keys inside a POST JSON body
-    for key in ["access_token", "token"] {
-        let (s, _) = post_json(
-            build_router(test_state()),
-            "/api/v1/sessions",
-            json!({ key: TOKEN }),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK, "body transport {key} rejected");
-    }
-
-    // A wrong token on any transport must still be a 401.
-    let (s, _) = call(build_router(test_state()), "/api/v1/sessions?token=wrong").await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "wrong ?token= must not pass");
+    // 1. Authorization: Bearer
     let app = build_router(test_state());
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/api/v1/sessions")
                 .method("GET")
-                .header("x-api-key", "wrong")
+                .header("authorization", format!("Bearer {TOKEN}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "wrong X-Api-Key must not pass");
+    assert_eq!(resp.status(), StatusCode::OK, "Bearer 头必须被接受");
+
+    // 2. ?access_token=
+    let (s, _) = call(
+        build_router(test_state()),
+        &format!("/api/v1/sessions?access_token={TOKEN}"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "?access_token= 必须被接受");
+
+    // 被删的头通道：X-Api-Key
+    let app = build_router(test_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/sessions")
+                .method("GET")
+                .header("x-api-key", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "X-Api-Key 通道已删除");
+
+    // 被删的查询拼写：?token=
+    let (s, _) = call(build_router(test_state()), &format!("/api/v1/sessions?token={TOKEN}")).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "?token= 拼写已删除");
+
+    // 被删的 body 通道：注册端点是本服务仍然接受 POST body 的少数几个之一，把凭据键放进
+    // body **不会**让它通过鉴权 —— 合并参数时凭据键被跳过（见 handlers::merge_body）。
+    let payload = json!({ "access_token": TOKEN, "token": TOKEN, "qq": "10001" });
+    let app = build_router(test_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/accounts")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "body 里的凭据键不再是通道"
+    );
+
+    // 注销端点也接受 body，因此**同样要钉一遍**：两条端点共用同一个 merge_body，结构上安全，
+    // 但「结构上安全」与「有断言盯着」是两回事 —— 只删实现、留下断言时才会红。
+    let app = build_router(test_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/accounts/10001")
+                .method("DELETE")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "access_token": TOKEN, "token": TOKEN }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "DELETE 的 body 凭据也不得通过鉴权"
+    );
+
+    // 错 token 仍然是 401（两种写法各一条）。
+    let (s, _) = call(build_router(test_state()), "/api/v1/sessions?access_token=wrong").await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "错 token 不得通过");
+    let app = build_router(test_state());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/sessions")
+                .method("GET")
+                .header("authorization", "Bearer wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "错 Bearer 不得通过");
 }
 
 #[tokio::test]
@@ -447,7 +507,7 @@ async fn chatlab_sessions_page_reports_more() {
 
     let (s, v) = call(
         app.clone(),
-        "/api/v1/sessions?format=chatlab&limit=1&access_token=test-token-123456",
+        "/chatlab/sessions?limit=1&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -461,7 +521,7 @@ async fn chatlab_sessions_page_reports_more() {
     // Following the cursor serves the remainder and then reports completion.
     let (s, v) = call(
         app.clone(),
-        &format!("/api/v1/sessions?format=chatlab&limit=1&cursor={cursor}&access_token=test-token-123456"),
+        &format!("/chatlab/sessions?limit=1&cursor={cursor}&access_token=test-token-123456"),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -471,45 +531,108 @@ async fn chatlab_sessions_page_reports_more() {
 
     // A page that already covers everything reports completion immediately.
     let (_, v) = call(
-        app,
-        "/api/v1/sessions?format=chatlab&limit=50&access_token=test-token-123456",
+        app.clone(),
+        "/chatlab/sessions?limit=50&access_token=test-token-123456",
     )
     .await;
     assert_eq!(v["count"], 2);
     assert_eq!(v["page"]["hasMore"], false);
-}
 
-/// The ChatLab face of `/api/v1/messages` carries the same outer paging keys
-/// as the native face.
-///
-/// Regression: it returned `{success, chatlab, meta, members, messages}` only,
-/// so a client that asked for `chatlab=1` to get a different message body also
-/// silently lost `talker` / `count` / `hasMore` — it had to switch to a
-/// different paging model just to walk the conversation.
-#[tokio::test]
-async fn chatlab_face_carries_the_outer_paging_keys() {
-    let app = build_router(test_state());
-
-    // The fixture group holds two messages; take one at a time.
-    let (s, v) = call(
+    // **分面回归**：老面只认 offset、发现面认 cursor。这不是可有可无的差别 ——
+    // 若老面「照旧接受」cursor，调用方以为自己在翻页，实际每次都拿到第一页，
+    // 而且没有任何东西会报错（未知参数一律静默忽略）。
+    // 断言写成「与发现面的第一页比较」而不是写死 id：夹具的排序由最后消息时间决定，
+    // 写死 id 会让这条回归在夹具时间戳变化时以另一种理由变红。
+    let (_, discovery_first) = call(
         app.clone(),
-        "/api/v1/messages?talker=10001&limit=1&chatlab=1&access_token=test-token-123456",
+        "/chatlab/sessions?limit=1&access_token=test-token-123456",
+    )
+    .await;
+    let first_id = discovery_first["sessions"][0]["id"].clone();
+    let (s, native) = call(
+        app.clone(),
+        "/api/v1/sessions?limit=1&cursor=1&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["success"], true);
-    assert_eq!(v["talker"], "10001", "the echoed talker, as on the native face");
-    assert_eq!(v["count"], 1, "count is the page size");
-    assert_eq!(v["hasMore"], true, "a truncated page must say so");
-
-    // A page that covers everything reports completion instead.
-    let (_, v) = call(
+    assert_eq!(native["count"], 1);
+    assert_eq!(
+        native["sessions"][0]["username"], first_id,
+        "老面不认识 cursor：它必须仍然返回第一页"
+    );
+    let (s, discovery_second) = call(
         app,
-        "/api/v1/messages?talker=10001&limit=5000&chatlab=1&access_token=test-token-123456",
+        "/chatlab/sessions?limit=1&cursor=1&access_token=test-token-123456",
     )
     .await;
-    assert_eq!(v["count"], 2);
-    assert_eq!(v["hasMore"], false);
+    assert_eq!(s, StatusCode::OK);
+    assert_ne!(
+        discovery_second["sessions"][0]["id"], first_id,
+        "发现面认识 cursor：它必须翻到第二页"
+    );
+}
+
+/// 消息面（`/chatlab/messages`）的信封：**没有 success**、`count` 是**本页条数**、
+/// 翻页走 `page`、消息**升序**，且 cursor 续页不重不丢。
+///
+/// 回归：这个形状此前挂在 `/api/v1/messages?chatlab=1` 上，信封里带 `success` 与
+/// `hasMore`（而且那个键名是 Rust 字段名，不是 JSON 键）—— 读者无法判断 `count`/`page`
+/// 是否可信，翻页信息与数据也混在同一层。
+#[tokio::test]
+async fn chatlab_message_face_envelope_and_cursor() {
+    let app = build_router(test_state());
+
+    let (s, v) = call(
+        app.clone(),
+        "/chatlab/messages?talker=10001&limit=1&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["talker"], "10001", "回显请求的会话");
+    assert!(v.get("success").is_none(), "数据信封不带 success: {v}");
+    assert_eq!(v["count"], 1, "count 是本页条数，不是总数");
+    assert_eq!(v["page"]["hasMore"], true, "截断必须显式告知");
+    let cursor = v["page"]["nextCursor"]
+        .as_str()
+        .expect("截断时必须给游标")
+        .to_string();
+
+    // 用自己发出的 nextCursor 续页：不重不丢。
+    let (s, v2) = call(
+        app.clone(),
+        &format!(
+            "/chatlab/messages?talker=10001&limit=1&cursor={cursor}&access_token=test-token-123456"
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v2["count"], 1);
+    assert_ne!(
+        v["messages"][0]["platformMessageId"], v2["messages"][0]["platformMessageId"],
+        "跨页不得重复（游标是排他的）"
+    );
+    assert_eq!(v2["page"]["hasMore"], false);
+    assert!(v2["page"]["nextCursor"].is_null(), "排空后没有游标");
+
+    // 一页装得下时立刻报完成；同时钉住**升序**（原生面是降序）。
+    let (_, v3) = call(
+        app.clone(),
+        "/chatlab/messages?talker=10001&limit=5000&access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(v3["count"], 2);
+    assert_eq!(v3["page"]["hasMore"], false);
+    let ts: Vec<i64> = v3["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["timestamp"].as_i64().unwrap())
+        .collect();
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "消息必须升序：{ts:?}");
+
+    // 缺 talker -> 400（与原生面同规）。
+    let (s, _) = call(app, "/chatlab/messages?access_token=test-token-123456").await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
 const SEQ2: i64 = 0x6771A6B60002;
@@ -576,48 +699,62 @@ async fn messages_end_date_covers_the_whole_day() {
 
 #[tokio::test]
 async fn messages_media_enabled_v1() {
-    let (s, v) = get(
+    // 一个 app 走完全程：导出写进**这个** state 的导出根，取字节也必须命中同一个根。
+    let app = build_router(test_state());
+    let (s, v) = common::get_json(
+        app.clone(),
         "/api/v1/messages?talker=10001&media=1&access_token=test-token-123456",
-        false,
+        &[],
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["media"]["enabled"], true);
-    // media=1 triggers the WeFlow-shaped export: exportPath = real root,
-    // count = exported messages, per-message mediaFileName/Url/LocalPath.
+    // media=1 触发 WeFlow 形状的导出：exportPath = 真实导出根、count = 成功导出的条数、
+    // 每条消息回填 mediaFileName/Url/LocalPath。
     let export_path = v["media"]["exportPath"].as_str().unwrap();
     assert!(!export_path.is_empty(), "media=1 exports into a real directory");
     assert_eq!(v["media"]["count"], 1);
     let m0 = &v["messages"][0];
-    // Export names are key-derived (<md5>.<source ext>): unique per content.
+    // 导出名由内容键派生（<md5>.<源扩展名>）：同内容同名、异内容异名。
     let exported_name = "aabbccddeeff00112233445566778899.jpg";
     assert_eq!(m0["mediaFileName"], exported_name);
     // 根相对路径、不含凭据；调用方按自己的基址拼接（响应体里带 token 会泄漏到日志与转发）。
-    assert_eq!(
-        m0["mediaUrl"],
-        format!("/api/v1/media/10001/images/{exported_name}")
-    );
+    // **单段形式**：{id} 就是导出文件名 —— 三段式要求调用方知道会话与类型，而那两个信息
+    // 在导出结果里本来就有，多要一次只是让调用方多一处能写错的地方。
+    assert_eq!(m0["mediaUrl"], format!("/api/v1/media/{exported_name}"));
     assert!(
         m0["mediaLocalPath"].as_str().unwrap().starts_with(export_path),
         "mediaLocalPath under exportPath"
     );
-    // The exported file exists on disk with the exact bytes.
+    // 导出的文件确实在盘上，且**按名取字节拿到的就是同一份** —— 这是「出现即可取」的
+    // 端到端钉子：句柄由内容摘要派生，所以跨会话按名解析是安全的。
     let exported = std::fs::read(m0["mediaLocalPath"].as_str().unwrap()).unwrap();
     assert_eq!(exported, b"\xFF\xD8 fake jpeg bytes \xFF\xD9");
+    let (s, _) = common::get_json(
+        app.clone(),
+        &format!("/api/v1/media/{exported_name}?access_token=test-token-123456"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "导出的文件必须能按名取回");
     // Structured metadata + mediaId direct-serve survive alongside export.
     assert_eq!(m0["media"]["md5"], "aabbccddeeff00112233445566778899");
     assert_eq!(m0["media"]["uuid"], "R020-test");
     assert_eq!(m0["mediaId"], "aabbccddeeff00112233445566778899");
-    // The no-media request keeps the compat envelope — assert its BODY, not
-    // just its status (the media=1 response above must not leak into it).
-    let (s, v2) = get(
+    // 未请求导出的那一次：信封照旧（enabled 与媒体计数还在），但**没有 exportPath** ——
+    // 「没导出」与「导出到空路径」在下游是两件事。
+    let (s, v2) = common::get_json(
+        app,
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
-        false,
+        &[],
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v2["media"]["enabled"], true);
-    assert_eq!(v2["media"]["exportPath"], "", "no media=1 -> empty exportPath");
+    assert!(
+        v2["media"].get("exportPath").is_none(),
+        "没执行导出就没有 exportPath：{v2}"
+    );
     assert_eq!(v2["media"]["count"], 1, "media metadata still counted");
     assert!(v2["messages"][0]["mediaFileName"].is_null(), "no export fields without media=1");
     assert!(v2["messages"][1]["media"].is_null(), "text message has no media");
@@ -627,10 +764,71 @@ async fn messages_media_enabled_v1() {
     assert_eq!(v2["messages"][1]["isSend"], 1, "rowid 1 is self-sent");
 }
 
+/// 新消息面的 `media=1` **真的执行导出**，并把落盘那条的 `fileName` 回填成实际导出名。
+///
+/// 旧的混合面在收集导出任务**之前**就 return 了，所以 `media=1` 在 ChatLab 形状上从未导出过 ——
+/// 「先触发导出、再取字节」这条两步走在那个面上并不成立，而没有任何测试会发现。
 #[tokio::test]
-async fn messages_without_media_param_keeps_compat_envelope() {
-    // No media param: capability envelope unchanged (exportPath ""), media
-    // metadata still rides on messages.
+async fn chatlab_messages_face_runs_the_media_export() {
+    let app = build_router(test_state());
+    let (s, v) = common::get_json(
+        app.clone(),
+        "/chatlab/messages?talker=10001&media=1&access_token=test-token-123456",
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // 信封不因 media=1 而变：无 success、count 是本页条数、page 恒出现。
+    assert!(v.get("success").is_none(), "数据信封不带 success：{v}");
+    assert_eq!(v["count"].as_u64().unwrap() as usize, v["messages"].as_array().unwrap().len());
+    assert!(v["page"]["hasMore"].is_boolean());
+
+    // 落盘的那条：fileName 是**实际导出名**（取自 store 键 ⇒ 可作句柄）。
+    let exported_name = "aabbccddeeff00112233445566778899.jpg";
+    let img = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["media"].is_object())
+        .expect("夹具里有一条图片消息");
+    assert_eq!(img["media"]["type"], "image");
+    assert_eq!(
+        img["media"]["fileName"], exported_name,
+        "落盘后 fileName 必须是实际导出名，而不是消息自带的元数据名：{img}"
+    );
+    // 元数据名与导出名**不同**，所以上面那条断言有区分力（夹具里是 aabb.png）。
+    assert_eq!(img["media"]["md5"], "aabbccddeeff00112233445566778899");
+
+    // 回填出来的名字确实能取回字节 —— 端到端钉子。
+    let (s, _) = common::get_json(
+        app.clone(),
+        &format!("/api/v1/media/{exported_name}?access_token=test-token-123456"),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "回填的句柄必须能取回字节");
+
+    // 没请求导出的那一次：fileName 保持消息自带的元数据名（不给句柄）。
+    let (s, v2) = common::get_json(
+        app,
+        "/chatlab/messages?talker=10001&access_token=test-token-123456",
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let img2 = v2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["media"].is_object())
+        .unwrap();
+    assert_eq!(img2["media"]["fileName"], "aabb.png", "没导出 ⇒ 只给元数据");
+}
+
+#[tokio::test]
+async fn messages_without_media_param_omits_export_path() {
+    // 未请求导出：能力信封照旧（enabled 与媒体计数还在），媒体元数据仍随消息下发，
+    // 但**没有 exportPath** —— 空串会被读成「有路径、只是空的」。
     let (s, v) = get(
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
         false,
@@ -638,30 +836,37 @@ async fn messages_without_media_param_keeps_compat_envelope() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["media"]["enabled"], true);
-    assert_eq!(v["media"]["exportPath"], "");
+    assert!(v["media"].get("exportPath").is_none(), "no export -> no exportPath: {v}");
     assert_eq!(v["media"]["count"], 1);
     assert!(v["messages"][0]["mediaFileName"].is_null(), "no export fields without media=1");
 }
 
+/// 分类型子开关照常；被删掉的旧拼写（meiti / tupian）**静默忽略**。
+///
+/// 未知参数不报错是既有契约（全仓没有 deny_unknown_fields），所以「删别名」的可观测后果
+/// 只有一个：它不再有作用。把这一点钉住 —— 否则删别名与「别名还在」在测试上无法区分。
 #[tokio::test]
-async fn messages_media_alias_and_kind_switches() {
-    // meiti alias triggers the export like media=1.
+async fn messages_media_kind_switches_and_removed_aliases() {
+    // meiti 曾等价于 media=1；现在它连「导出」都不触发。
     let (s, v) = get(
         "/api/v1/messages?talker=10001&meiti=1&access_token=test-token-123456",
         false,
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["media"]["count"], 1, "meiti alias exports");
-    // tupian=0 disables image export: count 0, no per-message fields.
+    assert_eq!(v["media"]["count"], 1, "媒体计数照旧");
+    assert!(v["media"].get("exportPath").is_none(), "meiti 不再触发导出: {v}");
+    assert!(v["messages"][0]["mediaFileName"].is_null(), "meiti 不再回填导出字段");
+    // media=1 搭配 image=0：分类型子开关仍然是有效的（tupian 这个旧拼写已被忽略）。
     let (s, v) = get(
-        "/api/v1/messages?talker=10001&media=1&tupian=0&access_token=test-token-123456",
+        "/api/v1/messages?talker=10001&media=1&image=0&tupian=0&access_token=test-token-123456",
         false,
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["media"]["count"], 0, "tupian=0 skips image export");
+    assert_eq!(v["media"]["count"], 0, "image=0 skips image export");
     assert!(v["messages"][0]["mediaFileName"].is_null());
+    assert_eq!(v["media"]["enabled"], true, "能力开关本身不变");
 }
 
 #[tokio::test]
@@ -679,74 +884,146 @@ async fn media_id_omitted_when_store_has_no_entry() {
     assert!(m0["mediaId"].is_null(), "mediaId omitted when not fetchable");
 }
 
+/// `{id}` 的两个来源：store 键（本地缓存，直服）与**导出文件名**（导出根回落）。
+///
+/// 三条规则在这里钉住：① store 键优先；② 同名多命中时**内容一致才服务**（不一致 404）；
+/// ③ 只有四个类型目录参与解析 —— 别的目录里就算躺着同名文件也不服务。
+/// 穿越拒绝与 kinds 白名单原本由三段式路由承载，这一并迁到这里；断言里用到的文件都真实
+/// 存在于盘上，所以不会因为「文件不在」而假绿。
 #[tokio::test]
-async fn media_single_segment_post_serves_bytes() {
-    // The {id} route is GET|POST like the three-segment route (POST with
-    // the token in the body is the documented transport).
+async fn media_by_id_serves_store_keys_and_exported_names() {
     let state = test_state();
+    let export_root = state.export_root.as_ref().clone();
+    let dir = export_root.join("10001").join("images");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = "aabbccddeeff00112233445566778899.jpg";
+    let bytes: &[u8] = b"exported bytes";
+    std::fs::write(dir.join(name), bytes).unwrap();
     let app = build_router(state);
-    let (s, _v) = post_json(
+
+    async fn get_bytes(app: axum::Router, uri: String) -> (StatusCode, Vec<u8>) {
+        let resp = app
+            .oneshot(Request::builder().uri(uri).method("GET").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, b.to_vec())
+    }
+
+    // ① store 键：直服本地缓存里的文件。
+    let (s, b) = get_bytes(
         app.clone(),
-        "/api/v1/media/aabbccddeeff00112233445566778899",
+        "/api/v1/media/aabbccddeeff00112233445566778899?access_token=test-token-123456".into(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(&b[..], b"\xFF\xD8 fake jpeg bytes \xFF\xD9", "store 键直服本地缓存");
+
+    // ② 导出根回落：{id} 是导出文件名（不带会话，按名在四个类型目录下解析）。
+    let uri = format!("/api/v1/media/{name}?access_token=test-token-123456");
+    let (s, b) = get_bytes(app.clone(), uri.clone()).await;
+    assert_eq!(s, StatusCode::OK, "导出根回落必须能取到字节");
+    assert_eq!(&b[..], bytes);
+
+    // ③ 同名同内容 ⇒ 不算冲突，照常服务。
+    let other = export_root.join("u_b").join("images");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join(name), bytes).unwrap();
+    let (s, _) = get_bytes(app.clone(), uri.clone()).await;
+    assert_eq!(s, StatusCode::OK, "同名同内容不算冲突");
+
+    // ④ 同名但大小不同 ⇒ 404（先比 size 短路，不必读整份文件）。
+    std::fs::write(other.join(name), b"different size").unwrap();
+    let (s, _) = get_bytes(app.clone(), uri.clone()).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "同名不同内容必须拒绝服务");
+
+    // ⑤ 同大小、不同内容 ⇒ 同样 404。只比 size 就判「一致」的实现会在这里放行，
+    //    而那正是「出现即可取」被破坏的形态。
+    let mut same_size = bytes.to_vec();
+    same_size[0] ^= 0xFF;
+    assert_eq!(same_size.len(), bytes.len());
+    std::fs::write(other.join(name), &same_size).unwrap();
+    let (s, _) = get_bytes(app.clone(), uri.clone()).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "同大小不同内容也是冲突");
+
+    // ⑥ kinds 白名单有区分力：把唯一命中挪到非法目录里，它必须取不到
+    //    （文件真实存在，所以这条断言不是因为「文件不在」而假绿）。
+    std::fs::remove_file(other.join(name)).unwrap();
+    std::fs::remove_file(dir.join(name)).unwrap();
+    let illegal = export_root.join("10001").join("files");
+    std::fs::create_dir_all(&illegal).unwrap();
+    std::fs::write(illegal.join(name), bytes).unwrap();
+    let (s, _) = get_bytes(app.clone(), uri.clone()).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "只有四个类型目录参与解析");
+    std::fs::write(dir.join(name), bytes).unwrap();
+
+    // ⑦ 穿越与坏名字：与导出侧共用同一条边界规则（pathsafe）。违规与「没这个名字」对
+    //    调用方是同一件事：都拿不到字节，都是 404。
+    for bad in ["a:b", "a..", "..", "evil."] {
+        let (s, _) = get_bytes(
+            app.clone(),
+            format!("/api/v1/media/{bad}?access_token=test-token-123456"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{bad} 必须被拒绝");
+    }
+
+    // ⑧ 未命中统一「媒体不存在」（统一信封，不是裸 error 键）。
+    let (s, b) = get_bytes(
+        app.clone(),
+        "/api/v1/media/nosuchfile.jpg?access_token=test-token-123456".into(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let v: Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["success"], false);
+    assert_eq!(v["code"], 404);
+    assert!(v.get("error").is_none(), "no bare error key: {v}");
+
+    // ⑨ 读端点只留 GET：POST 是 405（「body 带 token 的 POST」不再是通道）。
+    let (s, _) = post_json(
+        app,
+        &format!("/api/v1/media/{name}"),
         json!({"access_token": "test-token-123456"}),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "POST /api/v1/media/{{id}} must not 405");
-    // Without the token the POST is rejected like any other route.
-    let (s, _v) = post_json(app, "/api/v1/media/aabbccddeeff00112233445566778899", json!({})).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
 }
 
+/// 读端点只留 GET：POST 一律 405；动作端点与免鉴权的 /health 保留两个方法。
+///
+/// 这也是「POST body 不再是鉴权通道」的端到端钉子：把 token 放进 body 的 POST 连门都进不去。
 #[tokio::test]
-async fn post_body_booleans_for_media_params() {
-    // JSON booleans in the POST body must work exactly like ?media=1 —
-    // the two transports share one contract.
-    let state = test_state();
-    let app = build_router(state);
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/v1/messages",
-        json!({
-            "talker": "10001",
-            "media": true,
-            "access_token": "test-token-123456",
-        }),
+async fn read_endpoints_reject_post() {
+    for uri in [
+        "/api/v1/messages?talker=10001",
+        "/api/v1/sessions",
+        "/api/v1/contacts",
+        "/api/v1/group-members",
+        "/api/v1/media/x.jpg",
+        "/api/v1/push/messages",
+        "/chatlab/messages?talker=10001",
+        "/chatlab/sessions",
+    ] {
+        let (s, v) = post_json(
+            build_router(test_state()),
+            uri,
+            json!({"access_token": "test-token-123456"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED, "{uri} 只接受 GET：{v}");
+    }
+    // 动作端点（同步）与 /health 保留 POST。
+    let (s, _) = post_json(
+        build_router(test_state()),
+        "/api/v1/sync?access_token=test-token-123456",
+        json!({}),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "media:true must not 400");
-    assert_eq!(v["media"]["enabled"], true);
-    assert_eq!(v["media"]["count"], 1, "JSON bool media triggers the export");
-    assert!(!v["messages"][0]["mediaFileName"].is_null());
-
-    // Per-kind switches accept JSON bools too: image:false skips images.
-    let (s, v) = post_json(
-        app.clone(),
-        "/api/v1/messages",
-        json!({
-            "talker": "10001",
-            "media": true,
-            "image": false,
-            "access_token": "test-token-123456",
-        }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "image:false must not 400");
-    assert_eq!(v["media"]["count"], 0, "image:false disables the image export");
-    assert!(v["messages"][0]["mediaFileName"].is_null());
-
-    // chatlab accepts a JSON bool as well (same contract class).
-    let (s, v) = post_json(
-        app,
-        "/api/v1/messages",
-        json!({
-            "talker": "10001",
-            "chatlab": true,
-            "access_token": "test-token-123456",
-        }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "chatlab:true must not 400");
-    assert_eq!(v["chatlab"]["generator"], "qqflow-server");
+    assert_eq!(s, StatusCode::OK, "同步是动作端点，POST 保留");
+    let (s, _) = post_json(build_router(test_state()), "/health", json!({})).await;
+    assert_eq!(s, StatusCode::OK, "/health 免鉴权且保留 POST");
 }
 
 /// `test_state` plus the three name sources that compete for `senderName`,
@@ -868,7 +1145,7 @@ async fn chatlab_splits_account_name_from_group_nickname() {
     .await;
     let (s, chatlab) = call(
         app,
-        "/api/v1/messages?talker=10001&chatlab=1&access_token=test-token-123456",
+        "/chatlab/messages?talker=10001&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -904,7 +1181,7 @@ async fn chatlab_splits_account_name_from_group_nickname() {
     let app = build_router(state_with_names());
     let (s, c2c) = call(
         app,
-        "/api/v1/messages?talker=u_a&chatlab=1&access_token=test-token-123456",
+        "/chatlab/messages?talker=u_a&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -960,7 +1237,7 @@ async fn chatlab_type_is_the_chatlab_code_space_not_local_type() {
     // Same rows through the chatlab branch of /api/v1/messages agree...
     let (_, envelope) = call(
         app.clone(),
-        "/api/v1/messages?talker=10001&chatlab=1&access_token=test-token-123456",
+        "/chatlab/messages?talker=10001&access_token=test-token-123456",
     )
     .await;
     assert_eq!(envelope["messages"][0]["type"], 0);
@@ -1004,7 +1281,7 @@ async fn chatlab_meta_carries_owner_id_on_both_faces() {
     .await;
     let (_, envelope) = call(
         app,
-        "/api/v1/messages?talker=10001&chatlab=1&access_token=test-token-123456",
+        "/chatlab/messages?talker=10001&access_token=test-token-123456",
     )
     .await;
     assert!(pull["meta"]["ownerId"].is_string());
@@ -1407,15 +1684,14 @@ async fn accounts_validation_rejects_bad_input() {
         path: std::env::temp_dir().join("qqflow_smoke_10002.db"),
     });
     let app = build_router(state);
-    let tok = "test-token-123456";
 
     // Malformed key -> invalid_key (not an HTTP error). The path resolved
     // from the registry, so db_path rides along; the account never had a
     // state entry, so `status` is omitted.
     let (s, v) = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": tok, "qq": "10002", "key": "short"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10002", "key": "short"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1429,8 +1705,8 @@ async fn accounts_validation_rejects_bad_input() {
     // Unknown qq without a db_path -> unknown_qq, no path to echo.
     let (s, v) = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": tok, "qq": "999", "key": "0123456789abcdef"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "999", "key": "0123456789abcdef"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1441,8 +1717,8 @@ async fn accounts_validation_rejects_bad_input() {
     // Unresolvable db_path -> invalid_db_path.
     let (s, v) = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": tok, "qq": "999", "key": "0123456789abcdef", "db_path": "Z:\\nonexistent"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "999", "key": "0123456789abcdef", "db_path": "Z:\\nonexistent"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1450,7 +1726,7 @@ async fn accounts_validation_rejects_bad_input() {
     assert!(v["db_path"].is_null(), "unresolved -> db_path omitted: {v}");
 
     // Missing qq / key -> 400 envelope.
-    let (s, v) = post_json(app, "/api/v1/accounts", json!({"access_token": tok})).await;
+    let (s, v) = post_json(app, "/api/v1/accounts?access_token=test-token-123456", json!({})).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert_eq!(v["code"], 400);
 }
@@ -1467,12 +1743,11 @@ async fn accounts_idempotent_for_the_bound_account() {
         error: None,
     });
     let app = build_router(state);
-    let tok = "test-token-123456";
 
     let (s, v) = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": tok, "qq": "10001", "key": "0123456789abcdef"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10001", "key": "0123456789abcdef"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1501,8 +1776,8 @@ async fn accounts_error_state_echoes_status_on_reject() {
 
     let (s, v) = post_json(
         app,
-        "/api/v1/accounts",
-        json!({"access_token": "test-token-123456", "qq": "10003", "key": "short"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10003", "key": "short"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1533,8 +1808,8 @@ async fn accounts_rejects_a_second_account() {
 
     let (s, v) = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": "test-token-123456", "qq": "10002", "key": "0123456789abcdef"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10002", "key": "0123456789abcdef"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1570,8 +1845,8 @@ async fn accounts_conflict_survives_error_state() {
 
     let (s, v) = post_json(
         app,
-        "/api/v1/accounts",
-        json!({"access_token": "test-token-123456", "qq": "10002", "key": "0123456789abcdef"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10002", "key": "0123456789abcdef"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -1602,13 +1877,13 @@ async fn accounts_concurrent_different_qq_one_winner() {
 
     let a = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": "test-token-123456", "qq": "10001", "key": "0123456789abcdef"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10001", "key": "0123456789abcdef"}),
     );
     let b = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": "test-token-123456", "qq": "10002", "key": "0123456789abcdef"}),
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10002", "key": "0123456789abcdef"}),
     );
     let ((sa, va), (sb, vb)) = tokio::join!(a, b);
     assert_eq!(sa, StatusCode::OK);
@@ -1633,7 +1908,7 @@ async fn accounts_concurrent_different_qq_one_winner() {
 }
 
 /// Deregistration destroys the index, so an unauthenticated caller must not
-/// reach it — on either the DELETE route or its POST alias.
+/// reach it — the DELETE route is the only one left (the POST alias was removed).
 #[tokio::test]
 async fn deregister_requires_a_token() {
     let state = test_state();
@@ -1650,8 +1925,10 @@ async fn deregister_requires_a_token() {
     let (s, _) =
         common::delete_json(app.clone(), "/api/v1/accounts/10001?access_token=wrong", &[]).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "DELETE with a wrong token");
+    // POST 别名已删除：它连鉴权都到不了（404，而不是 401）。断言 404 而不是 405 是为了让
+    // 「删干净」有区分力 —— 只删路由、留下 handler 时这里会得到 405 或 200。
     let (s, _) = post_json(app.clone(), "/api/v1/accounts/10001/deregister", json!({})).await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "the POST alias is gated too");
+    assert_eq!(s, StatusCode::NOT_FOUND, "the POST alias is gone");
 
     // Every rejected attempt left the binding and the index alone.
     assert_eq!(
@@ -1699,7 +1976,7 @@ async fn deregister_enforces_the_qq_interlock() {
     let (s, v) = common::delete_json(
         app.clone(),
         "/api/v1/accounts/99999",
-        &[("X-Api-Key", "test-token-123456")],
+        &[("Authorization", "Bearer test-token-123456")],
     )
     .await;
     assert_eq!(s, StatusCode::OK, "a business verdict, not an HTTP error");
@@ -1794,8 +2071,8 @@ async fn deregister_returns_the_server_to_its_boot_state() {
     // point is that the occupancy check no longer rejects it).
     let (s, v) = post_json(
         app.clone(),
-        "/api/v1/accounts",
-        json!({"access_token": "test-token-123456", "qq": "10002",
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10002",
                "key": "0123456789abcdef", "db_path": db.to_string_lossy()}),
     )
     .await;
@@ -1891,10 +2168,14 @@ async fn deregister_purge_media_stays_inside_the_export_layout() {
     let _ = std::fs::remove_dir_all(&*root);
 }
 
-/// The POST alias exists for clients and proxies that cannot issue DELETE, and
-/// it must be the same handler — same verdicts, same body-carried parameters.
+/// 注销**只有 DELETE 一条路**：POST 别名已删除。
+///
+/// 别名曾经是为「发不出 DELETE 的客户端与代理」准备的，代价是多一条会改状态的路由 ——
+/// 它要单独鉴权、单独进接口描述、单独被下游覆盖；两条路做同一件事时，其中一条迟早漏掉
+/// 一次改动（这次的鉴权收敛与读端点收敛各是一次）。本用例把「删干净」钉住：路径不存在
+/// 是 **404**，而不是 405 或 200 —— 只删路由、留下 handler 时后两者才会出现。
 #[tokio::test]
-async fn deregister_post_alias_matches_the_delete_route() {
+async fn deregister_post_alias_is_gone_and_delete_still_works() {
     let state = test_state();
     state.accounts.write().push(qqflow_server::server::AccountState {
         qq: "10001".into(),
@@ -1904,29 +2185,30 @@ async fn deregister_post_alias_matches_the_delete_route() {
     });
     let app = build_router(state.clone());
 
-    // An account stuck in `error` still holds the binding, so clearing it is
-    // exactly what the alias has to be able to do. Token and `purge_media`
-    // both arrive in the JSON body here, not the query string.
-    let (s, v) = post_json(
+    // 别名：404，且**没有任何状态被改动**。
+    let (s, _) = post_json(
         app.clone(),
         "/api/v1/accounts/10001/deregister",
         json!({"access_token": "test-token-123456", "purge_media": false}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "POST 别名已删除");
+    assert!(
+        qqflow_server::server::bound_account(&state.accounts.read()).is_some(),
+        "失败的调用不得改状态"
+    );
+
+    // 正路：DELETE 仍然能清掉一个卡在 error 的账号（它仍然持有绑定）。
+    let (s, v) = common::delete_json(
+        app,
+        "/api/v1/accounts/10001?access_token=test-token-123456",
+        &[],
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["state"], "deregistered");
     assert_eq!(v["previous_status"], "error", "an error account can be cleared");
     assert!(qqflow_server::server::bound_account(&state.accounts.read()).is_none());
-
-    // Repeating it is idempotent, same as the DELETE route.
-    let (s, v) = post_json(
-        app,
-        "/api/v1/accounts/10001/deregister",
-        json!({"access_token": "test-token-123456"}),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["state"], "not_registered");
 }
 
 /// Golden 快照：每个 JSON 响应的**逐字节**护栏（含状态码）。
@@ -2070,13 +2352,13 @@ mod golden {
             ("health", "GET", "/health".to_string(), None),
             ("accounts", "GET", format!("/api/v1/accounts?access_token={t}"), None),
             ("sessions-native", "GET", format!("/api/v1/sessions?access_token={t}"), None),
-            ("sessions-chatlab", "GET", format!("/api/v1/sessions?format=chatlab&access_token={t}"), None),
             ("messages-native", "GET", format!("/api/v1/messages?talker=10001&limit=50&access_token={t}"), None),
-            ("messages-chatlab", "GET", format!("/api/v1/messages?talker=10001&limit=50&chatlab=1&access_token={t}"), None),
             ("messages-media", "GET", format!("/api/v1/messages?talker=10001&limit=50&media=1&access_token={t}"), None),
             ("pull", "GET", format!("/api/v1/sessions/10001/messages?limit=50&access_token={t}"), None),
             // ---- ChatLab 适配面（与老面共用实现，但它是独立路由，各钉各的快照）----
             ("chatlab-sessions", "GET", format!("/chatlab/sessions?access_token={t}"), None),
+            // 消息面：信封不带 success、count 是本页条数、消息升序、翻页走 page。
+            ("chatlab-messages", "GET", format!("/chatlab/messages?talker=10001&limit=50&access_token={t}"), None),
             ("chatlab-pull", "GET", format!("/chatlab/sessions/10001/messages?limit=50&access_token={t}"), None),
             ("contacts", "GET", format!("/api/v1/contacts?access_token={t}"), None),
             (
@@ -2124,15 +2406,10 @@ mod golden {
                 Some(serde_json::json!({ "qq": "20002", "key": "0123456789abcdef" })),
             ),
             // ---- 会改状态的排最后 ----
-            (
-                "accounts-deregister",
-                "POST",
-                format!("/api/v1/accounts/10001/deregister?access_token={t}"),
-                None,
-            ),
-            // 注销之后再走 DELETE 别名：状态确定（账号已不在），快照记的是「注销一个不存在账号」
-            // 的信封。字节面（/api/v1/media/*）与 SSE 面（/api/v1/push/*）不是 JSON，进不了这份
-            // 清单——它们的描述缺口由 src/server/openapi.rs 的端点表兜住。
+            // 注销只有 DELETE 一条路（POST 别名已删）。注销之后再走一次 DELETE：状态确定
+            // （账号已不在），快照记的是「注销一个不存在账号」的信封。字节面（/api/v1/media/*）
+            // 与 SSE 面（/api/v1/push/*）不是 JSON，进不了这份清单——它们的描述缺口由
+            // src/server/openapi.rs 的端点表兜住。
             (
                 "accounts-delete",
                 "DELETE",

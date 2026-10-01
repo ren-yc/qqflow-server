@@ -11,6 +11,12 @@
 //! the same-size idempotency check is sound (two messages with the same key
 //! are byte-identical; different content can never share a destination
 //! name). QQ's original `fileName` is only kept when no key exists.
+//!
+//! **句柄判据**（名字能不能作为「出现即可取」的地址下发）：键派生的名字（md5 hex 或 uuid ——
+//! 键按内容唯一）恒可以；回落来的 QQ 原名只有**形状是 32 位十六进制**时才当作内容摘要派生。
+//! 两者的共同点是「同名即同内容」，而按名取字节是**跨会话**解析的：别的会话里可能躺着同名
+//! 异内容的文件，那时下发的地址会 404。所以非摘要/非键名的那些只给 `mediaLocalPath` 与
+//! 元数据，不给 `mediaUrl`。
 //! A missing source (cache cleared) or a disabled kind silently yields None
 //! — the caller omits the fields.
 //!
@@ -59,10 +65,32 @@ pub struct ExportContext {
 #[derive(Debug, Clone)]
 pub struct ExportOut {
     pub file_name: String,
-    /// `{base_url}/api/v1/media/{talker}/{kind}/{file}`
-    pub url: String,
+    /// `/api/v1/media/{file_name}`（根相对，不带凭据）；**只在名字可作句柄时给出**。
+    ///
+    /// 不可作句柄时是 `None`：那种名字可能在本会话之外还有一个同名异内容的文件，下发的
+    /// 地址会 404 —— 而「出现即可取」是本服务的承诺，宁可只给 `local_path`。
+    pub url: Option<String>,
     /// Absolute path under the export root.
     pub local_path: String,
+    /// 名字是否取自 **store 键**（md5 hex 或 uuid）。键按内容唯一 ⇒ 名字也按内容唯一。
+    pub key_named: bool,
+    /// 文件名是否**由内容摘要派生**（32 位十六进制 + 可选扩展名）。
+    pub digest_named: bool,
+    /// 这个名字能不能作为句柄下发：`key_named || digest_named`。
+    ///
+    /// 二者都保证「同名即同内容」；回落来的 QQ 原名不保证，只作元数据 ——
+    /// 「这条有媒体、叫什么」与「字节取得到」是两件事。
+    pub handle_ok: bool,
+}
+
+/// 名字是否由**内容摘要**派生：32 位十六进制（大小写都算）＋ 可选扩展名。
+///
+/// 判据是「按名取字节是跨会话解析的」：路由只看名字、不看会话，而别的会话里可能躺着一个
+/// 同名但内容不同的文件。摘要派生的名字按内容唯一，所以可以承诺「出现即可取」；平台给的
+/// 文件名（QQ 的原始名、语音的服务端序号名）不满足这一点，只作元数据。
+pub fn name_is_content_digest(name: &str) -> bool {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Safe export file name: `<key>.<source ext>` when a store key exists
@@ -70,7 +98,9 @@ pub struct ExportOut {
 /// bytes can never collide on one destination; QQ's original file names
 /// are arbitrary and DO collide across messages), else QQ's file name when
 /// it is a bare URL-safe name, else the source file name.
-fn export_file_name(m: &MediaInfo, source: &Path) -> String {
+/// 返回 `(名字, 是否取自 store 键)`。第二个分量是**句柄判据的输入**：键派生的名字按内容
+/// 唯一，回落来的 QQ 原名不保证（见模块头）。
+fn export_file_name(m: &MediaInfo, source: &Path) -> (String, bool) {
     // `.` is allowed (extensions), which is what let `..` and `...` through:
     // both are built only from accepted bytes. They are not hypothetical — a
     // dot-only value reaches here whenever QQ's `fileName` is one — and on
@@ -84,21 +114,22 @@ fn export_file_name(m: &MediaInfo, source: &Path) -> String {
     };
     if let Some(key) = m.key().filter(|k| url_safe(k)) {
         if let Some(ext) = source.extension().and_then(|e| e.to_str()).filter(|e| !e.is_empty() && e.len() <= 8) {
-            return format!("{key}.{ext}");
+            return (format!("{key}.{ext}"), true);
         }
-        return key.to_string();
+        return (key.to_string(), true);
     }
     if let Some(name) = m.file_name.as_deref()
         && url_safe(name)
     {
-        return name.to_string();
+        return (name.to_string(), false);
     }
-    source
+    let fallback = source
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| url_safe(n))
         .unwrap_or("media")
-        .to_string()
+        .to_string();
+    (fallback, false)
 }
 
 /// Export one media file into `<root>/<talker>/<kind_dir>/<file>`. Returns
@@ -128,7 +159,7 @@ pub fn export_media(
         .as_deref()
         .and_then(|p| resolve_local_path(p, media_root))
         .or_else(|| fallback_path.and_then(|p| resolve_local_path(p, media_root)))?;
-    let file_name = export_file_name(m, &source);
+    let (file_name, key_named) = export_file_name(m, &source);
     // `talker` is a caller-supplied query parameter and `file_name` is derived
     // from the database, so both are checked before either becomes a path
     // component. Today a traversal `talker` is stopped one layer up — the store
@@ -161,23 +192,35 @@ pub fn export_media(
     if let (Ok(dm), Ok(sm)) = (dest.metadata(), source.metadata())
         && dm.is_file() && dm.len() == sm.len()
     {
-        return Some(out(&ctx.talker, kind_dir, &file_name, &dest));
+        return Some(out(&file_name, &dest, key_named));
     }
     if std::fs::copy(&source, &dest).is_err() {
         tracing::debug!("[media-export] copy failed: {} -> {}", source.display(), dest.display());
         return None;
     }
-    Some(out(&ctx.talker, kind_dir, &file_name, &dest))
+    Some(out(&file_name, &dest, key_named))
 }
 
-fn out(talker: &str, kind: &str, file_name: &str, dest: &Path) -> ExportOut {
+fn out(file_name: &str, dest: &Path, key_named: bool) -> ExportOut {
+    let digest_named = name_is_content_digest(file_name);
+    // 句柄判据：**键派生**（md5/uuid，按内容唯一）或**形状是内容摘要**（32 位十六进制）。
+    // 两者都保证「同名即同内容」，所以按名取字节是确定的。回落来的 QQ 原名不保证 ——
+    // 那种名字只给 local_path，不给可按名取字节的 url。
+    let handle_ok = key_named || digest_named;
     ExportOut {
         file_name: file_name.to_string(),
         // **相对路径，且不带 token**：token 一旦进了响应体就会出现在客户端日志与
         // 任何转发里，而它本来是只走请求头的凭据；相对路径同时免掉了把服务基址烤进
         // 响应——反代或换端口不会下发失效地址。调用方按自己的基址拼接。
-        url: format!("/api/v1/media/{talker}/{kind}/{file_name}"),
+        //
+        // **单段形式**：`{id}` 就是导出文件名。三段式（会话/类型/文件名）已删除 ——
+        // 它要求调用方知道会话与类型，而这两个信息在导出结果里本来就有，多要一次只是让
+        // 调用方多一处可以写错的地方。
+        url: handle_ok.then(|| format!("/api/v1/media/{file_name}")),
         local_path: dest.to_string_lossy().into_owned(),
+        key_named,
+        digest_named,
+        handle_ok,
     }
 }
 
@@ -201,9 +244,8 @@ pub fn export_page(
     let messages: Vec<crate::store::query::MessageOut> = items
         .into_iter()
         .map(|mut m| {
-            // The WeFlow `mediaType` string maps straight to the export
-            // subdirectory + kind switch (no enum round trip needed).
-            let (dir, enabled) = match m.media_type.as_deref() {
+            // 消息行上的类型字符串直接映射到导出子目录与 kind 开关（不需要枚举往返）。
+            let (dir, enabled) = match m.r#type.as_deref() {
                 Some("image") => ("images", opts.image),
                 Some("voice") => ("voices", opts.voice),
                 Some("video") => ("videos", opts.video),
@@ -217,8 +259,12 @@ pub fn export_page(
                 if let Some(out) = export_media(ctx, info, dir, enabled, media_root, fallback) {
                     exported += 1;
                     m.media_file_name = Some(out.file_name);
-                    m.media_url = Some(out.url);
+                    // url 已在导出侧按句柄判据决定给不给（不可作句柄时是 None）。
+                    m.media_url = out.url.clone();
                     m.media_local_path = Some(out.local_path);
+                    // 「确实写出了本地文件」（上面这个分支就是它）＋「名字可作句柄」：
+                    // 两个条件同时成立，这个名字才可以被 ChatLab 面回填成可取句柄。
+                    m.media_export_handle_ok = out.handle_ok;
                 }
             }
             m
@@ -257,20 +303,47 @@ mod tests {
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), None);
         assert_eq!(
             export_file_name(&m, &safe),
-            "aabbccddeeff00112233445566778899.png",
+            ("aabbccddeeff00112233445566778899.png".to_string(), true),
             "md5 key preferred over QQ's arbitrary file name (collision-safe)"
         );
         let m = media("aabbccddeeff00112233445566778899", Some("a/../evil.png"), None);
-        assert_eq!(export_file_name(&m, &safe), "aabbccddeeff00112233445566778899.png", "separator/.. rejected -> key.ext");
+        assert_eq!(
+            export_file_name(&m, &safe),
+            ("aabbccddeeff00112233445566778899.png".to_string(), true),
+            "separator/.. rejected -> key.ext"
+        );
         let m = media("aabbccddeeff00112233445566778899", Some("..\\evil"), None);
-        assert_eq!(export_file_name(&m, &safe), "aabbccddeeff00112233445566778899.png", "backslash rejected");
+        assert_eq!(
+            export_file_name(&m, &safe),
+            ("aabbccddeeff00112233445566778899.png".to_string(), true),
+            "backslash rejected"
+        );
         let m = media("aabbccddeeff00112233445566778899", Some("中文名字.png"), None);
-        assert_eq!(export_file_name(&m, &safe), "aabbccddeeff00112233445566778899.png", "non-url-safe name rejected");
+        assert_eq!(
+            export_file_name(&m, &safe),
+            ("aabbccddeeff00112233445566778899.png".to_string(), true),
+            "non-url-safe name rejected"
+        );
         let m = media("", Some(""), None);
-        assert_eq!(export_file_name(&m, &safe), "aabb.png", "no key/name -> source file name");
+        assert_eq!(
+            export_file_name(&m, &safe),
+            ("aabb.png".to_string(), false),
+            "no key/name -> source file name (**不是**键派生 ⇒ 不作句柄)"
+        );
         // No md5/uuid at all: QQ's bare URL-safe name is kept.
         let m = media("", Some("photo.png"), None);
-        assert_eq!(export_file_name(&m, &safe), "photo.png", "raw name kept only without a key");
+        assert_eq!(
+            export_file_name(&m, &safe),
+            ("photo.png".to_string(), false),
+            "raw name kept only without a key"
+        );
+        // uuid 键：形状不是 32 位十六进制，但它**取自 store 键**，所以同样按内容唯一。
+        let m = media("0f8fad5b-d9cb-469f-a165-70867728950e", Some("wechat.png"), None);
+        assert_eq!(
+            export_file_name(&m, &safe),
+            ("0f8fad5b-d9cb-469f-a165-70867728950e.png".to_string(), true),
+            "uuid key is a key: the name is content-unique even though it is not hex-shaped"
+        );
     }
 
     #[test]
@@ -291,9 +364,44 @@ mod tests {
         let m = media("aabbccddeeff00112233445566778899", Some("aabb.png"), Some(src.to_str().unwrap()));
         let e = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("export");
         assert_eq!(e.file_name, "aabbccddeeff00112233445566778899.png");
-        // 根相对路径、不含 token：调用方按自己的基址拼接。
-        assert_eq!(e.url, "/api/v1/media/10001/images/aabbccddeeff00112233445566778899.png");
-        assert!(!e.url.contains("access_token"), "响应体里不得出现凭据");
+        // 根相对路径、不含 token：调用方按自己的基址拼接。名字取自 store 键（md5）⇒ 是句柄。
+        let url = e.url.as_deref().expect("md5 键派生的名字可作句柄");
+        assert_eq!(url, "/api/v1/media/aabbccddeeff00112233445566778899.png");
+        assert!(!url.contains("access_token"), "响应体里不得出现凭据");
+        assert!(e.key_named && e.digest_named && e.handle_ok);
+
+        // 没有键 ⇒ 名字回落成 QQ 原名：**不给 url**（同名异内容可能躺在别的会话里），
+        // 只给 local_path 与元数据。
+        let src_plain = src_dir.join("photo.png");
+        std::fs::write(&src_plain, b"no key bytes").unwrap();
+        let m_plain = media("", Some("photo.png"), Some(src_plain.to_str().unwrap()));
+        let e_plain =
+            export_media(&ctx, &m_plain, "images", true, Some(&src_dir), None).expect("export plain");
+        assert_eq!(e_plain.file_name, "photo.png");
+        assert!(
+            e_plain.url.is_none(),
+            "非键名、非摘要名不得下发按名取字节的地址：{e_plain:?}"
+        );
+        assert!(!e_plain.key_named && !e_plain.digest_named && !e_plain.handle_ok);
+        assert!(e_plain.local_path.ends_with("photo.png"), "本地路径照给");
+
+        // uuid 键：形状不是 32 位十六进制，但它**取自 store 键** ⇒ 名字同样按内容唯一。
+        // 这条是「不要用形状代替来源」的反例：只看形状会把 uuid 名误判成不可作句柄。
+        let src_uuid = src_dir.join("u.png");
+        std::fs::write(&src_uuid, b"uuid bytes").unwrap();
+        let m_uuid = media(
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            Some("u.png"),
+            Some(src_uuid.to_str().unwrap()),
+        );
+        let e_uuid =
+            export_media(&ctx, &m_uuid, "images", true, Some(&src_dir), None).expect("export uuid");
+        assert_eq!(e_uuid.file_name, "0f8fad5b-d9cb-469f-a165-70867728950e.png");
+        assert!(
+            e_uuid.key_named && !e_uuid.digest_named && e_uuid.handle_ok,
+            "uuid 键派生的名字可作句柄：{e_uuid:?}"
+        );
+        assert!(e_uuid.url.is_some());
         let dest = Path::new(&e.local_path);
         assert_eq!(std::fs::read(dest).unwrap(), b"fake image bytes");
         let mtime = dest.metadata().unwrap().modified().unwrap();
@@ -301,6 +409,13 @@ mod tests {
         let e2 = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
+        // 判据本身：32 位十六进制（大小写都算）＋ 可选扩展名。
+        assert!(name_is_content_digest("aabbccddeeff00112233445566778899.png"));
+        assert!(name_is_content_digest("AABBCCDDEEFF00112233445566778899"));
+        assert!(!name_is_content_digest("photo.png"), "平台给的原名不派生自内容");
+        assert!(!name_is_content_digest("voice_123.silk"));
+        assert!(!name_is_content_digest("aabbccddeeff0011223344556677889.jpg"));
+
         // Different content, same QQ file name: never the same destination
         // (the md5 key differs -> distinct file, no overwrite).
         let src2 = src_dir.join("b.png");

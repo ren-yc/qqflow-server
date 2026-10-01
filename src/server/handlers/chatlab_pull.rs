@@ -26,7 +26,7 @@ pub struct Params {
     pub end: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
-    #[serde(default, alias = "token")]
+    #[serde(default)]
     pub access_token: Option<String>,
 }
 
@@ -134,6 +134,11 @@ pub async fn handler(
                 account_name: account_name(&m.from_uid),
                 content: m.parsed.content.clone(),
                 group_nickname: group_card(&m.from_uid),
+                // 媒体元数据（无媒体省略整个键）—— 与消息面**同一处**取法。
+                media: crate::server::chatlab::media_brief(
+                    m.parsed.msg_type.media_type_str(),
+                    m.parsed.media.as_ref(),
+                ),
                 platform_message_id: m.seq.to_string(),
                 reply_to_message_id,
                 sender: m.from_uid.clone(),

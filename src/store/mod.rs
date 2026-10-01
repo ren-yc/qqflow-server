@@ -100,7 +100,9 @@ pub struct Store {
     /// 群号 → 成员 uid（群名册）。**顺序稳定**（加载时排过序）。
     ///
     /// 它是「**我们知道的**成员」，不是「群的确切人数」：来源是本地缓存，可能少于真实值。
-    /// `/chatlab/sessions` 的 `memberCount` 用它 —— 文档里写明这个区别，下游才不会拿它当断言。
+    /// 两个用处：`/chatlab/sessions` 的 `memberCount`，以及 `group-members` 的成员集合
+    /// —— 后者是**名册 ∪ 发言人**（只列发言人会让潜水成员永远不出现）。文档里写明
+    /// 「我们知道的成员数」这个区别，下游才不会拿它当断言。
     pub chatroom_roster: HashMap<String, Vec<String>>,
     /// 群号 → 群主 uid（源 `group_detail_info_ver1.[60002]`，判据见 `group_meta` 模块头）。
     ///

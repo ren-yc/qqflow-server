@@ -6,7 +6,6 @@
       "version": "0.0.2"
     },
     "count": 2,
-    "hasMore": false,
     "members": [
       {
         "accountName": "李四",
@@ -35,6 +34,11 @@
         "accountName": "李四",
         "content": "[image]",
         "groupNickname": "",
+        "media": {
+          "fileName": "aabb.png",
+          "md5": "aabbccddeeff00112233445566778899",
+          "type": "image"
+        },
         "platformMessageId": "113737825910786",
         "sender": "u_b",
         "timestamp": 26481,
@@ -48,7 +52,10 @@
       "platform": "qq",
       "type": "group"
     },
-    "success": true,
+    "page": {
+      "hasMore": false,
+      "nextCursor": null
+    },
     "talker": "10001"
   },
   "keys": [
@@ -57,7 +64,6 @@
     "generator",
     "version",
     "count",
-    "hasMore",
     "members",
     "accountName",
     "avatar",
@@ -78,6 +84,10 @@
     "accountName",
     "content",
     "groupNickname",
+    "media",
+    "fileName",
+    "md5",
+    "type",
     "platformMessageId",
     "sender",
     "timestamp",
@@ -88,7 +98,9 @@
     "ownerId",
     "platform",
     "type",
-    "success",
+    "page",
+    "hasMore",
+    "nextCursor",
     "talker"
   ],
   "status": 200

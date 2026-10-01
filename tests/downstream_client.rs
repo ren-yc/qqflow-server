@@ -138,11 +138,12 @@ async fn downstream_client_real_db() {
     assert!(v.get("accounts").is_none(), "/health must not list accounts");
 
     // ---- 0.1 register the account (client-driven startup) ---------------
+    // 凭据走查询串：body 里的凭据键**不再是通道**（合并参数时被跳过）。
     let (s, v) = client_post(
         app.clone(),
-        "/api/v1/accounts",
+        &format!("/api/v1/accounts?access_token={token}"),
         &[],
-        json!({"access_token": token, "qq": qq, "key": key, "db_path": root}),
+        json!({"qq": qq, "key": key, "db_path": root}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -249,7 +250,10 @@ async fn downstream_client_real_db() {
     assert_eq!(v["success"], true);
     assert_eq!(v["talker"], first_talker);
     assert_eq!(v["media"]["enabled"], true, "media capability on");
-    assert_eq!(v["media"]["exportPath"], "");
+    assert!(
+        v["media"].get("exportPath").is_none(),
+        "没执行导出就没有 exportPath（不是空串）：{v}"
+    );
     let msgs = v["messages"].as_array().unwrap();
     assert!(!msgs.is_empty(), "real conversation must have messages");
     assert_eq!(v["count"].as_u64().unwrap() as usize, msgs.len());
@@ -264,8 +268,8 @@ async fn downstream_client_real_db() {
         assert!(m["content"].is_string());
         assert!(m["rawContent"].is_string());
         assert!(m["parsedContent"].is_string());
-        // mediaType appears iff the message is image/voice/video.
-        if let Some(mt) = m.get("mediaType") {
+        // 消息行的媒体类型键叫 type（它曾是 mediaType）；它只在 image/voice/video 上出现。
+        if let Some(mt) = m.get("type") {
             assert!(matches!(mt.as_str(), Some("image" | "voice" | "video")));
             assert!(matches!(m["localType"].as_i64(), Some(3..=5)));
         }
@@ -315,9 +319,9 @@ async fn downstream_client_real_db() {
         if let Some(name) = m.get("mediaFileName").and_then(|n| n.as_str()) {
             let url = m["mediaUrl"].as_str().unwrap();
             // 根相对路径，且不含凭据：见 weflow 侧同一断言的注释。
-            assert!(url.starts_with("/api/v1/media/"), "mediaUrl is a root-relative path");
+            // 单段形式：{id} 就是导出文件名（三段式已删除）。
+            assert_eq!(url, format!("/api/v1/media/{name}"), "mediaUrl 指向按名取字节的路由");
             assert!(!url.contains("access_token"), "no credential in a response body: {url}");
-            assert!(url.ends_with(&format!("/{name}")), "mediaUrl ends with the file name");
             assert!(
                 m["mediaLocalPath"].as_str().unwrap().starts_with(export_path),
                 "mediaLocalPath under exportPath"
@@ -326,8 +330,8 @@ async fn downstream_client_real_db() {
     }
     println!("[CLIENT] media=1 export: {exported} media rows exported (count={})", v["media"]["count"]);
 
-    // ---- 5. messages: POST body transport + YYYYMMDD bounds + token in body
-    let (s, v) = client_post(
+    // ---- 5. 读端点只留 GET：POST 是 405（body 不再是参数通道，也不再是凭据通道）----
+    let (s, _) = client_post(
         app.clone(),
         "/api/v1/messages",
         &[],
@@ -335,17 +339,22 @@ async fn downstream_client_real_db() {
             "access_token": token,
             "talker": first_talker,
             "limit": 5,
-            "start": "20200101",
-            "end": "20301231",
         }),
     )
     .await;
+    assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED, "读端点只接受 GET");
+
+    // 同样的取数走 GET + YYYYMMDD 边界。
+    let uri = format!(
+        "/api/v1/messages?talker={first_talker}&limit=5&start=20200101&end=20301231&access_token={token}"
+    );
+    let (s, v) = client_get(app.clone(), &uri, &[]).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true);
-    let posted = v["messages"].as_array().unwrap();
-    assert_eq!(v["count"].as_u64().unwrap() as usize, posted.len());
-    assert!(posted.len() <= 5);
-    println!("[CLIENT] POST messages: {} rows (limit=5, YYYYMMDD bounds)", posted.len());
+    let bounded = v["messages"].as_array().unwrap();
+    assert_eq!(v["count"].as_u64().unwrap() as usize, bounded.len());
+    assert!(bounded.len() <= 5);
+    println!("[CLIENT] GET messages: {} rows (limit=5, YYYYMMDD bounds)", bounded.len());
 
     // ---- 6. ChatLab Pull: paginate with nextSince/nextOffset, no repeats
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -462,18 +471,20 @@ async fn downstream_client_real_db() {
             assert_eq!(owners, 1, "群主必须在成员表里，且每群恰有一个");
             println!("[CLIENT] group-members({gid}): {} rows, {owners} owner", members.len());
 
-            // POST transport, `talker` alias for chatroomId.
-            let (s, v) = client_post(
+            // 读端点只留 GET，且 `talker` 别名已删除（参数面收敛）：POST 是 405，
+            // 带别名的 GET 也不再解析它 —— 未知参数被静默忽略，所以「别名还在」在这里
+            // 会表现为「返回了成员」，而现在是 400（缺必填的 chatroomId）。
+            let (s, _) = client_post(
                 app.clone(),
                 "/api/v1/group-members",
                 &[],
                 json!({ "access_token": token, "talker": gid }),
             )
             .await;
-            assert_eq!(s, StatusCode::OK);
-            assert_eq!(v["success"], true);
-            assert_eq!(v["chatroomId"], gid);
-            assert!(v["members"].as_array().unwrap().iter().all(|m| m.get("messageCount").is_none()));
+            assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED, "读端点只接受 GET");
+            let uri = format!("/api/v1/group-members?talker={gid}&access_token={token}");
+            let (s, v) = client_get(app.clone(), &uri, &[]).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "talker 别名已删除：{v}");
         }
         None => println!("[CLIENT] no group session found, skipping group-members"),
     }
@@ -481,9 +492,9 @@ async fn downstream_client_real_db() {
     // ---- 10. manual sync: real incremental pass over the real db --------
     let (s, v) = client_post(
         app.clone(),
-        "/api/v1/sync",
+        &format!("/api/v1/sync?access_token={token}"),
         &[],
-        json!({ "access_token": token, "limit": 10 }),
+        json!({ "limit": 10 }),
     )
     .await;
     assert_eq!(s, StatusCode::OK);

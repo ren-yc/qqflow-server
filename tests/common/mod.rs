@@ -368,9 +368,11 @@ pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(&pragma_suite(FAKE_KEY)).unwrap();
     // 群主表：夹具造得与真库同形（`group_detail_info_ver1.[60001]` 群号 → `[60002]` 群主 uid，
-    // 列名与类型照抄真库的最小可用子集）。两个群各设一名群主，且**群主必须在该群的发言者集合里**
-    // —— group-members 面返回的是发言者，群主缺席时 isOwner 全为 false，
-    // 「每群恰一个 true」这条断言在夹具路径上就验不了。10001 的 u_b、20002 的 u_a 都在下面的群消息里发言。
+    // 列名与类型照抄真库的最小可用子集）。两个群各设一名群主。
+    //
+    // **群主必须出现在 group-members 的成员集合里**，而那个集合是**名册 ∪ 发言人**；本夹具不造
+    // 名册（没有 chatroom_member 那张表），成员因此全部来自发言人 ⇒ 群主也得是发言人，否则
+    // 「每群恰一个 true」在夹具路径上验不了。10001 的 u_b、20002 的 u_a 都在下面的群消息里发言。
     conn.execute_batch(
         "CREATE TABLE group_list ([60001] INTEGER PRIMARY KEY, [60007] TEXT);\
          INSERT INTO group_list VALUES (10001, '测试群a');\

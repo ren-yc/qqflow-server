@@ -118,12 +118,15 @@ fn message_revoke_payload_has_no_media() {
     assert!(v.get("media").is_none(), "撤销事件不该有 media：{v}");
 }
 
-/// `sync` 基线帧：水位线收敛成**数组**。
+/// `sync` 基线帧：水位线收敛成**数组**，并带上**基线代号**。
 ///
-/// 这条护栏此前**不存在** —— 改动 sync 的键集在仓库里是静默的。它现在钉住两件事：
+/// 这条护栏此前**不存在** —— 改动 sync 的键集在仓库里是静默的。它现在钉住三件事：
 ///
-/// 1. 键集是 `event` + `watermarks`，**不再**是扁平结构体里那两个 `lastRowid*` 字段；
-/// 2. 「表 ←→ 水位」是**数据**，不是「字段名 ←→ 表」的约定 —— 加第三张表只需往数组里加一项。
+/// 1. 键集是 `event` + `generation` + `watermarks`，**不再**是扁平结构体里那两个
+///    `lastRowid*` 字段；
+/// 2. `generation` **恒出现**：注销时递增，客户端据此区分「注销后新账号刚开始」与
+///    「自己漏收了」—— 少了它，这两种情况在协议上是同一件事；
+/// 3. 「表 ←→ 水位」是**数据**，不是「字段名 ←→ 表」的约定 —— 加第三张表只需往数组里加一项。
 ///
 /// 它由 `serialize_weflow` 里的特判产生，所以这条测试同时是那个特判的回归位置。
 #[test]
@@ -132,7 +135,15 @@ fn sync_payload_is_the_converged_watermark_array() {
     let ev = Event::sync(12345, 678, 1_700_000_000);
     let (name, v) = serialize_for_test(ev);
     assert_eq!(name, "sync");
-    assert_eq!(keys_of(&v), ["event", "watermarks"], "sync 的键集是契约：{v}");
+    assert_eq!(
+        keys_of(&v),
+        ["event", "generation", "watermarks"],
+        "sync 的键集是契约：{v}"
+    );
+    assert!(
+        v["generation"].as_u64().is_some(),
+        "generation 恒出现且是非负整数：{v}"
+    );
     let wms = v["watermarks"].as_array().expect("watermarks 必须是数组");
     assert_eq!(wms.len(), 2, "两张表各一项：{v}");
     assert_eq!(wms[0]["table"], "group_msg_table");

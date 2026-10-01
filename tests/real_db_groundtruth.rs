@@ -405,13 +405,15 @@ async fn fake_db_media_endpoint_serves_bytes() {
     let (s, _v) = common::get_json(app.clone(), &format!("/api/v1/media/{md5}"), &[]).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
-    // File deleted (QQ cleared cache) -> 404 with a clear message.
+    // File deleted (QQ cleared cache) -> 404，与其他「拿不到字节」的情形同一个措辞：
+    // 「文件已被清理」与「没这个名字」对调用方是同一种失败，两种措辞只会让它多写一条分支。
     std::fs::remove_file(common::fake_media_path(&nt_db)).unwrap();
     let (s, v) = common::get_json(app.clone(), &format!("/api/v1/media/{md5}?access_token=test-token"), &[]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(v["code"], 404);
     assert!(
-        v["message"].as_str().unwrap().contains("缓存"),
-        "cache-cleared message: {v}"
+        v["message"].as_str().is_some_and(|m| m.contains("媒体")),
+        "统一措辞：{v}"
     );
 }
 
@@ -588,8 +590,8 @@ async fn fake_db_media_export_serves_exported_bytes() {
     // Export names are key-derived (<md5>.jpg): unique per content.
     let exported_name = format!("{md5}.jpg");
     assert_eq!(m["mediaFileName"], exported_name);
-    // 根相对路径、不含凭据：调用方按自己的基址拼接。
-    assert_eq!(m["mediaUrl"], format!("/api/v1/media/10001/images/{exported_name}"));
+    // 根相对路径、不含凭据：调用方按自己的基址拼接。**单段形式**（{id} 就是导出文件名）。
+    assert_eq!(m["mediaUrl"], format!("/api/v1/media/{exported_name}"));
     let local = m["mediaLocalPath"].as_str().unwrap();
     assert!(local.starts_with(export_root.to_string_lossy().as_ref()));
 
@@ -597,12 +599,13 @@ async fn fake_db_media_export_serves_exported_bytes() {
     let expected = std::fs::read(common::fake_media_path(&nt_db)).unwrap();
     assert_eq!(std::fs::read(local).unwrap(), expected);
 
-    // 3) GET the three-segment URL -> exact bytes + image/jpeg.
+    // 3) GET the exported name -> exact bytes + image/jpeg。导出名不再带会话与类型：
+    //    按名解析是跨会话的，所以路由只需要一个名字。
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/media/10001/images/{exported_name}?access_token=test-token"))
+                .uri(format!("/api/v1/media/{exported_name}?access_token=test-token"))
                 .method("GET")
                 .body(Body::empty())
                 .unwrap(),
@@ -614,15 +617,15 @@ async fn fake_db_media_export_serves_exported_bytes() {
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
     assert_eq!(bytes.to_vec(), expected);
 
-    // 4) POST variant works too (WeFlow GET|POST).
+    // 4) 读端点只留 GET：POST 是 405（不再有「body 带 token 的 POST 通道」）。
     let (s, _v) = common::post_json(
         app.clone(),
-        &format!("/api/v1/media/10001/images/{exported_name}"),
+        &format!("/api/v1/media/{exported_name}"),
         &[],
         serde_json::json!({"access_token": "test-token"}),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
+    assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
 
     // 5) Traversal attacks -> 404, never a file outside the export root.
     for path in [
@@ -639,14 +642,20 @@ async fn fake_db_media_export_serves_exported_bytes() {
         assert_eq!(s, StatusCode::NOT_FOUND, "traversal blocked: {path}");
     }
 
-    // 6) Unknown media_type -> 404.
+    // 6) kinds 白名单：把唯一命中挪到非法类型目录里，它必须取不到 —— 文件**真实存在**，
+    //    所以这条断言不是因为「文件不在」而假绿。
+    let legal = export_root.join("10001").join("images").join(&exported_name);
+    let illegal_dir = export_root.join("10001").join("other");
+    std::fs::create_dir_all(&illegal_dir).unwrap();
+    std::fs::rename(&legal, illegal_dir.join(&exported_name)).unwrap();
     let (s, _v) = common::get_json(
         app.clone(),
-        &format!("/api/v1/media/10001/other/{exported_name}?access_token=test-token"),
+        &format!("/api/v1/media/{exported_name}?access_token=test-token"),
         &[],
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(s, StatusCode::NOT_FOUND, "只有四个类型目录参与解析");
+    std::fs::rename(illegal_dir.join(&exported_name), &legal).unwrap();
 }
 
 /// Manual-sync path: `AccountSync::poll_once` picks up rows appended to
@@ -833,9 +842,9 @@ async fn client_registers_account_with_key_and_db_path() {
     // Wrong key (valid format, wrong content) -> accepted, then error.
     let (s, v) = common::post_json(
         app.clone(),
-        "/api/v1/accounts",
+        "/api/v1/accounts?access_token=test-token",
         &[],
-        json!({"access_token": "test-token", "qq": FAKE_QQ, "key": "0123456789abcdeX", "db_path": db_path}),
+        json!({"qq": FAKE_QQ, "key": "0123456789abcdeX", "db_path": db_path}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -858,9 +867,9 @@ async fn client_registers_account_with_key_and_db_path() {
     // Corrected key -> accepted, then ready and serving.
     let (s, v) = common::post_json(
         app.clone(),
-        "/api/v1/accounts",
+        "/api/v1/accounts?access_token=test-token",
         &[],
-        json!({"access_token": "test-token", "qq": FAKE_QQ, "key": FAKE_KEY, "db_path": db_path}),
+        json!({"qq": FAKE_QQ, "key": FAKE_KEY, "db_path": db_path}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -881,9 +890,9 @@ async fn client_registers_account_with_key_and_db_path() {
     // request omits db_path, so the echo proves it came from the registry).
     let (s, v) = common::post_json(
         app.clone(),
-        "/api/v1/accounts",
+        "/api/v1/accounts?access_token=test-token",
         &[],
-        json!({"access_token": "test-token", "qq": FAKE_QQ, "key": FAKE_KEY}),
+        json!({"qq": FAKE_QQ, "key": FAKE_KEY}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);

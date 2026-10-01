@@ -18,13 +18,14 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 ## 鉴权规范
 
-除健康检查接口外，所有 `/api/v1/*` 接口均受 Token 保护。支持五种传参方式（任选其一）：
+除健康检查接口外，所有 `/api/v1/*` 与 `/chatlab/*` 接口均受 Token 保护。支持**两种**传参方式（任选其一）：
 
 1. **HTTP Header (推荐)**: `Authorization: Bearer <您的Token>`
-2. **HTTP Header**: `X-Api-Key: <您的Token>`
-3. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
-4. **Query 参数**: `?token=<您的Token>`（与 3 等价，别名）
-5. **JSON Body**: `{"access_token": "<您的Token>"}` 或 `{"token": "<您的Token>"}`（仅限 POST 请求；SSE 接口除外，仅支持前四种 Header/Query 方式）
+2. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
+
+> **迁移**：`X-Api-Key`、`?token=` 与 POST body 里的凭据键**已删除**。每多一条通道就多一处
+> 凭据会被复制到的地方（请求体、代理日志、客户端抓包），而它们鉴权的是同一个东西。
+> body 里的 `access_token`/`token` 现在会被**跳过**（既不鉴权、也不覆盖查询串里的值）。
 
 ## 接口列表
 
@@ -32,18 +33,23 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET|POST /api/v1/health`（免鉴权）
 - `POST /api/v1/accounts`（注册账号：qq + key + db_path）
 - `GET /api/v1/accounts`（账号明细，需鉴权，见 §1.2）
-- `DELETE /api/v1/accounts/{qq}`（注销账号，见 §1.3）
-- `POST /api/v1/accounts/{qq}/deregister`（注销别名，同一处理器）
-- `GET|POST /api/v1/messages`
-- `GET /api/v1/media/{id}`（媒体直服，自本地缓存）
-- `GET|POST /api/v1/media/{talker}/{mediaType}/{file}`（媒体导出文件服务，见 §3.2）
-- `GET|POST /api/v1/sessions`
-- `GET /api/v1/sessions/{id}/messages`（ChatLab Pull，仅 GET）
-- `GET|POST /api/v1/contacts`
-- `GET|POST /api/v1/group-members`
-- `GET|POST /api/v1/push/messages`（SSE）
-- `GET|POST /api/v1/sync`（手动同步）
+- `DELETE /api/v1/accounts/{qq}`（注销账号，见 §1.3；**POST 别名已删除**）
+- `GET /api/v1/messages`（原生/富数据形状，见 §3）
+- `GET /api/v1/media/{id}`（**唯一**的取字节路由：store 键或导出文件名，见 §3.1）
+- `GET /api/v1/sessions`（原生形状；只认 `offset`）
+- `GET /api/v1/sessions/{id}/messages`（ChatLab Pull；与 `/chatlab/...` 同一处理器、同一形状）
+- `GET /api/v1/contacts`
+- `GET /api/v1/group-members`（成员集合是**名册 ∪ 发言人**）
+- `GET /api/v1/push/messages`（SSE，带正文的富推送面）
+- `GET|POST /api/v1/sync`（手动同步，动作端点）
+- `GET /chatlab/sessions`（ChatLab 发现面，认 `cursor`）
+- `GET /chatlab/messages`（ChatLab 消息面：原 `?chatlab=1` 的新家）
+- `GET /chatlab/sessions/{id}/messages`（ChatLab Pull）
+- `GET /chatlab/push/messages`（SSE 通知面，只发元信息）
 - `GET /openapi.json`（接口描述，**免鉴权**，见 §1.0）
+
+> **读端点只有 GET**：`messages`/`sessions`/`contacts`/`group-members`/`media/{id}`/`push/messages`
+> 的 POST 一律 **405**。动作端点（注册、同步）与免鉴权的 `/health` 保留两个方法。
 
 > v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（§3.2，WeFlow 形状）。
 
@@ -122,7 +128,7 @@ GET /api/v1/health
 
 ## 1.2 账号明细（GET /api/v1/accounts）
 
-`/health` 不再披露的账号明细。Token 保护（五通道，但 GET 建议走 Header——查询串会进代理日志与 shell 历史）；**不受就绪门控**，因为客户端正是在账号还在 `indexing`（即服务尚未就绪）时轮询它。
+`/health` 不再披露的账号明细。Token 保护（两条通道，但 GET 建议走 Header——查询串会进代理日志与 shell 历史）；**不受就绪门控**，因为客户端正是在账号还在 `indexing`（即服务尚未就绪）时轮询它。
 
 **请求**
 
@@ -161,7 +167,7 @@ Authorization: Bearer YOUR_TOKEN
 
 ## 1.1 注册账号（POST /api/v1/accounts）
 
-客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（五通道）；**不受就绪门控**。
+客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（两条通道）；**不受就绪门控**。
 
 **请求**
 
@@ -249,11 +255,8 @@ DELETE /api/v1/accounts/1234567890?purge_media=1
 Authorization: Bearer YOUR_TOKEN
 ```
 
-不能发 `DELETE` 的客户端或代理可用等价别名（同一处理器，参数可走 JSON Body）：
-
-```http
-POST /api/v1/accounts/1234567890/deregister
-```
+> **迁移**：`POST /api/v1/accounts/{qq}/deregister` 别名**已删除**（现在返回 404）。
+> 注销只有 `DELETE` 一条路 —— 两条路做同一件事时，其中一条迟早漏掉一次改动。
 
 | 参数 | 类型 | 必填 | 说明 |
 | ---- | ---- | ---- | ---- |
@@ -398,14 +401,14 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 - `since` 是**排他**下界：用 `nextSince` 续拉不会重复取到边界那一秒，也不会跳过它。
 - 支持 `limit` 分页时 `sync` 块**必须**给（规范：缺了它 ChatLab 不保证自动续拉）。
 
-**`messageCount` 恒为 `0`**：本仓库不维护每会话条数。**键要留着** —— 下游按它排序，缺键与「是 0」
-在下游不是同一件事。`memberCount` **不给**（没有群名册来源），夹具的能力声明与之保持一致。
+**`messageCount` 是索引里的真实条数**（该会话在索引中有多少条消息）。键**恒保留** —— 缺键与
+「是 0」在下游不是同一件事。`memberCount` 来自群名册，**只在名册加载得到时出现**。
 
 ### ChatLab 发现面（GET `/chatlab/sessions`）
 
 规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的会话发现入口。与 `/api/v1/sessions`
-**共用同一份实现**，差别只有默认语义：老面靠 `format=chatlab` 参数切换，新面**天生就是** ChatLab
-形状。**老面一行未改。**
+**共用同一份实现**，差别只在**形状与分页参数**：老面只输出原生形状、只认 `offset`；新面**天生
+就是** ChatLab 形状，并接受 `cursor`（`page.nextCursor` 的回传入参）。
 
 响应（规范形状）：
 
@@ -413,7 +416,7 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 {
   "sessions": [
     { "id": "10001", "name": "…", "platform": "qq", "type": "group",
-      "messageCount": 0, "lastMessageAt": 1782864000 }
+      "messageCount": 128, "lastMessageAt": 1782864000 }
   ],
   "page": { "hasMore": true, "nextCursor": "2" }
 }
@@ -421,11 +424,13 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 
 参数 `keyword`（按名称或 id 模糊匹配）、`limit`、`cursor`（原样回传上一页的 `nextCursor`）。
 
-- **不给 `offset`**：规范明确不建议在发现接口用它（列表变化时会出现重复或漏项）。
+- **推荐 `cursor`**：规范明确不建议在发现接口用 `offset`（列表变化时会出现重复或漏项）。
+  `cursor` 解析失败时**退回 `offset`**（与其它参数一样「坏值退化为默认而不是报错」），因此
+  `offset` 仍然可用。
 - **`page` 总是给出**：规范说客户端在响应里**未发现** `page` 时按「单次全量结果」处理 —— 那比
   「靠条数猜有没有截断」明确。
-- **`messageCount` 恒为 `0`**：本仓库不维护每会话条数。**键要留着** —— 下游按它排序，缺键与
-  「是 0」在下游不是同一件事。
+- **`messageCount` 是真实条数**（索引里该会话的消息数）。键恒保留 —— 缺键与「是 0」在下游
+  不是同一件事。
 - **`memberCount`** 来自群名册（`group_info.db` 的 `group_member3`），**只在名册加载得到时出现**
   （私聊、或名册缺失时**不出现这个键**）。
   - 它是「**我们知道的**成员数」，**不是「群的确切人数」**：来源是本地缓存，可能少于真实值。
@@ -480,16 +485,19 @@ GET /api/v1/messages
 | `start`   | string | 否   | 开始时间，支持 `YYYYMMDD` 或秒级时间戳                |
 | `end`     | string | 否   | 结束时间，支持 `YYYYMMDD` 或秒级时间戳                |
 | `keyword` | string | 否   | 基于消息显示文本过滤                                  |
-| `chatlab` | string | 否   | `1/true` 时输出 ChatLab 格式                          |
-| `format`  | string | 否   | `json` 或 `chatlab`                                   |
-| `media`   | string/bool | 否 | `1`/`true`（别名 `meiti`）触发该页媒体导出，填充 `mediaFileName`/`mediaUrl`/`mediaLocalPath` 并启用 WeFlow 形状的 `media.exportPath`；不带参数时保持兼容 envelope（`exportPath=""`，媒体元数据仍随消息返回）。两种传输一致：query-string 用 `1`/`true`/`0`/`false` 字符串，POST body 直接用 JSON bool |
-| `image`（别名 `tupian`）/ `voice`（别名 `vioce`）/ `video` / `emoji` | string/bool | 否 | 媒体导出子开关，默认开启，`0`/`false` 关闭（同上，POST body 接受 JSON bool） |
+| `media`   | string | 否 | `1`/`true` 触发该页媒体导出，填充 `mediaFileName`/`mediaUrl`/`mediaLocalPath`，并让 `media.exportPath` **出现**；不带它时 `exportPath` **省略**（不是空串），媒体元数据仍随消息返回 |
+| `image` / `voice` / `video` / `emoji` | string | 否 | 媒体导出子开关，默认开启，`0`/`false` 关闭 |
+
+> **迁移**（三个旧参数行为已删除）：
+> - `chatlab=1` 与 `format=chatlab`：老面**不再输出** ChatLab 形状，改用 `GET /chatlab/messages`；
+> - 拼音别名 `meiti` / `tupian` / `vioce`：**静默忽略**（未知参数不报错，所以它们不再有任何作用）；
+> - POST：读端点只留 GET，POST 一律 **405**（body 既不是参数通道，也不是鉴权通道）。
 
 ### 示例
 
 ```bash
 curl "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=20&access_token=YOUR_TOKEN"
-curl "http://127.0.0.1:5032/api/v1/messages?talker=10001&chatlab=1&access_token=YOUR_TOKEN"
+curl "http://127.0.0.1:5032/chatlab/messages?talker=10001&limit=20&access_token=YOUR_TOKEN"
 curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=20260131&access_token=YOUR_TOKEN"
 ```
 
@@ -497,7 +505,8 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 
 > v1 说明：`talker` 对应的会话不存在时不报错，返回 `success=true`、`messages=[]`、`count=0`（与 §4.1 的 404 行为不同）。
 
-顶层字段：`success`、`talker`、`count`、`hasMore`、`media.enabled`、`media.exportPath`、`media.count`、`messages`
+顶层字段：`success`、`talker`、`count`、`hasMore`、`media.enabled`、`media.count`、`messages`，
+以及**仅在 `media=1` 时出现**的 `media.exportPath`。
 
 单条消息字段（按时间倒序，最新在前）：
 
@@ -511,10 +520,10 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | `senderUsername` | 发送者 UID（稳定标识，客户端据此去重） |
 | `senderName` | 发送者显示名，按**本会话**解析：群聊为本群群名片（`40090`）> 备注（`20009`）> 最新昵称（`40093`）> 档案昵称（`20002`）> UID；私聊无群名片，从备注起算。同一 UID 在不同会话可得不同显示名（群名片只在本群生效，不会外泄到私聊或联系人列表）。回退链末端是 UID 本身，故 `senderUsername` 非空时该字段必非空；系统消息等无发送者的行 `senderUsername` 为空，此字段同为空串（真实账号抽样 2568 条中 369 条属此类）。**有此字段后，客户端无需为显示名再调用 `/api/v1/contacts` 与 `/api/v1/group-members`** |
 | `content` / `rawContent` / `parsedContent` | v1 三者相同，为解析后文本 |
-| `mediaType` | 仅图片/语音/视频消息：`image` / `voice` / `video` |
+| `type` | 仅图片/语音/视频消息：`image` / `voice` / `video`（该键曾叫 `mediaType`，与媒体对象内部的名字空间无关） |
 | `media` | 仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略） |
 | `mediaId` | 媒体获取键（md5 hex 或 uuid，统一小写），用于 `GET /api/v1/media/{id}`；**仅当索引注册了本地缓存路径（`media.localPath` 非空）时提供**——否则省略（`media` 对象仍在，但该键无法取到字节，承诺了就是必 404） |
-| `mediaFileName` / `mediaUrl` / `mediaLocalPath` | 仅 `media=1` 导出后出现：导出文件名、**根相对路径**（调用方按自己的基址拼接，取字节带鉴权头）、导出目录绝对路径（WeFlow 形状字段） |
+| `mediaFileName` / `mediaUrl` / `mediaLocalPath` | 仅 `media=1` **确实写出本地副本**后出现：导出文件名、**根相对路径** `/api/v1/media/{导出文件名}`（单段形式；调用方按自己的基址拼接，取字节带鉴权头）、导出目录绝对路径 |
 
 消息类型码：
 
@@ -538,7 +547,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
   "talker": "10001",
   "count": 2,
   "hasMore": true,
-  "media": { "enabled": true, "exportPath": "", "count": 1 },
+  "media": { "enabled": true, "count": 1 },
   "messages": [
     {
       "localId": 1234567890123,
@@ -551,7 +560,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
       "content": "[image]",
       "rawContent": "[image]",
       "parsedContent": "[image]",
-      "mediaType": "image",
+      "type": "image",
       "media": {
         "uuid": "R020-...",
         "md5": "9f2a1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
@@ -579,19 +588,38 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 }
 ```
 
-### ChatLab 响应
+### ChatLab 消息面（GET /chatlab/messages）
 
-当 `chatlab=1` 或 `format=chatlab` 时，返回 ChatLab 结构（消息按时间正序）。
+原 `/api/v1/messages?chatlab=1` 的**新家**。它天生就是 ChatLab 形状 —— 调用方不必知道还有
+另一种，也不会因为漏传一个开关而拿到另一种。
 
-**外层信封与原生面一致**：`success` / `talker` / `count` / `hasMore` 四个键照常出现，
-`count` 是本页条数。只换消息体、不换翻页模型——否则调用方为了**翻页**还得切回原生面，
-而它本来只是为了拿另一种消息形状才传了 `chatlab=1`。
+**请求**：`talker`（必填）、`limit`（默认 100、上限 10000）、`offset`、`cursor`
+（`page.nextCursor` 的回传入参；解析失败退回 `offset`）、`start`、`end`、`keyword`、
+`media` 与四个分类型子开关（语义与 §3 相同）。鉴权与就绪门控与原生面一致。
 
+**信封**（**不带 `success`** —— 它输出的是数据信封，而 `success` 是「操作结果」的语言）：
 
-- `chatlab.version`（`"0.0.2"`）、`chatlab.exportedAt`、`chatlab.generator`（`"qqflow-server"`）
-- `meta.name`（会话显示名：群聊为群备注 > 改名消息群名 > 群信息库群名 > 群号；私聊为备注 > 对方昵称（会话名） > 档案昵称 > UID）、`meta.platform`（`"qq"`）、`meta.type`（`group`/`private`）、`meta.groupId`（群聊为群号，私聊为对方 UID）、`meta.ownerId`（当前绑定账号 QQ 号，未绑定为空串）
-- `members[].platformId`、`members[].accountName`、`members[].groupNickname`、`members[].avatar`（恒空）；仅含本页出现过的发送者，已去重
-- `messages[].sender`、`messages[].accountName`、`messages[].groupNickname`、`messages[].timestamp`、`messages[].type`、`messages[].content`、`messages[].platformMessageId`
+```json
+{
+  "talker": "10001",
+  "count": 2,
+  "page": { "hasMore": true, "nextCursor": "2" },
+  "chatlab": { "version": "0.0.2", "exportedAt": 1782864000, "generator": "qqflow-server" },
+  "meta": { "groupId": "10001", "name": "项目群", "ownerId": "10001", "platform": "qq", "type": "group" },
+  "members": [ … ],
+  "messages": [ … ]
+}
+```
+
+四条容易踩的口径：
+
+1. `count` ＝**本页条数**（不是总数；总数不在这个面上表达，分页信息一律走 `page`）；
+2. 消息**升序**（原生面是降序）；
+3. `media=1` **真正执行导出**（收集任务 → 把确实落盘的那些回填成可取句柄）。`media` 是
+   **元数据**：`{type, fileName, md5}`，无媒体时**整个键省略**、`md5` 取不到则省略该键。
+   `fileName` 只有在**确实写出了本地副本、且名字由内容摘要派生**时才是可取句柄；
+4. `members` 仍是**本页出现的发送者**（去重），**不是**名册 —— 名册只并进
+   `/api/v1/group-members`。
 
 字段语义与 §4.1 ChatLab Pull 完全一致，注意两点：
 
@@ -606,12 +634,12 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 `private`。需要更细的会话分类请用 §4 `/api/v1/sessions` 的 `type`。
 
 不输出的可选字段（`meta.groupAvatar`、`members[].aliases`、`messages[].mediaPath`）与本面
-同样适用，清单见 §4.1"与标准 / 安装版的已知差异"。`messages[].replyToMessageId` 由本面与
-`format=chatlab` 面**同样规则**输出。
+同样适用，清单见 §4.1"与标准 / 安装版的已知差异"。`messages[].replyToMessageId` 在
+**原生面、消息面、拉取面三个面上同规**：无引用时**省略该键**（不是给 `null`）。
 
 ---
 
-## 3.1 获取媒体文件（GET|POST /api/v1/media/{id}）
+## 3.1 获取媒体文件（GET /api/v1/media/{id}）
 
 **请求**
 
@@ -621,36 +649,60 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 
 | 参数 | 类型 | 必填 | 说明 |
 | ---- | ---- | ---- | ---- |
-| `id` | string | 是 | 消息里的 `mediaId`（md5 hex 或 uuid） |
-| `access_token` | string | 是 | 鉴权（或 `Authorization: Bearer` / POST body） |
+| `id` | string | 是 | **store 键**（消息里的 `mediaId`，md5 hex 或 uuid）或**导出文件名**（`media=1` 写进导出根的名字） |
+| `access_token` | string | 是 | 鉴权（或 `Authorization: Bearer`） |
 
 **响应**：媒体文件字节流，`content-type` 按扩展名（`image/jpeg` / `image/png` / `image/gif` / `image/webp` / `video/mp4` / `audio/wav` / `audio/amr` / `audio/silk` 等），携带 `content-length`。
 
-**说明**：文件自 QQ 本地缓存目录只读读取（消息 `media.localPath`，即 `45812` 字段）。仅注册了本地路径的媒体可获取；QQ 清理缓存后文件缺失返回 `404`（`{"success":false,"code":404,"message":"本地缓存已清理，媒体文件不存在"}`）。`id` 未知同样返回 `404`。该端点仅接受索引内已注册的键，客户端无法注入任意文件路径。
+**说明**：`id` 有**两个来源**，按顺序解析：
+
+1. **store 键**：索引登记过的本地缓存路径（消息 `media.localPath`，即 `45812` 字段）。命中即服务，
+   这是 `mediaId` 承诺「出现即可取」的落点；键命中但文件已被 QQ 清理 ⇒ `404`。
+2. **导出文件名**：在导出根下按名解析，布局 `<exportPath>/<talker>/<images|voices|videos|emojis>/<file>`。
+   只有这四个类型目录参与解析（别的目录里就算躺着同名文件也不服务）；路径段按统一规则拒绝
+   尾点、尾空格与冒号，规范化后必须仍落在导出根内。
+
+**同名多命中**（规则与 weflow-server 一致）：候选**内容一致** ⇒ 取排序后的第一个；
+**不一致** ⇒ `404`（同名内容冲突）。比较先比 size 短路，只有 size 相同才逐字节读整份文件 ——
+读放大 ＝ 候选数 × 文件大小，是线性成本。这条规则是「出现即可取」的前提：按名解析是**跨会话**的，
+别的会话里可能躺着同名但内容不同的文件。
+
+**未命中的措辞统一为「媒体不存在」**（含缓存被清理的情形）——「文件被清理」与「没这个名字」
+对调用方是同一种失败，两种措辞只会让它多写一条分支。
+
+> **迁移**：三段式 `/api/v1/media/{talker}/{mediaType}/{file}` 已删除，改用本路由。
 
 ## 3.2 媒体导出（WeFlow 形状，`media=1`）
 
-`GET|POST /api/v1/messages?media=1`（别名 `meiti`）把**本页**媒体导出到导出根目录（`--media-export-dir`，默认 `<data-dir>/api-media`），布局 `<exportPath>/<talker>/<images|voices|videos>/<file>`，并：
+`GET /api/v1/messages?media=1`（`/chatlab/messages` 同样支持）把**本页**媒体导出到导出根目录（`--media-export-dir`，默认 `<data-dir>/api-media`），布局 `<exportPath>/<talker>/<images|voices|videos>/<file>`，并：
 
-- 每条媒体消息填充 `mediaFileName` / `mediaUrl`（**根相对路径** `/api/v1/media/{talker}/{type}/{file}`，不含 token）/ `mediaLocalPath`（绝对路径）
-- envelope 变为 `"media": {"enabled": true, "exportPath": "<导出根>", "count": <本次导出条数>}`
-- 子开关 `image`（别名 `tupian`）、`voice`（别名 `vioce`）、`video`、`emoji` 默认开启，`0`/`false` 关闭对应类型导出
+- 每条**确实写出本地副本**的媒体消息填充 `mediaFileName` / `mediaUrl`（**根相对路径**
+  `/api/v1/media/{导出文件名}`，不含 token）/ `mediaLocalPath`（绝对路径）
+- envelope 多出 `"exportPath": "<导出根>"`（未请求导出时该键**省略**，不是空串），
+  `count` 是本次成功导出的条数
+- 子开关 `image` / `voice` / `video` / `emoji` 默认开启，`0`/`false` 关闭对应类型导出
 - 导出在阻塞线程池执行（`spawn_blocking`），不阻塞 HTTP worker（并发导出/SSE 互不影响）
 - 幂等：目标已存在且同尺寸即跳过（不重写、mtime 保留）——目标文件名由内容键（md5 hex / uuid，小写）派生，同键必同内容，不会出现"同名不同字节"互相覆盖/错指
 
-**获取导出文件**：`GET|POST /api/v1/media/{talker}/{mediaType}/{file}?access_token=YOUR_TOKEN`（`mediaType` ∈ `images|voices|videos|emojis`；遍历防护：路径段拒绝 `..`/分隔符 + canonicalize 前缀校验；文件缺失或类型未知 → 404）。注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
+**获取导出文件**：`GET /api/v1/media/{导出文件名}?access_token=YOUR_TOKEN`（见 §3.1 的按名解析规则：
+只有四个类型目录参与、同名异内容 404、路径穿越拒绝）。注意：链接仅在 `media=1` 导出过对应消息后
+可访问（WeFlow 同语义）。
+
+> **句柄只对「内容摘要派生」的名字给出**：导出名是 `<内容键>.<扩展名>`（md5 hex / uuid）时它
+> 同时是 ChatLab 面 `media.fileName` 的可用句柄；平台给的原文件名回落**只作元数据**，
+> 因为按名解析是跨会话的、同名可能是别的文件。
 
 **与 WeFlow 的已知差异**（不可避免，文档化）：① `emoji` 开关接受但不产生导出（QQ 表情仅有显示文本，无文件；gif 图片走 `images/`）；② 语音导出**原始** `.silk`/`.amr` 文件（未转码为 wav）；③ `mediaUrl` 的 base 默认取 `http://{host}:{port}`（默认 127.0.0.1:5032，WeFlow 为 5031）——绑定 `0.0.0.0`/`::` 时该地址不可达，自动回退 `127.0.0.1` 并告警；局域网/容器部署请用 `--base-url http://<可达地址>:<port>` 显式指定；④ 导出根默认 `<data-dir>/api-media`（可 `--media-export-dir` 覆盖）；⑤ 文件名按内容键派生（`<md5|uuid>.<源扩展名>`，如 `9f2a1c...4d.png`）而非保留 QQ 原始 `fileName`——同名不同内容的文件因此永不冲突，跨页重复导出幂等（无键可派生时才保留 QQ 原始名）；⑥ 404 错误体为统一 envelope，而安装版 WeFlow 为 `{"error":"Media not found"}`（注：weflow-server 自其 0.5.0 起亦已统一为 envelope，此项差异仅对安装版 WeFlow 成立）。`mediaId` 直服（§3.1）与 `media` 元数据对象为 qqflow 扩展，导出后仍可用。
 
 ## 4. 获取会话列表
-
-> 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
 
 **请求**
 
 ```http
 GET /api/v1/sessions
 ```
+
+> 读端点只留 GET（POST 返回 405）；`/api/v1/sync` 与 `/health` 仍接受 POST。
 
 ### 参数
 
@@ -685,19 +737,22 @@ GET /api/v1/sessions
 }
 ```
 
-### ChatLab 格式（`format=chatlab`）
+### ChatLab 形状（`GET /chatlab/sessions`）
+
+`/api/v1/sessions` 只输出原生形状；ChatLab 形状走这个面（详见 §4 的 ChatLab 发现面一节）。
 
 ```json
 {
   "sessions": [
-    { "id": "10001", "name": "项目群", "platform": "qq", "type": "group", "messageCount": 0, "lastMessageAt": 1782864000 }
+    { "id": "10001", "name": "项目群", "platform": "qq", "type": "group", "messageCount": 128, "lastMessageAt": 1782864000 }
   ],
   "count": 1,
   "page": { "hasMore": true, "nextCursor": "1" }
 }
 ```
 
-`platform` 固定 `"qq"`；`messageCount` v1 恒为 `0`。`count` 是**本页条数**（与原生面同义）。
+`platform` 固定 `"qq"`；`messageCount` 是**索引里的真实条数**。`count` 是**本页条数**。
+老面**不再识别** `cursor`：继续传不会报错，而是静默回到第一页。
 
 **`page` 块是必需的。** ChatLab 把「没有 `page` 块」的响应读作「这就是完整一页」，
 所以不带 `page` 的截断会被下游当成全量——默认 `limit` 是 100，普通账号就能撞上，
@@ -832,7 +887,7 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | `members[].avatar` | 可选，要求 Data URL | 真实 URL | **恒为空串** | QQ 侧没有可用的头像来源；字段保留以满足形状 |
 | `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 媒体字节请走 §3 `/api/v1/messages` 的媒体导出 |
 | `members[].roles` | 可选，`[{id}]`（中文表列出） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出（源 `group_info.db::group_detail_info_ver1.[60002]`）；且两者受同一个限制——群主不在本页时都无从判断 |
-| `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 `format=chatlab` 面有 | **目标唯一时输出；否则省略该键** | 键名与语义对齐 WeFlow；判据见下 |
+| `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 ChatLab 面有 | **目标唯一时输出；否则省略该键**（原生面、消息面、拉取面**同规**） | 键名与语义对齐 WeFlow；判据见下 |
 
 **`replyToMessageId` 的判据（为什么有时不给）**：它取自表列 `40850`（被回复消息的**会话内序号**），
 再在同一会话里找 `40003` 等于它的那一行，输出**那一行的 `40001`**（也就是 `platformMessageId`）。
@@ -899,9 +954,9 @@ GET /api/v1/contacts
 
 ## 6. 获取群成员列表
 
-> 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
-
-v1 成员来源：该群消息中出现过的发送者 UID + 昵称（无独立群成员库）。
+v1 成员来源：**名册 ∪ 发言人** —— `group_info.db::group_member3` 的群名册与索引里该群的发言者
+取并集。只列发言人会让「群里有谁」的答案取决于谁最近说过话，潜水成员永远不出现，而他们恰恰是
+「这个群还有谁」的主要部分。代价是出现 `messageCount` 为 0 的成员，这是接受的。
 
 > 同 §5：只为显示发送者名字不必调用本接口，§3 每条消息的 `senderName` 已是同一条
 > 解析链路（含本群群名片）。本接口留给需要成员名单本身的场景（发言数统计等）。
@@ -916,12 +971,15 @@ GET /api/v1/group-members
 
 | 参数                   | 类型   | 必填 | 说明                          |
 | ---------------------- | ------ | ---- | ----------------------------- |
-| `chatroomId`           | string | 是   | 群 ID，兼容使用 `talker` 传入 |
-| `includeMessageCounts` | string | 否   | `1/true` 时附带成员发言数     |
-| `withCounts`           | string | 否   | `includeMessageCounts` 的别名 |
-| `forceRefresh`         | string | 否   | 兼容占位参数，v1 无缓存可刷新 |
+| `chatroomId`           | string | 是   | 群 ID（`talker` 别名已删除） |
+| `includeMessageCounts` | string | 否   | `1/true` 时附带成员发言数（`withCounts` 别名已删除） |
 
-群不存在时返回 `404`。
+> **迁移**：`talker` 与 `withCounts` 别名、`forceRefresh` 占位参数都已删除；
+> 它们被**静默忽略**（未知参数不报错）。同步统一走 `POST /api/v1/sync`。
+
+**群不存在时返回 404**；名册有而消息无时**返回成员**（不再 404 —— 那时名册恰好是唯一能回答
+「群里有谁」的来源）。成员按 `messageCount` 降序、`wxid` 升序**稳定排序**：只按计数排时，
+一大批计数为 0 的潜水成员顺序会随哈希遍历顺序抖动，下游按它做 diff 会看到满屏假变化。
 
 ### 响应字段
 
@@ -929,15 +987,19 @@ GET /api/v1/group-members
 - `chatroomId`
 - `count`
 - `fromCache`（v1 恒为 `false`）
-- `updatedAt`（毫秒时间戳）
+- `updatedAt`（毫秒时间戳，取值是**本次响应的生成时刻**）。**它不表示索引新鲜度** ——
+  本仓没有记录索引构建时刻；weflow 的同名字段是索引构建完成时刻，两仓含义不同（允许差异）。
 - `members[].wxid`（发送者 UID）
-- `members[].displayName` / `members[].nickname`（该群消息内首见昵称）；`members[].groupNickname`（本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID）
+- `members[].displayName`（该群消息内首见昵称；**名册-only 成员回落 UID**，而不是空串）；
+  `members[].nickname`（消息里带的昵称）；`members[].groupNickname`（本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID）
 - `members[].remark`（来自 `profile_info.db` 的 `20009`；未设置备注的成员为空串）
 - `members[].alias` / `members[].avatarUrl`（v1 恒为空串）
 - `members[].isOwner`（群主标记：由 `group_info.db::group_detail_info_ver1.[60002]` 解析——
   **每群恰一个 `true`**；群主不在本页、或缺 `group_info.db`/该表时全为 `false`，键恒保留）
 - `members[].isFriend`（v1 恒为 `false`）
-- `members[].messageCount`（仅 `includeMessageCounts=1` 时返回）
+- `members[].messageCount`（仅 `includeMessageCounts=1` 时返回）。**未请求计数时这个键不出现**
+  （不是给 `0`）—— weflow 在同名参数下给 `0`：`0` 是「统计过，这个成员没发过言」，而缺键是
+  「没统计」。两仓取值不同是**允许差异**，写在这里以免调用方按另一端写判空逻辑。
 
 ---
 

@@ -3,21 +3,98 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.7.0] - 2026-10-02
 
-### 文档（如实化，无行为变化）
+接口面的形状收敛：老面只做原生/富数据面，ChatLab 形状搬到 `/chatlab/*`；媒体只留一条按名取字节的
+路由（`{id}` 增加导出根回落）；鉴权通道减到两条。**破坏性变更较多**，逐条迁移见文末「迁移」。
 
-- **通知帧的 `platformMessageId` 说明改为如实**：本面**不下发**该字段（键保留、值恒为 `null`）。
-  事件里的 `rawid` 是本仓库自己的行号，不是平台消息号（拉取面用的是 `seq`）；此前 DTO 文档承诺
-  「撤回事件里它是被撤回那条的 id」，而实现写 `null` —— 承诺与实现不符，且规范里该字段是可选的。
+### 新增
+
+- **`GET /chatlab/messages`** —— ChatLab 形状的消息面，也是原「混合面」
+  （`/api/v1/messages?chatlab=1`）的新家：参数 `talker`（必填）/ `limit` / `offset` / `cursor` /
+  `start` / `end` / `media` / `keyword`；信封
+  `{talker,count,page,chatlab,meta,members,messages}`，**不带 `success`**，`count` 是**本页条数**，
+  消息**升序**，`page{hasMore,nextCursor}` 报告截断。`media=1` **真正执行导出** —— 旧的混合面在
+  收集导出任务**之前**就 return 了，所以 `media=1` 在 ChatLab 形状上从未导出过；「先触发导出、
+  再取字节」这条两步走在那个面上并不成立。
+- **消息的媒体元数据**：拉取面与消息面每条消息新增 `media{type,fileName,md5}`（无媒体省略整键；
+  `md5` 取不到时省略该键）。它是**元数据**：只有 `media=1` 且该条**确实写出了本地文件**、
+  且文件名由内容键派生时，`fileName` 才是可取句柄。
+- **`GET /api/v1/media/{id}` 的导出根回落**：`id` 先按 store 键（md5 hex / uuid 的本地缓存路径）
+  解析，未命中再按**导出文件名**在 `<exportPath>/<talker>/<images|voices|videos|emojis>/<file>`
+  下解析。三段式路由因此不再需要。
+- `sync` 帧新增 `generation`（**恒出现**）：客户端据此区分「注销后新账号刚开始」与「自己漏收了」。
+  （该帧同时从手拼 `json!` 改为**类型化 DTO**，三个类型已登记进 `/openapi.json`。）
+
+### 变更（破坏性）
+
+- **老面不再输出 ChatLab 形状**：`/api/v1/messages` 与 `/api/v1/sessions` 上的 `chatlab=1` /
+  `format=chatlab` 开关已删除，两个面只输出原生形状。`/api/v1/sessions` 也**不再识别 `cursor`**
+  （只认 `offset`）；`/chatlab/sessions` 继续认 `cursor`。两条路**必须拆参数** —— 一刀切会让
+  「换个面就该换参数」静默失效（调用方以为在翻页，实际一直拿第一页）。
+- **读端点只有 GET**：`messages` / `sessions` / `contacts` / `group-members` / `media/{id}` /
+  `push/messages` 的 POST 变 405。`/api/v1/sync` 与 `/health`、`/api/v1/accounts` 仍接受两个方法。
+- **鉴权只剩两条通道**：`Authorization: Bearer` 与 `?access_token=`。`X-Api-Key`、`?token=`
+  与 POST body 里的凭据键都已删除；`merge_body` 现在**跳过** `access_token`/`token` 两个键
+  （否则「body 不能鉴权」会被一次合并静默绕过）。
+- **媒体字节只留 `GET /api/v1/media/{id}`**：三段式 `/api/v1/media/{talker}/{media_Type}/{file}`
+  已删除；`mediaUrl` 改指 `/api/v1/media/{导出文件名}`（生产点在 `store/media_export.rs`）。
+- **`mediaType` → `type`**（只消息行的扁平键；SSE 的载荷没有这个键，不受影响）。
+- **`group-members` 的成员集合改为名册 ∪ 发言人**：从未发过言的成员也会出现（`messageCount` 为 0），
+  `count` 会变大；名册有而消息无时**返回成员而不是 404**。同时删 `talker` 与 `withCounts` 别名、
+  `forceRefresh` 占位参数（同步统一走 `/api/v1/sync`）。
+- **`replyToMessageId` 在三个面统一为「无引用则省略该键」**（本仓此前只有拉取面有该键，
+  消息面没有；现在三个面同规）。
+- **原生面 `media.exportPath` 未导出时省略**（此前是空串 —— 空串会被读成「有路径、只是空的」）。
+- 删除参数别名：`meiti` / `tupian` / `vioce`；删除 `POST /api/v1/accounts/{qq}/deregister` 别名。
+- **通知帧的三个 id 键改为省略**（`eventId` / `sessionId` / `platformMessageId`）：基线事件的
+  `sessionId` 是空串，而 `skip_serializing_if` 对空串无效 —— 构造时显式映射成 `None`。
+  撤回帧**仍然不填** `platformMessageId`：本仓事件里的 `rawid` 是**行号**，而拉取面的
+  `platformMessageId` 用的是 `seq`，两号不可混用。
+- **`/chatlab/sessions` 的 `messageCount` 落成真值**（索引里该会话的条数）。此前恒为 0，
+  而「键要留着：下游按它排序」这条注释让一列无意义的数字看起来像承诺。
+- 契约 pin 升到 `v0.4.0`（新增 `media_shape_in_pull`、`chatlab_envelope_page_keys` 两条具名
+  不变量与消息面用例；鉴权探测收窄为两条；夹具登记 `messages_chatlab` 端点）。
+
+### 修复
+
+- **按名取字节的同名多命中**：候选内容一致才服务（先比 size 短路，必要时逐字节比较），不一致给 404。
+  「取第一个」在这里是错的：按名解析是**跨会话**的，别的会话里可能躺着同名但内容不同的文件 ——
+  随便挑一个等于把「出现即可取」变成「出现即可取到某个东西」，而调用方无从察觉。
+  **句柄因此只对内容摘要派生的名字给出**（平台名/原文件名回落只作元数据）。
+- **kinds 白名单与穿越拒绝迁到 `{id}`**：只有四个类型目录参与解析；路径段沿用
+  `pathsafe::safe_segment` ＋ canonicalize ＋ `starts_with(export_root)`。
+- `group-members` 的排序稳定：先按 `messageCount` 降序、再按 uid 升序。只按计数排时，
+  一大批计数为 0 的潜水成员顺序随哈希遍历顺序抖动，同一个群两次请求的顺序可能不同。
+- 未命中的措辞统一为「媒体不存在」（含缓存被清理的情形）——「文件被清理」与「没这个名字」
+  对调用方是同一种失败。
+- 注销函数里那段英文注释改回与代码一致（它写着重放历史「保持不动」，而代码是**清空条目 ＋
+  保留 id 计数器 ＋ 推进 `generation`**）。
+
+### 文档
+
+- `docs/qqflow-server-api.md` 与 `docs/architecture.md` 随本批改动同步：路由清单（含
+  `/chatlab` 四条）、鉴权两条通道、读端点只留 GET、媒体按名解析与同名消歧规则、
+  `GET /chatlab/messages` 的信封与四条口径、群成员集合与排序、`messageCount` 真值。
 - `/chatlab/sessions` 的响应示例补上漏掉的 `count` 键（实际响应一直有它）。
 
-### 变更（内部，输出逐字节不变）
+### 迁移
 
-- `sync` 帧从手拼 `json!` 改为**类型化 DTO**（`SyncFrame` / `WatermarkEntry` / `WatermarkValue`），
-  三个类型已登记进 `/openapi.json` 的 `components.schemas`（此前这一帧在描述里没有对应类型）。
-  键集与键序不变：SSE 的键集护栏与一致性套件都通过。
-- `/openapi.json` 里通知帧的 `description` 随上面第一条改动（DTO 文档注释直接进描述）。
+过渡期一律**立即生效**。
+
+| 改了什么 | 怎么迁 |
+|---|---|
+| 老面不再输出 ChatLab 形状（`chatlab=1` / `format=chatlab`） | 改用 `GET /chatlab/messages`（参数同名，见上）；会话发现面用 `/chatlab/sessions` |
+| 老面不再识别 `cursor` | 老面用 `offset`；**注意失败模式**：继续传 `cursor` 不会报错，而是**静默回到第一页** |
+| 旧参数拼写（`chatlab=1`、`format=chatlab`、`meiti`、`tupian`、`vioce`） | 一律**被静默忽略**（未知参数不报错）：改成 `media=1` 与类型参数，或改用新面 |
+| 三段式媒体路由已删 | 改用 `GET /api/v1/media/{id}`（`{id}` 是导出文件名）；未导出前先请求 `media=1` |
+| 鉴权只剩 Bearer 与 `?access_token=` | 删掉 `X-Api-Key`、`?token=` 与「把 token 放进 JSON body」的写法 |
+| 消息行的 `mediaType` 改名 `type` | 按键名替换；值与位置不变 |
+| `/chatlab/sessions` 的 `messageCount` 由恒 0 变真值 | 按它排序的地方现在拿到的是真实条数（更准，但也更大） |
+| 读端点的 POST 变 405 | 改用 GET（参数走查询串） |
+| `group-members` 的 `talker`/`withCounts` 别名与 `forceRefresh` 已删、成员集合并了名册 | 用 `chatroomId` 与 `includeMessageCounts`；按 `count` 分配 UI 的地方要接受更大的成员数 |
+| 原生面 `media.exportPath` 未导出时省略 | 判空从「空串」改为「键不存在」 |
+| 通知帧的 `eventId`/`sessionId`/`platformMessageId` 改为省略 | 按「键存在且非空」判断；基线帧不再有空的 `sessionId` |
 ## [0.6.1] - 2026-10-01
 
 门禁与文档收口。**响应形状未变** —— 新增的是接口描述里的两条操作与更严的门禁。
