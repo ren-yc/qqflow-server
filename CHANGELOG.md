@@ -3,6 +3,37 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.1] - 2026-10-01
+
+门禁与文档收口。**响应形状未变** —— 新增的是接口描述里的两条操作与更严的门禁。
+
+### 新增
+
+- **`/openapi.json` 补上两条真实存在的操作**：`POST /api/v1/sessions`、`GET /api/v1/sync`。
+  它们一直能被调用却不在描述里，从描述生成客户端的人看不到它们。
+- 路由现在有**唯一事实源**（`src/server/routes.rs`）：`build_router` 由它构建，
+  与端点表的对等由 `documented_routes_match_the_openapi_table` 强制 —— 集合必须等于
+  「路由 − 豁免」（本仓没有豁免），未声明的方法必须 405。
+
+### 变更（对门禁，不对接口）
+
+- 一致性套件带上跳过即失败：有用例被跳过时整套失败（此前跳过不影响退出码，
+  「夹具少声明一个端点」会让用例静默变成不跑，而 CI 仍是绿的）。缺 `FLOW_CONTRACT_DIR`
+  同样由静默通过改为失败。
+- 契约 pin 升到 `v0.3.3`（`v0.3.1` 引入跳过即失败；`v0.3.2` 让 runner 校验 tag；
+  `v0.3.3` 修公共段措辞）。夹具的 `contractVersion` 与 `conformance.pin` 由
+  `pinned_contract_version_matches_the_fixture` 钉在一起，只改一处不再能溜过。
+- golden 快照**缺失即失败**（此前缺失会被静默重建，drift 检测随之失效）。
+
+### 文档
+
+- `docs/architecture.md` 补「工程与工具链」「测试与夹具」两节。
+- `docs/qqflow-server-api.md` 登记 `members[].roles` 为**有意不输出**（与 `isOwner` 同义，
+  且受同一个「群主可能不在本页」的限制）。
+
+### 迁移
+
+无。
 ## [0.6.0] - 2026-09-27
 
 ChatLab 适配层上线，**并接受一次破坏性发布**（三项，见下）。下游需按迁移表逐项核对。
