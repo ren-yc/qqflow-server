@@ -2193,11 +2193,20 @@ mod golden {
             let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
             let path = golden_dir().join(format!("{name}.json"));
-            if update || !path.exists() {
+            if update {
                 std::fs::write(&path, &actual).unwrap();
                 println!("[GOLDEN] 写入 {}", path.display());
                 continue;
             }
+            // 快照**缺失即失败**：此前写成 `if update || !path.exists()` 静默重建，
+            // 于是删掉一个快照文件（或新增端点后忘了提交快照）不会红 —— 下一次运行会把它
+            // 按当时的实现重新写出来，drift 检测就此失效。缺失与漂移是两种不同的失败，
+            // 但都必须看得见。
+            assert!(
+                path.exists(),
+                "golden 快照缺失：{}（新增端点后必须 UPDATE_GOLDEN=1 生成并提交）",
+                path.display()
+            );
             if std::fs::read_to_string(&path).unwrap() != actual {
                 drifted.push(name.to_string());
             }
@@ -2207,4 +2216,86 @@ mod golden {
             "这些端点的响应与快照不一致：{drifted:?}\n\n若改动是有意的，设 UPDATE_GOLDEN=1 重跑后**人工读一遍 diff**。"
         );
     }
+}
+/// **路由 ↔ 接口描述的对等**。
+///
+/// 为什么要有它：端点是两份清单（`server::routes::ROUTES` 与 `openapi.rs` 的端点表），
+/// 而上次「收口」仍然漏了两条真实操作（`POST /api/v1/sessions`、`GET /api/v1/sync`）——
+/// 表、描述与 golden 快照同源，互相印证恒绿，只有读路由代码才看得出来。
+///
+/// 三条断言：
+/// 1. 集合相等：描述的 (路径, 方法) == 路由 − 豁免（本仓豁免为空）；
+/// 2. 声明的每个方法都被真实路由**接受**（不是 405）；
+/// 3. 没声明的方法一律 **405** —— 而 405 同时证明「这条路径确实注册了」，
+///    因此它也是「表里有幽灵路由」的探测器（真有幽灵路由，探测会得到 404）。
+#[tokio::test]
+async fn documented_routes_match_the_openapi_table() {
+    use qqflow_server::server::routes::{NOT_DOCUMENTED, ROUTES};
+
+    let doc = serde_json::to_value(qqflow_server::server::openapi::document()).unwrap();
+    let paths = doc["paths"].as_object().expect("paths 必须是对象");
+
+    let mut documented: Vec<(String, String)> = Vec::new();
+    for (path, item) in paths {
+        for method in item.as_object().expect("path item 必须是对象").keys() {
+            documented.push((path.clone(), method.clone()));
+        }
+    }
+    let mut routed: Vec<(String, String)> = Vec::new();
+    for r in ROUTES {
+        if NOT_DOCUMENTED.contains(&r.kind) {
+            continue;
+        }
+        for m in r.methods {
+            routed.push((r.path.to_string(), m.key().to_string()));
+        }
+    }
+    documented.sort();
+    routed.sort();
+    assert_eq!(documented, routed, "接口描述必须恰好等于「路由 − 豁免」");
+
+    let app = build_router(test_state());
+    // 只探测这五个方法：HEAD 由 axum 依 GET 自动派生，OPTIONS 不在契约里。
+    const PROBE: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    for r in ROUTES {
+        let uri = probe_uri(r.path);
+        for method in PROBE {
+            let declared = r.methods.iter().any(|m| m.key().eq_ignore_ascii_case(method));
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(&uri)
+                        .header("authorization", "Bearer test-token-123456")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            if declared {
+                assert_ne!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {uri} 在端点表里声明了，路由却不接受"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {uri} 没被声明却被接受（或该路径根本没注册）"
+                );
+            }
+        }
+    }
+}
+
+/// 把路由表里的占位符换成夹具里的真实取值 —— 否则路径匹配不上，探测全变 404。
+fn probe_uri(path: &str) -> String {
+    path.replace("{qq}", common::FAKE_QQ)
+        .replace("{id}", "10001")
+        .replace("{talker}", "u_a")
+        .replace("{media_type}", "images")
+        .replace("{file}", "aabbccddeeff00112233445566778899.jpg")
 }

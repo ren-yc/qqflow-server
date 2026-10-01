@@ -5,6 +5,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod openapi;
+pub mod routes;
 pub(crate) mod chatlab;
 pub mod handlers;
 
@@ -12,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::routing::{delete, get, post};
 use axum::Router;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -282,48 +282,13 @@ async fn openapi_handler() -> axum::response::Response {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    use handlers::*;
-    Router::new()
-        .route("/health", get(health::handler).post(health::handler))
-        .route("/api/v1/health", get(health::handler).post(health::handler))
-        // 接口描述**免鉴权**：它描述的是形状，不含任何本机信息（账号、路径、密钥都不在
-        // 里面），而且正是给尚未拿到 token 的接入方看的。
-        .route("/openapi.json", get(openapi_handler))
-        .route("/api/v1/accounts", get(accounts::list_handler).post(accounts::handler))
-        .route("/api/v1/accounts/{qq}", delete(accounts::delete_handler))
-        // POST alias for clients (and proxies) that cannot issue DELETE.
-        .route("/api/v1/accounts/{qq}/deregister", post(accounts::delete_handler))
-        .route("/api/v1/messages", get(messages::handler).post(messages::handler))
-        .route("/api/v1/media/{id}", get(media::handler).post(media::handler))
-        .route(
-            "/api/v1/media/{talker}/{media_type}/{file}",
-            get(media::exported_handler).post(media::exported_handler),
-        )
-        .route("/api/v1/sessions", get(sessions::handler).post(sessions::handler))
-        .route("/api/v1/sessions/{id}/messages", get(chatlab_pull::handler))
-        .route("/api/v1/contacts", get(contacts::handler).post(contacts::handler))
-        .route("/api/v1/group-members", get(group_members::handler).post(group_members::handler))
-        .route("/api/v1/push/messages", get(push_events::handler).post(push_events::handler))
-        // ── ChatLab 适配面（新增，**不改老路由**）──────────────────────────
-        //
-        // 规范把 `baseUrl` 定义为 `/chatlab`。它与 `/api/v1/*` **共用同一份实现与同一条总线**，
-        // 差别只在帧的形状：老面发完整事件，通知面只发元信息。
-        .route(
-            "/chatlab/push/messages",
-            axum::routing::get(chatlab_push::handler),
-        )
-        .route(
-            "/chatlab/sessions",
-            axum::routing::get(chatlab_sessions::handler),
-        )
-        // Pull 面**本身就是** ChatLab 形状（它没有 `format` 参数）。挂到规范约定的
-        // `{baseUrl}/sessions/{id}/messages` 上，于是 `baseUrl=/chatlab` 三条路由齐了。
-        .route(
-            "/chatlab/sessions/{id}/messages",
-            axum::routing::get(chatlab_pull::handler),
-        )
-        .route("/api/v1/sync", get(sync::handler).post(sync::handler))
-        .fallback(unknown_path)
+    // **路由表是唯一事实源**（见 `routes`）：这里只负责把它挂上去。加路由改 routes.rs，
+    // 不在这里 —— 于是「真实路由」与「接口描述」不可能各自漂移（对等测试在 api_smoke）。
+    let mut app = Router::new();
+    for r in routes::ROUTES {
+        app = app.route(r.path, routes::method_router(r.kind));
+    }
+    app.fallback(unknown_path)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
 }

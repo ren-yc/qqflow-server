@@ -831,6 +831,7 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 多来源名字已收敛进 `accountName`（备注 > `uid_names` > 昵称 > UID） |
 | `members[].avatar` | 可选，要求 Data URL | 真实 URL | **恒为空串** | QQ 侧没有可用的头像来源；字段保留以满足形状 |
 | `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 媒体字节请走 §3 `/api/v1/messages` 的媒体导出 |
+| `members[].roles` | 可选，`[{id}]`（中文表列出） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出（源 `group_info.db::group_detail_info_ver1.[60002]`）；且两者受同一个限制——群主不在本页时都无从判断 |
 | `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 `format=chatlab` 面有 | **目标唯一时输出；否则省略该键** | 键名与语义对齐 WeFlow；判据见下 |
 
 **`replyToMessageId` 的判据（为什么有时不给）**：它取自表列 `40850`（被回复消息的**会话内序号**），
