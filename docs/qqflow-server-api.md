@@ -1126,3 +1126,19 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
 9. **单账号绑定**：内存索引没有账号维度，同时只能有一个账号处于 `indexing` / `ready` / `error`。第二个账号注册被拒（`account_conflict`，见 §1.1）而**不是覆写**；换账号必须先调 `DELETE /api/v1/accounts/{qq}`（§1.3）。`error` 不释放绑定，但同一 qq 可直接重试。
 10. **注销不是锁**：它只是把服务恢复到未注册状态，持有 token 的客户端可以立刻重新注册。要真正阻止访问请轮换 token 或停止进程。
 11. **密钥在内存中未做 `zeroize`**：`key` 仅存活于进程内存、不落盘，但注销/进程退出时不做显式擦除，因此仍可能残留在内存或崩溃转储中。威胁模型假定本机可信（服务默认只监听 `127.0.0.1`）。
+
+## 类型化客户端（SDK）
+
+本仓库自带类型化 Rust 客户端：`clients/rust`（crate 名 `qqflow-client`，workspace 成员）。
+
+- **类型与操作客户端是生成的**：出处是 `/openapi.json` 的描述（生成工具 `clients/regen`，
+  `cargo run -p qqflow-regen` 重新生成；生成物入库，CI 断言「重生成无 diff」）。**不要手改**
+  `clients/rust/src/generated/` 下的任何文件。
+- **行为层是手写的**（`clients/rust/src/client.rs`）：就绪轮询（`ensure_ready`，注册载荷是
+  `qq`/`key`/`db_path`）、Pull 游标排空（`drain_session`，`nextSince`/`nextOffset` 原样回传）、
+  会话列表排空、SSE 订阅（`watch`，`Last-Event-ID` 重连、心跳注释帧过滤、`generation` 变化
+  上报；老面 `message.new`/`message.revoke` 载荷由客户端自有类型解码——它们不在描述 schema 里）、
+  媒体字节（`media_bytes`，404 后按「先 `media=1` 导出再取」自动重试一次）、关键词检索
+  （`search`，`YYYYMMDD` 客户端先校验）。
+- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL。
+- 本轮**不发布** crates.io：本地 `cargo build -p qqflow-client` 即可使用。

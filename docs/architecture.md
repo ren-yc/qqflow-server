@@ -135,6 +135,22 @@ QQ 数据目录（nt_db 等）
 
 **依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum 与 tokio**。
 核心面（解析、存储）因此不得依赖可选面 —— 这条边界由 CI 上的一条检查守着。
+
+### `clients/`：类型化 SDK（workspace 成员）
+
+两个成员，与 src 的模块边界不同 —— 它们**消费** HTTP 面，不属于 crate 本体：
+
+| 成员 | 内容 | 维护方式 |
+|---|---|---|
+| `clients/rust`（`qqflow-client`） | 类型与操作客户端 ＋ 手写行为层（就绪轮询 / 游标排空 / SSE 重连 / 媒体重试 / 检索） | `generated/` 只许生成器改（`clients/regen`，CI 断言重生成无 diff）；行为层手写并测 |
+| `clients/regen`（`qqflow-regen`） | 生成工具：取 `server::openapi::document()`，做确定性规范化（3.1 → 3.0）后交给生成器 | 改规范化规则 = 改语义，需评审 |
+
+分层的理由：描述文档只声明「形状」，不声明「翻页到什么时候停、断线后从哪续」——后者是行为，
+生成不出来；而类型若靠手写，必然与描述静默分叉。所以形状交给生成器（入库 + no-diff 门禁），
+行为交给手写层（对 mock 夹具测试）。与 weflow 侧的**语义差异**都在客户端自有类型里：老面 SSE 的
+`message.new`/`message.revoke` 载荷不在描述 schema 里，由行为层的 `MessageEvent` 解码；水位是
+SQLite 行号（weflow 是三元组），`generation` 变化后的补拉语义因此是「整会话重排空」。
+
 ## 服务层
 
 ### 响应形状只有一个事实源：`server/dto.rs`

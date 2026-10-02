@@ -3,6 +3,25 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+
+## [未发布]
+
+### 新增
+
+- **`clients/rust`（`qqflow-client`）**：类型化 Rust SDK（workspace 成员，随根包版本 0.7.0）。
+  类型与操作客户端由 `/openapi.json` 描述生成（生成物入库，CI 断言「重生成无 diff」）；
+  行为面手写六件套：`ensure_ready`（注册 + 就绪轮询）、`drain_session`（Pull 游标原样回传排空）、
+  `list_all_sessions`、`watch`（SSE 重连带 `Last-Event-ID`、心跳过滤、`generation` 变化上报；
+  老面 `message.new`/`message.revoke` 载荷由客户端自有类型解码）、`media_bytes`（404 后按
+  「先 `media=1` 导出再取」重试一次）、`search`（`YYYYMMDD` 客户端校验）。本轮**不发布** crates.io。
+- **`clients/regen`（`qqflow-regen`）**：生成工具（`cargo run -p qqflow-regen`，`--check` 供 CI 用）。
+  规范化（3.1 → 3.0）与 weflow 侧同构：可空 `type` 数组转 `nullable`、`Option` 的 `oneOf` null 臂丢弃。
+
+### 修复
+
+- **`/openapi.json` 为路径模板参数补 `parameters` 声明**：四条带占位符的操作此前没有参数声明，
+  违反 OpenAPI 规范；golden 快照只记录输出、不校验合法性，因此一直无声。守卫断言见
+  `tests/openapi.rs`。
 ## [0.7.0] - 2026-10-02
 
 接口面的形状收敛：老面只做原生/富数据面，ChatLab 形状搬到 `/chatlab/*`；媒体只留一条按名取字节的
