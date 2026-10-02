@@ -20,9 +20,14 @@
   真实类型烧成 string）。
 - **`clients/python`（`qqflow-sdk`）**：类型化 Python SDK（workspace 外的独立包，随根包版本 0.7.0）。
   模型由 openapi-generator 从同一份规范化 spec 生成（生成物与 spec 一并入库，CI 断言「重生成无 diff」）；
-  行为面 `httpx.AsyncClient` 异步手写，与 Rust 侧逐方法同构：`ensure_ready`（注册 + 就绪轮询）、
-  `drain_session`（Pull 游标原样回传排空）、`list_all_sessions`、`watch`（SSE 重连带 `Last-Event-ID`、
-  心跳过滤、EOF 冲刷、`generation` 变化上报——水位是 per-table 行号，跳变后的补拉是**整会话重排空**；
+  行为面 `httpx.AsyncClient` 异步手写，与 Rust 侧逐方法同构：`ensure_ready`（注册 + 就绪轮询；
+  200 拒绝态 `account_conflict`/`invalid_key`/`invalid_db_path`/`unknown_qq` 现映射为 `StatusError` 快速失败）、
+  `wait_ready`（wait-only 就绪轮询，不做任何注册动作）、`drain_session`（Pull 游标原样回传排空）、
+  `list_all_sessions`、`watch`（SSE **单连接连续产出多帧**——原先每帧断开重连；字节级 LF 分帧，
+  `aiter_lines` 的 splitlines 语义会把含 U+0085/U+2028/U+2029 的 JSON 正文拆断；1 MiB 未消费缓冲上限；
+  单帧解码失败跳过不杀流；EOF 把未终结残行并入末帧冲刷；重连带 `Last-Event-ID`、`generation` 变化上报
+  ——水位是 per-table 行号，跳变后的补拉是**整会话重排空**；`message.new`/`message.revoke` 解码为
+  `MessageEvent`，该模型现携带 `event` 字段（载荷缺省时回落帧头事件名），new 与 revoke 不再不可区分；
   老面 `message.new`/`message.revoke` 由客户端自有 `MessageEvent` 模型解码）、`media_bytes`（404 后按
   「先 `media=1` 导出再取」重试一次）、`search`（`YYYYMMDD` 客户端校验）。本轮**不发布** PyPI。
 

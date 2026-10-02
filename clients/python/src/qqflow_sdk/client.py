@@ -39,6 +39,26 @@ from .generated.qqflow_sdk import models as gen
 
 log = logging.getLogger(__name__)
 
+# 200-with-refusal states the registration endpoint answers with: a
+# conflict leaves the incumbent bound, the other three reject the request
+# before any state change. Treating these 200s as "accepted" makes the
+# readiness poll time out and hide the real cause, so ensure_ready maps
+# them to StatusError; wait-only callers classify the body themselves.
+_REFUSAL_STATES = frozenset({
+    "account_conflict",
+    "invalid_key",
+    "invalid_db_path",
+    "unknown_qq",
+})
+
+# SSE framing is byte-level: U+0085/U+2028/U+2029 are legal *inside* JSON
+# bodies, and str.splitlines (what ``aiter_lines`` uses) would split the
+# body there and corrupt the frame. Only LF terminates a line; a lone CR is
+# stripped for CRLF servers. The cap bounds a malformed stream that never
+# emits a blank line - without it, one such stream grows the buffer without
+# bound.
+_SSE_BUFFER_CAP = 1 << 20
+
 
 class ClientError(Exception):
     """Base error for the behavior layer."""
@@ -58,7 +78,7 @@ class ShapeError(ClientError):
 
 
 class NotReady(ClientError):
-    """``ensure_ready`` hit its deadline before the account reached ready."""
+    """``wait_ready``/``ensure_ready`` hit its deadline before the account reached ready."""
 
     def __init__(self, timeout: float, last_state: str) -> None:
         super().__init__(
@@ -84,10 +104,17 @@ class MessageEvent(BaseModel):
     ``#[serde(rename_all = "camelCase")]``: the aliases below are what the
     wire actually carries, and ``populate_by_name`` keeps the snake_case
     attribute names usable from Python.
+
+    ``event`` carries the event name (``message.new`` vs ``message.revoke``):
+    without it the two kinds decode into indistinguishable objects and a
+    downstream listener cannot tell a new message from a revoke. The
+    decoder fills it from the frame body, falling back to the SSE
+    ``event:`` header when the body omits it.
     """
 
     model_config = ConfigDict(populate_by_name=True)
 
+    event: str
     session_id: str = Field(validation_alias=AliasChoices("sessionId", "session_id"))
     session_type: str = Field(validation_alias=AliasChoices("sessionType", "session_type"))
     group_name: Optional[str] = Field(default=None, validation_alias=AliasChoices("groupName", "group_name"))
@@ -107,24 +134,25 @@ class _SseFrame:
     id_: Optional[str]
 
 
-def _parse_sse_block(block: str) -> Optional[_SseFrame]:
+def _parse_sse_block(block: bytes) -> Optional[_SseFrame]:
     event = data = id_ = None
-    for line in block.splitlines():
-        if line.startswith(":"):
+    for raw in block.split(b"\n"):
+        raw = raw.rstrip(b"\r")
+        if raw.startswith(b":"):
             continue  # heartbeat comment
-        if line.startswith("id:"):
-            id_ = line[3:].strip()
-        elif line.startswith("event:"):
-            event = line[6:].strip()
-        elif line.startswith("data:"):
-            data = line[5:].strip()
+        if raw.startswith(b"id:"):
+            id_ = raw[3:].strip().decode("utf-8", "replace")
+        elif raw.startswith(b"event:"):
+            event = raw[6:].strip().decode("utf-8", "replace")
+        elif raw.startswith(b"data:"):
+            data = raw[5:].strip().decode("utf-8", "replace")
     if data is None:
         return None
     return _SseFrame(event, data, id_)
 
 
 class Client:
-    """Async client for one weflow-server instance.
+    """Async client for one qqflow-server instance.
 
     ``token`` is the API token the server printed on first start (or
     ``--show-token``). Auth goes in the ``Authorization`` header only -
@@ -168,25 +196,20 @@ class Client:
         except _json.JSONDecodeError as exc:  # pragma: no cover - defensive
             raise ShapeError(str(exc)) from exc
 
-    # ---- ensure_ready ---------------------------------------------------
+    # ---- readiness ------------------------------------------------------
 
-    async def ensure_ready(self, account: str, body: dict, timeout: float = 120.0) -> None:
-        """Register (idempotently) and poll until the account is ready.
+    async def wait_ready(self, account: str, timeout: float = 120.0) -> None:
+        """Poll the account listing until `account` reports ready.
 
-        Intermediate states (``indexing``) are waiting, not errors; errors
-        are reserved for the deadline or the account landing in ``error``.
-        The registration payload carries ``qq`` / ``key`` / ``db_path``;
-        the listing is matched by ``AccountView.qq``.
+        Wait-only: performs **no** registration action and sends no body -
+        the caller owns registration and the classification of business
+        rejections (200 responses whose JSON `state` names a conflict or a
+        refusal). Errors are reserved for the deadline or the account
+        landing in ``error``; intermediate states are waiting, not errors.
+        The listing is matched by ``AccountView.qq``.
         """
-        url = self._url("/api/v1/accounts")
-        resp = await self._http.post(
-            url,
-            headers={"Authorization": f"Bearer {self._token}"},
-            json=body,
-        )
-        if resp.status_code >= 400:
-            raise StatusError(resp.status_code, url)
         deadline = asyncio.get_running_loop().time() + timeout
+        last_state = "not-registered"
         while True:
             listing = gen.AccountsList.model_validate(
                 await self._get_json("/api/v1/accounts", {})
@@ -203,6 +226,39 @@ class Client:
             if asyncio.get_running_loop().time() >= deadline:
                 raise NotReady(timeout, last_state)
             await asyncio.sleep(0.25)
+
+    async def ensure_ready(self, account: str, body: dict, timeout: float = 120.0) -> None:
+        """Register (idempotently) and poll until the account is ready.
+
+        The HTTP POST failing (>=400) is the only transport-level error the
+        registration step raises. A **200 whose JSON body carries a
+        `state` naming a refusal** (`account_conflict` / `invalid_key` /
+        `invalid_db_path` / `unknown_qq`) raises :class:`StatusError`
+        instead of entering the wait: treating those rejections as accepted
+        makes the readiness poll time out and hide the real cause. Callers
+        that need to distinguish refusal states themselves should POST and
+        use :meth:`wait_ready` directly.
+
+        The registration payload carries ``qq`` / ``key`` / ``db_path``.
+        Intermediate states (``indexing``) are waiting, not errors; errors
+        are reserved for the deadline or the account landing in ``error``.
+        """
+        url = self._url("/api/v1/accounts")
+        resp = await self._http.post(
+            url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            json=body,
+        )
+        if resp.status_code >= 400:
+            raise StatusError(resp.status_code, url)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        state = payload.get("state") if isinstance(payload, dict) else None
+        if isinstance(state, str) and state in _REFUSAL_STATES:
+            raise StatusError(200, f"{url} (state={state})")
+        await self.wait_ready(account, timeout)
 
     # ---- drain_session --------------------------------------------------
 
@@ -320,15 +376,33 @@ class Client:
 
     # ---- watch ------------------------------------------------------------
 
-    async def watch(self, *, poll_interval: float = 0.5) -> AsyncIterator[Any]:
-        """Yield live server events, reconnecting with ``Last-Event-ID``.
+    async def watch(self) -> AsyncIterator[Any]:
+        """Yield live server events over one long-lived SSE connection.
 
-        Heartbeat comment frames are skipped. ``sync`` frames carry the
-        server's ``generation``; a jump means the replay buffer cannot fill
-        the gap and - the watermarks being per-table SQLite row numbers -
-        the caller should re-drain each watched session *from scratch*
-        (a full re-drain, not a cursor resume). Cancelling the iteration
-        closes the stream.
+        One connection produces many events: the read loop yields each
+        decoded frame and keeps reading until the stream itself ends or
+        errors - only then does it reconnect, carrying `Last-Event-ID` so
+        the server's replay window fills the gap. A per-frame disconnect
+        would turn every frame (including idle `sync` heartbeats) into a
+        reconnect cycle and make the server re-send its baseline each time.
+
+        Framing is byte-level LF - never ``aiter_lines``, whose splitlines
+        semantics split JSON bodies at U+0085/U+2028/U+2029 - with a 1 MiB
+        cap on unconsumed bytes: a malformed stream that never emits a
+        blank line grows a naive buffer without bound.
+
+        Decoding failures on a single frame (bad JSON, shape mismatch,
+        non-object payload) are logged and skipped, never fatal: one bad
+        frame must not kill the stream. `StatusError` (HTTP >= 400) and
+        network errors keep their documented semantics - the former
+        propagates to the caller, the latter reconnects with backoff.
+        Cancelling the iteration closes the stream.
+
+        ``sync`` frames carry the server's `generation`; a jump means the
+        replay buffer cannot fill the gap and - the watermarks being
+        per-table SQLite row numbers - the caller should re-drain each
+        watched session *from scratch* (a full re-drain, not a cursor
+        resume).
         """
         last_event_id: Optional[str] = None
         backoff = 0.5
@@ -340,45 +414,71 @@ class Client:
                 }
                 if last_event_id is not None:
                     headers["Last-Event-ID"] = last_event_id
-                event: Optional[Any] = None
+                overflow = False
                 async with self._http.stream(
                     "GET", self._url("/api/v1/push/messages"), headers=headers
                 ) as resp:
                     if resp.status_code >= 400:
                         raise StatusError(resp.status_code, self._url("/api/v1/push/messages"))
                     backoff = 0.5
-                    block: list[str] = []
-                    async for line in resp.aiter_lines():
-                        if line.strip():
-                            block.append(line)
-                            continue
-                        if not block:
-                            continue
-                        frame = _parse_sse_block("\n".join(block))
-                        block = []
-                        if frame is None:
-                            continue
-                        if frame.id_ is not None and frame.id_.isdigit():
-                            last_event_id = frame.id_
-                        decoded = self._decode_event(frame)
-                        if decoded is not None:
-                            event = decoded
+                    buffer = bytearray()
+                    pending: list[bytes] = []
+                    pending_bytes = 0
+                    async for chunk in resp.aiter_bytes():
+                        buffer.extend(chunk)
+                        while True:
+                            nl = buffer.find(b"\n")
+                            if nl < 0:
+                                break
+                            line = bytes(buffer[:nl]).rstrip(b"\r")
+                            del buffer[: nl + 1]
+                            if line:
+                                pending.append(line)
+                                pending_bytes += len(line) + 1
+                                continue
+                            # blank line = end of frame
+                            frame = _parse_sse_block(b"\n".join(pending))
+                            pending = []
+                            pending_bytes = 0
+                            if frame is None:
+                                continue
+                            if frame.id_ is not None and frame.id_.isdigit():
+                                last_event_id = frame.id_
+                            try:
+                                decoded = self._decode_event(frame)
+                            except (ShapeError, ValidationError, AttributeError) as exc:
+                                log.warning("undecodable SSE frame skipped: %s", exc)
+                                continue
+                            if decoded is not None:
+                                yield decoded
+                        if pending_bytes + len(buffer) > _SSE_BUFFER_CAP:
+                            log.warning(
+                                "SSE buffer over %d bytes without a frame boundary "
+                                "(malformed stream?), ending this stream for reconnect",
+                                _SSE_BUFFER_CAP,
+                            )
+                            overflow = True
                             break
-                    if event is None and block:
-                        # EOF with a pending frame: servers may close without
+                    residual = bytes(buffer).rstrip(b"\r")
+                    buffer.clear()
+                    if residual:
+                        pending.append(residual)
+                    if not overflow and pending:
+                        # EOF: fold the unterminated final line (still in the buffer) into the
+                        # pending frame - a server may close without
                         # the trailing blank line, and the last event would
                         # silently vanish with the buffer.
-                        frame = _parse_sse_block("\n".join(block))
-                        block = []
+                        frame = _parse_sse_block(b"\n".join(pending))
                         if frame is not None:
                             if frame.id_ is not None and frame.id_.isdigit():
                                 last_event_id = frame.id_
                             try:
-                                event = self._decode_event(frame)
+                                decoded = self._decode_event(frame)
                             except Exception as exc:
                                 log.warning("undecodable final SSE frame: %s", exc)
-                if event is not None:
-                    yield event
+                            else:
+                                if decoded is not None:
+                                    yield decoded
             except httpx.HTTPError as exc:
                 log.warning("SSE stream error, reconnecting: %s", exc)
             await asyncio.sleep(backoff)
@@ -392,9 +492,13 @@ class Client:
         except _json.JSONDecodeError as exc:
             raise ShapeError(str(exc)) from exc
         kind = payload.get("event", frame.event or "")
-        if kind == "message.new":
-            return MessageEvent.model_validate(payload)
-        if kind == "message.revoke":
+        if kind in ("message.new", "message.revoke"):
+            # The event name lives in the frame; some legacy payloads omit
+            # it from the body, and MessageEvent must carry it either way -
+            # without it new and revoke decode into indistinguishable
+            # objects and a listener cannot tell them apart.
+            if isinstance(payload, dict):
+                payload.setdefault("event", kind)
             return MessageEvent.model_validate(payload)
         if kind == "sync":
             return gen.SyncFrame.model_validate(payload)
