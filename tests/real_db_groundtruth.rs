@@ -248,9 +248,9 @@ fn fake_db_names_loaded() {
     // 服务器走的是 `build_with` —— 它内部按同样的顺序调这两个。
     let meta = qqflow_server::store::group_meta::load_group_meta(&nt_db, FAKE_KEY);
     let roster = meta.roster.get("10001").expect("10001 应当有名册（夹具写了 group_member3）");
-    assert_eq!(roster.len(), 3, "夹具写了 3 个成员：{roster:?}");
+    assert_eq!(roster.len(), 4, "夹具写了 4 个成员（u_d 是刻意留的潜水成员）：{roster:?}");
     assert!(roster.contains(&"u_a".to_string()), "u_a 在名册里");
-    assert_eq!(meta.member_count("10001"), Some(3), "memberCount 用名册长度");
+    assert_eq!(meta.member_count("10001"), Some(4), "memberCount 用名册长度");
     assert_eq!(meta.member_count("99999"), None, "没有名册 ⇒ 没有数字，而不是 0");
     let cards = meta.cards.get("10001").expect("10001 应当有群名片");
     assert_eq!(cards.get("u_a").map(String::as_str), Some("张三群名片"));
@@ -272,12 +272,91 @@ fn fake_db_names_loaded() {
     // 灌进 store 之后，会话侧的 `memberCount` 才有来源。
     // 用上面已经建好的 `store`（`conn` 在 `drop(reader)` 之后已经不能再用 —— 它借着 reader）。
     qqflow_server::store::group_meta::apply_group_meta(&mut store, meta);
-    assert_eq!(store.chatroom_roster.get("10001").map(Vec::len), Some(3));
+    assert_eq!(store.chatroom_roster.get("10001").map(Vec::len), Some(4));
     assert_eq!(
         store.chatroom_owner.get("10001").map(String::as_str),
         Some("u_b"),
         "apply 之后 handler 才取得到群主"
     );
+}
+
+/// 群成员面 = **名册 ∪ 发言人**（端到端）。
+///
+/// 夹具给群 10001 造了 4 人名册（`group_member3`：u_a/u_b/u_c/u_d），其中 **u_d 从不发言** ——
+/// 这条断言正是「潜水成员会出现」的判据：把成员集合改回「只列发言人」会得到 3 人，而契约套件
+/// 与 golden 都看不见这个差别（它们用的夹具里发言人与名册恰好同集，改回旧语义照样绿）。
+///
+/// 同时钉住两件容易悄悄漂移的事：roster-only 成员的 `messageCount` 为 **0**（键仍在）、
+/// `displayName` **回落 uid** 而不是空串；以及排序是「计数降序 → uid 升序」（一大批 0 计数
+/// 成员的顺序不得随哈希遍历顺序抖动）。
+#[tokio::test]
+// 与同文件其它 async 夹具用例同款：夹具目录必须整条测试独占，而断言要 await。
+#[allow(clippy::await_holding_lock)]
+async fn fake_db_group_members_is_roster_union_senders() {
+    let _guard = FAKE_DB_LOCK.lock().unwrap();
+    // 显式重建夹具：别的用例会往同一个库里追加行（图片行是 u_c 发的），
+    // 不重建的话「u_d 没发过言」这个前提取决于执行顺序。
+    build_fake_db();
+    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    common::write_fake_group_info(&nt_db);
+
+    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    reader.open().unwrap();
+    let conn = reader.acquire().unwrap();
+    let mut store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    drop(reader);
+    // 名册与群主住 group_info.db；服务器启动时走的是同一条装载路径（build_with 内部）。
+    let meta = qqflow_server::store::group_meta::load_group_meta(&nt_db, FAKE_KEY);
+    qqflow_server::store::group_meta::apply_group_meta(&mut store, meta);
+
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        store: Arc::new(parking_lot::RwLock::new(store)),
+        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        token: Arc::new("test-token".into()),
+        sync: Arc::new(SyncEngine::new()),
+        init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
+        export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_members_export")),
+        base_url: Arc::new("http://127.0.0.1:5032".into()),
+        history: Arc::new(parking_lot::Mutex::new(Default::default())),
+        shutdown: tokio::sync::watch::channel(false).0,
+    });
+    let app = build_router(state.clone());
+
+    let (s, v) = common::get_json(
+        app.clone(),
+        "/api/v1/group-members?chatroomId=10001&includeMessageCounts=1&access_token=test-token",
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let members = v["members"].as_array().unwrap();
+    let mut uids: Vec<&str> = members.iter().map(|m| m["wxid"].as_str().unwrap()).collect();
+    uids.sort_unstable();
+    assert_eq!(
+        uids,
+        ["u_a", "u_b", "u_c", "u_d"],
+        "名册 ∪ 发言人：从不发言的 u_d 也必须出现"
+    );
+
+    let c = members.iter().find(|m| m["wxid"] == "u_d").unwrap();
+    assert_eq!(c["messageCount"], 0, "没发过言 ⇒ 计数为 0（键仍在）");
+    assert!(
+        c["displayName"].as_str().is_some_and(|s| !s.is_empty()),
+        "名册-only 成员的 displayName 回落 uid，而不是空串：{c}"
+    );
+
+    let got: Vec<(i64, String)> = members
+        .iter()
+        .map(|m| (m["messageCount"].as_i64().unwrap(), m["wxid"].as_str().unwrap().to_string()))
+        .collect();
+    let mut want = got.clone();
+    want.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    assert_eq!(got, want, "排序必须是「计数降序 → uid 升序」（0 计数的成员不得抖动）");
+    assert_eq!(v["fromCache"], false);
+    assert!(v["updatedAt"].as_i64().is_some_and(|t| t > 0), "updatedAt 有值：{v}");
 }
 
 /// Structured image rows flow through the whole pipeline: the spec-shaped

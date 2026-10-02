@@ -370,9 +370,14 @@ pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
     // 群主表：夹具造得与真库同形（`group_detail_info_ver1.[60001]` 群号 → `[60002]` 群主 uid，
     // 列名与类型照抄真库的最小可用子集）。两个群各设一名群主。
     //
-    // **群主必须出现在 group-members 的成员集合里**，而那个集合是**名册 ∪ 发言人**；本夹具不造
-    // 名册（没有 chatroom_member 那张表），成员因此全部来自发言人 ⇒ 群主也得是发言人，否则
-    // 「每群恰一个 true」在夹具路径上验不了。10001 的 u_b、20002 的 u_a 都在下面的群消息里发言。
+    // **群主必须出现在 group-members 的成员集合里**，而那个集合是**名册 ∪ 发言人**：本夹具的
+    // 名册就是下面 `group_member3` 的那几行（10001 四人、20002 一人），两个群的群主
+    // （u_b / u_a）都在群消息里发过言。
+    //
+    // **10001 的 u_d 是刻意留的潜水成员**：他从不在基础数据集里发言，于是「名册 ∪ 发言人」
+    // 与「只列发言人」在这个群上给出不同结果（4 人 vs 3 人）—— 没有这样一个成员，套件里就没有
+    // 任何断言能区分两种实现。盯着它的回归是
+    // `real_db_groundtruth::fake_db_group_members_is_roster_union_senders`。
     conn.execute_batch(
         "CREATE TABLE group_list ([60001] INTEGER PRIMARY KEY, [60007] TEXT);\
          INSERT INTO group_list VALUES (10001, '测试群a');\
@@ -384,6 +389,7 @@ pub fn write_fake_group_info(nt_db_dir: &Path) -> std::path::PathBuf {
          INSERT INTO group_member3 VALUES (10001, 'u_a', '张三群名片', '猫毛过敏');\
          INSERT INTO group_member3 VALUES (10001, 'u_b', '', '嗯啊');\
          INSERT INTO group_member3 VALUES (10001, 'u_c', '王五名片', 'largefatpig');\
+         INSERT INTO group_member3 VALUES (10001, 'u_d', '', '');\
          INSERT INTO group_member3 VALUES (20002, 'u_a', '', '');",
     )
     .unwrap();
