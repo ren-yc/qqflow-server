@@ -217,8 +217,24 @@ tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（四条数�
 
 **取字节只有一条路**：`GET /api/v1/media/{id}`。`id` 先按 store 键（md5 hex / uuid，索引登记过
 的本地缓存路径）解析，未命中再按**导出文件名**在导出根下扫四个类型目录；同名多命中时**内容一致
-才服务**（不一致 404），且只有内容摘要派生的名字才被当作句柄下发（见 §3.1）。
-服务端只在下发句柄的那几处 stat 自己的会话目录，扫描只发生在取字节时。
+才服务**（不一致 404），且只有「按内容唯一」的名字才被当作句柄下发（store 键 **或** 内容摘要派生；
+见 §3.1）。服务端只在下发句柄的那几处 stat 自己的会话目录，扫描只发生在取字节时。
+
+### ChatLab 面（四条路由）
+
+规范把 `baseUrl` 定义为 `/chatlab`，那四条与 `/api/v1/*` **共用同一份实现与同一条事件总线**，
+差别是**形状与参数**而不是数据：
+
+| 路由 | 作用 | 与老面的差别 |
+|---|---|---|
+| `GET /chatlab/sessions` | 会话发现面 | 只输出 ChatLab 形状；认 `cursor`（老面只认 `offset`） |
+| `GET /chatlab/messages` | 消息面（原「混合面」的新家） | `talker` 必填；信封**不带 `success`**、`count` 是本页条数、消息**升序**、翻页走 `page`；`media=1` 真正执行导出 |
+| `GET /chatlab/sessions/{id}/messages` | 拉取面（Pull 协议） | 与 `/api/v1/sessions/{id}/messages` 同一 handler、同一形状 |
+| `GET /chatlab/push/messages` | 通知面（SSE） | 只发元信息、不发正文；撤回帧带平台消息号 |
+
+**读端点只有 GET**（老面的 `messages`/`sessions`/`contacts`/`group-members`/`media/{id}`/
+`push/messages` 的 POST 都是 405）；`/api/v1/sync` 与 `/health`、`/api/v1/accounts` 仍接受两个
+方法 —— 动作端点与读端点是两回事。
 
 ## 工程与工具链
 
@@ -283,7 +299,7 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-33 条用例。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+34 条用例。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 
