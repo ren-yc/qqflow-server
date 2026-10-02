@@ -1,0 +1,16 @@
+{
+  "name": "qqflow-server-ts-example",
+  "version": "0.7.0",
+  "private": true,
+  "description": "TypeScript example client for qqflow-server (example only, not published to npm)",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "smoke": "node dist/smoke.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^24.0.0"
+  }
+}
