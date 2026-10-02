@@ -1309,6 +1309,51 @@ async fn sse_streams_sync_event() {
     );
 }
 
+/// 流的**最后一批字节**必须以 SSE 的空行分隔符结尾（\n\n）。
+///
+/// 为什么钉它：SSE 的帧分隔是「空行」，而最后一帧后面没有下一帧来触发分隔写入时，
+/// 尾帧是否自带分隔完全取决于 axum 的编码行为——它随版本可能改变，升级是静默的。
+/// 最后一帧丢分隔时，按块解析的消费者会把它粘在缓冲里直到 EOF 才冲刷（若实现冲刷），
+/// 按行解析的消费者（clients/rust 行为层的 `watch`）则会因为最后一行没有换行而
+/// **静默丢弃尾帧**。这里把「线上的尾字节形状」钉住：它变红时说明分隔语义变了，
+/// 上述消费者都需要复核。
+///
+/// 经 tower `oneshot` 读响应体，`to_bytes` 拿到的是**解码后**的正文，断言不受
+/// chunked 帧化的干扰。
+#[tokio::test]
+async fn stream_tail_ends_with_a_blank_line_separator() {
+    let state = test_state();
+    let app = build_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/push/messages?access_token=test-token-123456")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The stream closes itself via the shutdown watch: trigger it, then read
+    // the body to EOF.
+    state.shutdown.send_replace(true);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("response body");
+    let body = &body[..];
+    assert!(
+        body.starts_with(b"event: ready"),
+        "流应从 ready 帧开始：{:?}",
+        String::from_utf8_lossy(&body[..body.len().min(80)]),
+    );
+    assert!(
+        body.ends_with(b"\n\n"),
+        "SSE 流的最后一帧必须自带空行分隔，否则按空行分块的消费者会丢尾帧：尾 40 字节 = {:?}",
+        String::from_utf8_lossy(&body[body.len().saturating_sub(40)..]),
+    );
+}
+
 #[tokio::test]
 async fn sse_requires_auth() {
     let state = test_state();
