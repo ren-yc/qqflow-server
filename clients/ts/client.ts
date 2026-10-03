@@ -15,6 +15,10 @@ const REFUSAL_STATES = new Set([
   "unknown_qq",
 ]);
 
+// Byte cap for the SSE read loop: a malformed stream that never closes a
+// frame must not grow the buffer without bound (mirrors clients/python).
+const SSE_BUFFER_CAP = 1 << 20;
+
 export class StatusError extends Error {
   constructor(
     public readonly status: number,
@@ -118,7 +122,7 @@ export class QqflowClient {
     const url = this.url("/api/v1/accounts");
     const resp = await fetch(url, {
       method: "POST",
-      headers: this.headers(),
+      headers: { ...this.headers(), "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
     if (!resp.ok) throw new StatusError(resp.status, url);
@@ -133,28 +137,41 @@ export class QqflowClient {
   /**
    * Watch the SSE push stream. One connection yields many events: framing is
    * byte-level LF (never splitlines semantics, which corrupt JSON containing
-   * U+0085/U+2028/U+2029) and reconnects happen only when the stream itself
-   * ends. This demo shape logs frames instead of decoding payloads.
+   * U+0085/U+2028/U+2029), frames end on blank lines, and reconnects
+   * happen only when the stream itself ends - carrying the last seen `id:`
+   * as `Last-Event-ID` so the server's replay window fills the gap. A byte
+   * cap guards against a malformed stream that never closes a frame. This
+   * demo shape hands each assembled frame to the callback; decoding the
+   * JSON payload per event kind is what clients/python and clients/rust do.
+   * The weflow sibling exposes the same shape as an async generator; the
+   * framing logic is equivalent.
    */
   async watch(
     onFrame: (line: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
+    let lastEventId: string | undefined;
     let backoff = 500;
     for (;;) {
       try {
+        const headers: Record<string, string> = {
+          ...this.headers(),
+          Accept: "text/event-stream",
+        };
+        if (lastEventId !== undefined) headers["Last-Event-ID"] = lastEventId;
         const resp = await fetch(this.url("/api/v1/push/messages"), {
-          headers: { ...this.headers(), Accept: "text/event-stream" },
+          headers,
           signal,
         });
         if (!resp.ok || !resp.body) {
           throw new StatusError(resp.status, "/api/v1/push/messages");
         }
-        backoff = 500;
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
         let pending: string[] = [];
+        let pendingBytes = 0;
+        let overflow = false;
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -167,15 +184,34 @@ export class QqflowClient {
             if (line.endsWith("\r")) line = line.slice(0, -1);
             if (line.length > 0) {
               pending.push(line);
+              pendingBytes += line.length + 1;
               continue;
             }
             // blank line = end of frame
+            if (pendingBytes > SSE_BUFFER_CAP) {
+              overflow = true; // over-cap frame: never delivered
+              break;
+            }
             const frame = pending.join("\n");
             pending = [];
-            if (frame) onFrame(frame);
+            pendingBytes = 0;
+            if (!frame) continue;
+            const idLine = frame.split("\n").find((l) => l.startsWith("id:"));
+            if (idLine) lastEventId = idLine.slice(3).trim();
+            onFrame(frame);
+          }
+          if (overflow) break;
+          if (pendingBytes + buffer.length > SSE_BUFFER_CAP) {
+            overflow = true;
+            break;
           }
         }
-        // stream ended; reconnect after backoff
+        if (!overflow) {
+          // clean stream end: reconnect at the floor
+          backoff = 500;
+        } else {
+          backoff = Math.min(backoff * 2, 30000); // malformed: keep escalating
+        }
       } catch (err) {
         if (signal?.aborted) return;
       }
