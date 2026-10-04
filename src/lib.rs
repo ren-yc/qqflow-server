@@ -53,6 +53,22 @@ internal!(sync);
 #[cfg(feature = "server")]
 internal!(server);
 
+/// 造库/造密钥夹具 —— **不是承诺面**，只随 `testing` feature 编译。
+///
+/// 落点为什么在库里而不是 `tests/common`：需要它的有两个调用方，而它们互相看不见
+/// 对方的代码 —— 集成测试是独立 crate（链库），**根包二进制同样是独立 crate**，批量
+/// 导出的夹具生成入口（CLI 的 `--rows`）够不着只在 `tests/` 下存在的模块。一份造库器、
+/// 两个调用方、一个 feature 门。
+///
+/// 只有造库部分是库内单元；axum `oneshot` 那几个 HTTP 助手留在测试侧（它们要
+/// `axum` 与 `tower`，后者是 dev-dependency）。
+///
+/// 豁免文档门：它随 `testing` 编译，语义等同上面 `internal!` 的 testing 分支 ——
+/// 把实现面转 `pub` 只为让本仓自己的二进制与集成测试够得着，不是对外承诺。
+#[cfg(feature = "testing")]
+#[allow(missing_docs)]
+pub mod testing;
+
 /// CLI 入口：起服务直到结束。
 ///
 /// **二进制走这里，而不是直接用 `config`/`logging`。** `src/main.rs` 是**独立 crate**，只能看见
