@@ -330,6 +330,11 @@ Python 只用于钩子与套件执行器，**纯标准库**——CI 与开发机
 
 每一条都是**不知道就会踩**的那类。写新代码前扫一眼这里。
 
+**对外承诺的字段形状另有落点**：三种「没有值」的表示（省略键 / `null` / 空串）、规范与安装版的
+已知偏离、以及本仓与 weflow 的允许差异，都登记在 `docs/qqflow-server-api.md` 的
+「与标准 / 安装版的已知差异」与「字段无值时怎么表示」两节。改 DTO 之前先读那两节 ——
+那里的每个键都被 golden 快照或 `tests/sse_shape.rs` 的键集断言钉住。
+
 ### 明文头偏移：`cipher_plaintext_header_size` 做不到这件事
 
 库文件前 1024 字节是明文头，常规做法是用 SQLCipher 的 `cipher_plaintext_header_size`

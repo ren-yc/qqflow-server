@@ -878,15 +878,17 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 
 ### 与标准 / 安装版的已知差异
 
-以下是有意不实现或受数据限制的部分，下游不要依赖这些字段存在：
+以下是有意不实现、或按本仓数据条件取舍的部分。本仓**没有「键恒出现、值为 `null`」的响应字段**
+（唯一的例外是分页游标，见下节）——可选字段一律**省略键**：
 
 | 字段 | 标准 | 安装版 | 本项目 | 原因 |
 | ---- | ---- | ------ | ------ | ---- |
-| `meta.groupAvatar` | 可选，要求 Data URL | 字段清单里有 | **不输出** | QQ 侧没有可用的群头像来源 |
+| `meta.groupId` | 群 ID（**仅群聊**） | 字段清单里有 | **私聊也输出**，值等于会话 id | 省略键、给空串、给会话 id 是三种不同的契约；改用「群聊时 `groupId` 等于路径 id」限定语义（契约套件的 `meta_groupId_matches_id`） |
+| `meta.groupAvatar` | 可选；CN 的「头像格式说明」接受 Data URL 与网络 URL 两种，EN 字段表只写 Data URL | 字段清单里有 | **不输出** | QQ 侧没有可用的群头像来源 |
 | `members[].aliases` | 可选，`string[]` | 未列出 | **不输出** | 多来源名字已收敛进 `accountName`（备注 > `uid_names` > 昵称 > UID） |
-| `members[].avatar` | 可选，要求 Data URL | 真实 URL | **恒为空串** | QQ 侧没有可用的头像来源；字段保留以满足形状 |
-| `messages[].mediaPath` | 不在标准 | 字段清单里有 | **两个面都不输出** | 媒体字节请走 §3 `/api/v1/messages` 的媒体导出 |
-| `members[].roles` | 可选，`[{id}]`（中文表列出） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出（源 `group_info.db::group_detail_info_ver1.[60002]`）；且两者受同一个限制——群主不在本页时都无从判断 |
+| `members[].avatar` | 可选；**CN 的「头像格式说明」明确接受网络 URL**，EN 字段表只写 Data URL | 真实 URL | **恒为空串** | QQ 侧没有可用的头像来源；字段保留以满足形状。空串而非省略键，是为了让 `members[]` 的键集恒定 |
+| `messages[].mediaPath` | **规范里没有这个字段**（EN / CN 字段表都没有） | 字段清单里有 | **两个面都不输出** | 媒体字节请走 §3 `/api/v1/messages` 的媒体导出 |
+| `members[].roles` | 可选，`[{id}]`（CN 表列出，EN 表未列） | 未列出 | **不输出** | **有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出（源 `group_info.db::group_detail_info_ver1.[60002]`）；且两者受同一个限制——群主不在本页时都无从判断 |
 | `messages[].replyToMessageId` | 不在标准（WeFlow 私有扩展） | 仅 ChatLab 面有 | **目标唯一时输出；否则省略该键**（原生面、消息面、拉取面**同规**） | 键名与语义对齐 WeFlow；判据见下 |
 
 **`replyToMessageId` 的判据（为什么有时不给）**：它取自表列 `40850`（被回复消息的**会话内序号**），
@@ -900,6 +902,42 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 
 > 列 `40900`（引用场景的消息快照）经实测**不含**目标身份——四种编码 × 两列 × 发送者维度都试过，
 > 不能用来消歧。上游文档在这一点上与本库形态不同，**以本库实测为准**。
+
+### 字段无值时怎么表示：省略键 / `null` / 空串
+
+同一个响应里会出现三种「没有值」，它们是**三种不同的契约**：**省略键**＝这个对象不存在或本次没请求；
+**`null`**＝有这个概念、此刻没有值；**空串**＝类型上恒为字符串的字段没有内容。本仓的可选字段
+**一律省略键**，唯一的 `null` 是分页游标（那里「已排空」本身是有意义的状态）。
+
+| 面 | 字段 | 表示 | 说明 |
+| --- | --- | --- | --- |
+| `GET /api/v1/messages` | `messages[].media`、`mediaId`、`mediaFileName`、`mediaUrl`、`mediaLocalPath`、`replyToMessageId` | 无值时**省略键** | 本仓消息面没有「键恒出现、值为 `null`」的字段 |
+| `GET /api/v1/messages` | `media.exportPath` | **只在真正执行了导出时出现** | 未请求 `media=1` 时省略该键——「没导出」与「导出到空路径」是两件事（回归见 `messages_without_media_param_omits_export_path`） |
+| `GET /api/v1/accounts` | `accounts[].dbPath`、`accounts[].error` | 无值时**省略键** | |
+| `POST /api/v1/accounts` | `dbPath`、`status` | 无值时**省略键** | 注册的三个分支键集不同，见该端点小节 |
+| `GET /chatlab/sessions` | `sessions[].memberCount` | 不掌握名册时**省略键** | 可选字段，断言不得写成必填 |
+| `GET /chatlab/sessions`、`GET /chatlab/messages` | `page.nextCursor` | 键恒出现，已排空时 `null` | 与「整个 `page` 块不存在」（＝完整单页）是两件事 |
+| `GET /chatlab/messages`、拉取面（两条路径同形） | `messages[].media`、`replyToMessageId` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
+| 拉取面 | `page` | **不出现在响应里** | 进度走 `sync` 块（`hasMore` / `nextSince` / `nextOffset` / `watermark`），四个键恒出现 |
+| `GET /api/v1/group-members` | `members[].messageCount` | **只在 `includeMessageCounts=1` 时出现** | 未请求计数时省略，而不是给 `0`（见第 6 节） |
+| `GET /api/v1/group-members` | `members[].isOwner` | 键**恒保留**（值为 `false` 时也出现） | 与 `messageCount` 相反：它表达的是「判定过，不是群主」 |
+| SSE `message.new` | `groupName`、`avatarUrl`、`sourceName`、`media`、`mediaId` | 都是**条件键**：没有就不出现 | 不是给 `null`（回归见 `message_new_text_payload_keys_are_pinned`、`message_new_media_payload_carries_no_local_path`）。其中 `avatarUrl` 目前**恒不出现**：QQ 侧没有头像来源，构造点一律传 `None`；它留在类型里，是为了将来源可用时不必改形状 |
+| SSE `message.revoke` | `groupName`、`avatarUrl`、`sourceName` | 条件键（`avatarUrl` 同上，恒不出现） | 撤销事件**没有** `media`（回归见 `message_revoke_payload_has_no_media`） |
+| SSE `sync` | `event`、`generation`、`watermarks` | 三个键恒出现 | 某张表没有水位时，是**数组里少一项**，而不是给 `null` 或 `0`（回归见 `sync_omits_tables_without_a_watermark`） |
+| 通知面 `/chatlab/push/messages` | `eventId`、`sessionId`、`platformMessageId`、`generation` | 都是**条件键** | 基线事件（`session.sync` 一类）带 `generation`、不带 `eventId` / `sessionId`；消息事件反之。`sessionId` 为空串时**显式映射成省略**——空串与「没有会话」在下游是两件事 |
+
+**空串是另一套约定**：`group-members` 的 `alias` / `avatarUrl`（v1 恒为空串）、`remark`（未设置时
+为空串），以及 ChatLab `members[].avatar`（恒为空串），在没有该值时给空串而不是 `null`；
+名册-only 成员的 `displayName` 回落 UID 而不是空串。判据是这些字段在类型上恒为字符串。
+
+**跨仓的允许差异**（两仓都成立，但取值不同，按一端写判空逻辑会出错）：
+
+| 项 | 本仓 | weflow |
+| --- | --- | --- |
+| 未请求导出时的 `media.exportPath` | 省略键 | 键恒出现（值是导出根） |
+| SSE `message.new` 的 `groupName` / `media` | 条件键（没有就不出现） | 键恒出现，无值时 `null` |
+| 通知帧 `platformMessageId` | 恒省略 | 键恒出现：`message.new` 为 `null`，`message.revoke` 为平台号 |
+| 未请求计数时的 `members[].messageCount` | 省略键 | 键恒出现，值为 `0`（见第 6 节） |
 
 ---
 
