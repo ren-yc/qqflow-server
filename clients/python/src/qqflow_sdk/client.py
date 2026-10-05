@@ -124,6 +124,40 @@ def _validate_time_bound(field: str, value: str) -> None:
         )
 
 
+def _message_query_params(
+    talker: str,
+    keyword: str | None,
+    start: str | None,
+    end: str | None,
+    limit: int | None,
+    offset: int | None,
+    media: bool,
+) -> dict[str, str]:
+    """Query for either messages face.
+
+    The native face (``/api/v1/messages``) and the ChatLab face
+    (``/chatlab/messages``) take the **same** query surface - only the
+    envelope differs. Building it in two places is how the two faces end up
+    answering the same request with different pages.
+    """
+    if not talker:
+        raise ShapeError("talker must not be empty")
+    query: dict[str, str] = {"talker": talker}
+    if keyword is not None:
+        query["keyword"] = keyword
+    for field, value in (("start", start), ("end", end)):
+        if value is not None:
+            _validate_time_bound(field, value)
+            query[field] = value
+    if limit is not None:
+        query["limit"] = str(limit)
+    if offset is not None:
+        query["offset"] = str(offset)
+    if media:
+        query["media"] = "1"
+    return query
+
+
 class MessageEvent(BaseModel):
     """The legacy SSE face's ``message.new`` / ``message.revoke`` payload.
 
@@ -338,7 +372,52 @@ class Client:
             body=payload,
         )
 
-    # ---- drain_session --------------------------------------------------
+    async def sync_now(self) -> gen.SyncResult:
+        """``POST /api/v1/sync`` - run one manual incremental sync.
+
+        The watcher runs the same sync on file changes, so this exists for a
+        caller that must have a fresh read *now* rather than eventually. It is
+        a write against the server's state - it advances watermarks and may
+        export media - so it is deliberately absent from every polling path:
+        only a caller that asked for it triggers it.
+        """
+        url = self._url("/api/v1/sync")
+        resp = await self._http.post(
+            url, headers={"Authorization": f"Bearer {self._token}"}
+        )
+        return gen.SyncResult.model_validate(await self._decode(resp, url))
+
+    # ---- pull_page / drain_session --------------------------------------
+
+    async def pull_page(
+        self,
+        talker: str,
+        since: int | None,
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> gen.PullEnvelope:
+        """Fetch **one page** of the ChatLab Pull cursor loop.
+
+        :meth:`drain_session` is this in a loop; the single-page entry exists
+        for callers that must bound a single request. ``since`` is
+        **exclusive** and ``offset`` advances within one timestamp group.
+        Both cursors come back in ``sync`` and must be echoed verbatim: the
+        server pages by (timestamp group, offset), and a client-derived
+        cursor is how pages get silently skipped or replayed.
+
+        ``limit`` is a per-page cap (the server caps it at 5000). ``None``
+        means the server default, which is also 5000.
+        """
+        query: dict[str, str] = {}
+        if since is not None:
+            query["since"] = str(since)
+        if offset:
+            query["offset"] = str(offset)
+        if limit is not None:
+            query["limit"] = str(limit)
+        return gen.PullEnvelope.model_validate(
+            await self._get_json(f"/api/v1/sessions/{talker}/messages", query)
+        )
 
     async def drain_session(
         self,
@@ -354,17 +433,10 @@ class Client:
         get silently skipped or replayed.
         """
         next_since = since
-        next_offset: int | None = None
+        next_offset = 0
         total = 0
         while True:
-            query: dict[str, str] = {}
-            if next_since is not None:
-                query["since"] = str(next_since)
-            if next_offset is not None:
-                query["offset"] = str(next_offset)
-            page = gen.PullEnvelope.model_validate(
-                await self._get_json(f"/api/v1/sessions/{talker}/messages", query)
-            )
+            page = await self.pull_page(talker, next_since, next_offset)
             total += len(page.messages)
             on_page(page.messages)
             if not page.sync.has_more:
@@ -468,23 +540,42 @@ class Client:
         is stable across a live database, while offset paging over a growing
         table can shift.
         """
-        if not talker:
-            raise ShapeError("talker must not be empty")
-        query: dict[str, str] = {"talker": talker}
-        if keyword is not None:
-            query["keyword"] = keyword
-        for field, value in (("start", start), ("end", end)):
-            if value is not None:
-                _validate_time_bound(field, value)
-                query[field] = value
-        if limit is not None:
-            query["limit"] = str(limit)
-        if offset is not None:
-            query["offset"] = str(offset)
-        if media:
-            query["media"] = "1"
+        query = _message_query_params(
+            talker, keyword, start, end, limit, offset, media
+        )
         return gen.MessagesNative.model_validate(
             await self._get_json("/api/v1/messages", query)
+        )
+
+    async def chatlab_messages(
+        self,
+        talker: str,
+        *,
+        keyword: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+        media: bool = False,
+    ) -> gen.ChatlabMessages:
+        """``GET /chatlab/messages`` - the **ChatLab-shaped** messages face.
+
+        Same query surface as :meth:`list_messages`, different envelope:
+        ascending by time, ChatLab type codes, ``media`` on the message,
+        ``count``/``page`` for paging and **no** ``success`` key. Project from
+        this face when the caller wants ChatLab field names; the native face
+        is the only one carrying ``raw_content``/``is_send``.
+
+        ``offset`` is this face's paging cursor: the wire also accepts
+        ``cursor``, but the two are the same integer, so advancing by the page
+        size and passing ``page.next_cursor`` are equivalent - and it keeps
+        the two faces from growing different paging parameters for one list.
+        """
+        query = _message_query_params(
+            talker, keyword, start, end, limit, offset, media
+        )
+        return gen.ChatlabMessages.model_validate(
+            await self._get_json("/chatlab/messages", query)
         )
 
     async def contacts(
@@ -510,6 +601,26 @@ class Client:
             await self._get_json("/api/v1/contacts", query)
         )
 
+    async def group_members(
+        self,
+        chatroom: str,
+        *,
+        include_message_counts: bool = False,
+    ) -> gen.GroupMembers:
+        """``GET /api/v1/group-members`` - group members (**roster union speakers**).
+
+        Silent members (in the roster, never spoke) appear too, with
+        ``message_count`` 0 - listing only speakers would make "who is in this
+        group" depend on who talked last. The server counts real numbers only
+        when ``include_message_counts`` is true: the count is a whole-conversation
+        scan, not free.
+        """
+        query: dict[str, str] = {"chatroomId": chatroom}
+        if include_message_counts:
+            query["includeMessageCounts"] = "1"
+        return gen.GroupMembers.model_validate(
+            await self._get_json("/api/v1/group-members", query)
+        )
     async def media_bytes_by_id(self, media_id: str) -> bytes:
         """``GET /api/v1/media/{id}`` - bytes for a handle the server advertised.
 

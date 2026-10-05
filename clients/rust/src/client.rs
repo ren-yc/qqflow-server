@@ -396,6 +396,21 @@ impl Client {
         RegisterOutcome::from_body(&url, value)
     }
 
+    /// `POST /api/v1/sync` — run one manual incremental sync and return its
+    /// counters.
+    ///
+    /// The watcher runs the same sync on file changes, so this exists for a
+    /// caller that must have a fresh read *now* rather than eventually (the
+    /// `sync` CLI subcommand and the `sync_now` MCP tool both do). It is a
+    /// write against the server's state — it advances watermarks and may export
+    /// media — so it is deliberately absent from every polling path: only a
+    /// caller that asked for it triggers it.
+    pub async fn sync_now(&self) -> Result<gen_types::SyncResult> {
+        let url = self.url("/api/v1/sync");
+        let resp = self.http.post(&url).bearer_auth(&self.token).send().await?;
+        Self::decode(resp, &url).await
+    }
+
     /// Poll until `qq` reports `ready`. **Wait-only**: never registers.
     ///
     /// Intermediate states are waiting, not errors — only the deadline and the
@@ -424,7 +439,42 @@ impl Client {
         }
     }
 
-    // ---- drain_session ---------------------------------------------------
+    // ---- pull_page / drain_session ---------------------------------------
+
+    /// Fetch **one page** of the ChatLab Pull cursor loop.
+    ///
+    /// [`Client::drain_session`] is this in a loop; the single-page entry
+    /// exists for callers that must bound a single request — an MCP tool has
+    /// a per-call budget, and "drain everything" is exactly what it must not
+    /// do.
+    ///
+    /// `since` is **exclusive** and `offset` advances within one timestamp
+    /// group. Both cursors come back in `sync` and must be echoed verbatim:
+    /// the server pages by (timestamp group, offset), and a client-derived
+    /// cursor is how pages get silently skipped or replayed.
+    ///
+    /// `limit` is a per-page cap (the server caps it at 5000). `None` means
+    /// the server default, which is also 5000.
+    pub async fn pull_page(
+        &self,
+        talker: &str,
+        since: Option<i64>,
+        offset: u64,
+        limit: Option<u32>,
+    ) -> Result<gen_types::PullEnvelope> {
+        let mut q = BTreeMap::new();
+        if let Some(s) = since {
+            q.insert("since", s.to_string());
+        }
+        if offset != 0 {
+            q.insert("offset", offset.to_string());
+        }
+        if let Some(l) = limit {
+            q.insert("limit", l.to_string());
+        }
+        self.get_json(&format!("/api/v1/sessions/{talker}/messages"), &q)
+            .await
+    }
 
     /// Drain one session through the ChatLab Pull cursor loop, calling
     /// `on_page` per page. Cursors are echoed verbatim: `next_since` /
@@ -444,19 +494,7 @@ impl Client {
         let mut next_offset = 0u64;
         let mut total = 0u64;
         loop {
-            let mut q = BTreeMap::new();
-            if let Some(s) = next_since {
-                q.insert("since", s.to_string());
-            }
-            if next_offset != 0 {
-                q.insert("offset", next_offset.to_string());
-            }
-            let page: gen_types::PullEnvelope = self
-                .get_json(
-                    &format!("/api/v1/sessions/{talker}/messages"),
-                    &q,
-                )
-                .await?;
+            let page = self.pull_page(talker, next_since, next_offset, None).await?;
             total += page.messages.len() as u64;
             on_page(&page.messages)?;
             if !page.sync.has_more {
@@ -481,9 +519,15 @@ impl Client {
     /// that re-reads the list every cycle should ask for the maximum instead,
     /// because the request count is `sessions / page_size` and the server's
     /// default page is two orders of magnitude smaller than the cap.
+    ///
+    /// `keyword` filters **server-side** (case-insensitive), so pagination
+    /// walks the filtered list rather than trimming after the fact — trimming
+    /// after the fact would stop at the first short page and silently drop
+    /// matches that live further out.
     pub async fn list_all_sessions(
         &self,
         page_size: Option<u32>,
+        keyword: Option<&str>,
     ) -> Result<Vec<gen_types::SessionNative>> {
         let mut out: Vec<gen_types::SessionNative> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -493,6 +537,9 @@ impl Client {
             q.insert("offset", offset.to_string());
             if let Some(n) = page_size {
                 q.insert("limit", n.to_string());
+            }
+            if let Some(k) = keyword {
+                q.insert("keyword", k.to_string());
             }
             let page: gen_types::SessionsNative =
                 self.get_json("/api/v1/sessions", &q).await?;
@@ -566,6 +613,25 @@ impl Client {
         self.get_json("/api/v1/messages", &q.params()?).await
     }
 
+    /// `GET /chatlab/messages` — the **ChatLab-shaped** messages face.
+    ///
+    /// Same query surface as [`Client::list_messages`] (`talker` required;
+    /// `keyword`/`start`/`end`/`limit`/`offset`/`media`), different envelope:
+    /// ascending by time, ChatLab type codes, `media` on the message,
+    /// `count`/`page` for paging, and **no** `success` key. Project from this
+    /// face when the caller wants ChatLab field names; the native face is the
+    /// only one carrying `rawContent`/`isSend`.
+    ///
+    /// `offset` is this face's paging cursor (the wire also accepts `cursor`;
+    /// the two are the same integer, so advancing by the page size and
+    /// passing `page.nextCursor` are equivalent).
+    pub async fn chatlab_messages(
+        &self,
+        q: &MessageQuery,
+    ) -> Result<gen_types::ChatlabMessages> {
+        self.get_json("/chatlab/messages", &q.params()?).await
+    }
+
     /// `GET /api/v1/contacts` — one page of the contact list.
     ///
     /// Contact detail is not part of the ChatLab shape at all; this is the
@@ -582,6 +648,25 @@ impl Client {
             params.insert("keyword", k.clone());
         }
         self.get_json("/api/v1/contacts", &params).await
+    }
+
+    /// `GET /api/v1/group-members` — 群成员（**名册 ∪ 发言人**）。
+    ///
+    /// 潜水成员（名册里、从未发言）也会出现，`message_count` 为 0 —— 只列发言人
+    /// 会让「群里有谁」的答案取决于谁最近说过话。`include_message_counts` 为
+    /// `true` 时服务端才数真实计数（否则整列回 0：计数是全会话扫描，不是免费的）。
+    /// 名册与消息都在内存索引里：本请求不读盘、也不触发同步。
+    pub async fn group_members(
+        &self,
+        chatroom: &str,
+        include_message_counts: bool,
+    ) -> Result<gen_types::GroupMembers> {
+        let mut params = BTreeMap::new();
+        params.insert("chatroomId", chatroom.to_string());
+        if include_message_counts {
+            params.insert("includeMessageCounts", "1".to_string());
+        }
+        self.get_json("/api/v1/group-members", &params).await
     }
 
     /// `GET /api/v1/media/{id}` — bytes for a handle the server advertised.

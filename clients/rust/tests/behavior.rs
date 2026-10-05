@@ -44,12 +44,18 @@ struct Mock {
     native_queries: Arc<StdMutex<Vec<String>>>,
     /// When set, `GET /api/v1/contacts` answers this page verbatim.
     contacts_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// When set, `GET /api/v1/group-members` answers this page verbatim.
+    group_members_page: Arc<StdMutex<Option<serde_json::Value>>>,
+    /// Query strings seen by the group-members route, in order.
+    group_members_queries: Arc<StdMutex<Vec<String>>>,
     /// FIFO pages for `GET /api/v1/sessions`.
     sessions_pages: Arc<StdMutex<Vec<serde_json::Value>>>,
     /// Query strings seen by the sessions route, in order.
     sessions_queries: Arc<StdMutex<Vec<String>>>,
     /// How many times `/health` was hit, and whether it carried credentials.
     health_calls: Arc<StdMutex<Vec<bool>>>,
+    /// How many times `POST /api/v1/sync` was hit (asserts "no polling").
+    sync_calls: Arc<StdMutex<usize>>,
 }
 
 fn parse_query(q: &Option<String>) -> Vec<(String, String)> {
@@ -72,7 +78,9 @@ async fn spawn_mock(mock: Mock) -> String {
         .route("/api/v1/media/{id}", get(media_route))
         .route("/api/v1/messages", get(messages_route))
         .route("/api/v1/contacts", get(contacts_route))
+        .route("/api/v1/group-members", get(group_members_route))
         .route("/api/v1/sessions", get(sessions_route))
+        .route("/api/v1/sync", post(sync_post))
         .route("/health", get(health_route))
         .route("/api/v1/push/messages", get(sse_route))
         .with_state(mock.clone());
@@ -97,6 +105,21 @@ async fn accounts_post(
         .clone()
         .unwrap_or_else(|| serde_json::json!({"success": true, "state": "indexing"}));
     Json(body).into_response()
+}
+
+/// `POST /api/v1/sync` — counts calls and requires the bearer token.
+///
+/// The counter is the point: the SDK must trigger a sync **only** when the
+/// caller asked for one, never from a polling path.
+async fn sync_post(State(mock): State<Mock>, headers: HeaderMap) -> Response {
+    assert_bearer(&headers);
+    *mock.sync_calls.lock().unwrap() += 1;
+    Json(serde_json::json!({
+        "success": true,
+        "newMessages": 7,
+        "revokeMessages": 2,
+    }))
+    .into_response()
 }
 
 fn assert_bearer(headers: &HeaderMap) {
@@ -216,6 +239,19 @@ async fn health_route(State(mock): State<Mock>, headers: HeaderMap) -> Response 
 async fn contacts_route(State(mock): State<Mock>, headers: HeaderMap) -> Response {
     assert_bearer(&headers);
     match mock.contacts_page.lock().unwrap().clone() {
+        Some(p) => Json(p).into_response(),
+        None => (StatusCode::NOT_FOUND, "fixture missing").into_response(),
+    }
+}
+
+async fn group_members_route(
+    State(mock): State<Mock>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    assert_bearer(&headers);
+    mock.group_members_queries.lock().unwrap().push(query.unwrap_or_default());
+    match mock.group_members_page.lock().unwrap().clone() {
         Some(p) => Json(p).into_response(),
         None => (StatusCode::NOT_FOUND, "fixture missing").into_response(),
     }
@@ -605,6 +641,200 @@ async fn contacts_page_decodes_rows_and_paging_fields() {
 }
 
 #[tokio::test]
+async fn group_members_decodes_roster_page_and_sends_chatroom_param() {
+    let mock = Mock::default();
+    *mock.group_members_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true, "chatroomId": "123@chatroom", "count": 2, "fromCache": false,
+        "updatedAt": 1_700_000_000_123i64,
+        "members": [
+            { "alias": "", "avatarUrl": "", "displayName": "潜水者", "groupNickname": "",
+              "isFriend": false, "isOwner": false, "messageCount": 0,
+              "nickname": "", "remark": "", "wxid": "quiet" },
+            { "alias": "a", "avatarUrl": "", "displayName": "张三", "groupNickname": "张三",
+              "isFriend": true, "isOwner": true, "messageCount": 9,
+              "nickname": "三儿", "remark": "客户张三", "wxid": "alice" }
+        ],
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let page = client
+        .group_members("123@chatroom", true)
+        .await
+        .expect("group members must decode");
+    assert_eq!(page.count, 2);
+    assert_eq!(page.updated_at, 1_700_000_000_123, "updatedAt is **milliseconds** — a seconds truncation silently halves freshness precision");
+    // The roster includes silent members: a zero-count row is legal, not an error.
+    // `messageCount` is a **conditional key** on this face (present only when counts
+    // were asked for), so it decodes to an Option — not to a placeholder 0.
+    assert_eq!(page.members[0].message_count, Some(0));
+    assert_eq!(page.members[1].message_count, Some(9));
+    assert!(page.members[1].is_owner, "exactly one owner when the roster carries one");
+    let queries = mock.group_members_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1, "exactly one GET /api/v1/group-members");
+    assert!(queries[0].contains("chatroomId=123%40chatroom"), "the chatroom rides as a query param: {}", queries[0]);
+    assert!(queries[0].contains("includeMessageCounts=1"), "counts asked for: {}", queries[0]);
+}
+
+/// The off switch: `include_message_counts = false` must **omit the parameter**
+/// rather than send `0` — the server reads it through a flexible bool parser,
+/// and the wire shape for "don't scan the conversation" is absence.
+#[tokio::test]
+async fn group_members_omits_include_message_counts_when_false() {
+    let mock = Mock::default();
+    *mock.group_members_page.lock().unwrap() = Some(serde_json::json!({
+        "success": true, "chatroomId": "123@chatroom", "count": 0, "fromCache": false,
+        "updatedAt": 0, "members": [],
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    client.group_members("123@chatroom", false).await.expect("empty page decodes");
+    let queries = mock.group_members_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    assert!(!queries[0].contains("includeMessageCounts"), "absent, not 0: {}", queries[0]);
+}
+
+// ---- sync_now -----------------------------------------------------------
+
+/// `sync_now` is a **write** (it advances watermarks and may export media), so
+/// the contract has two halves: it POSTs with the bearer token and decodes the
+/// counters, and nothing else in the client ever triggers it.
+#[tokio::test]
+async fn sync_now_posts_with_the_bearer_token_and_decodes_counters() {
+    let mock = Mock::default();
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let result = client.sync_now().await.expect("decode SyncResult");
+    assert!(result.success);
+    assert_eq!(result.new_messages, 7);
+    assert_eq!(result.revoke_messages, 2);
+    assert_eq!(*mock.sync_calls.lock().unwrap(), 1, "exactly one POST /api/v1/sync");
+}
+
+/// The other half: the polling paths must not sync on their own. A client that
+/// synced while merely asking for readiness would turn every probe into a disk
+/// scan of the live database.
+#[tokio::test]
+async fn no_polling_path_triggers_a_sync() {
+    let mock = Mock::default();
+    let mut always = mock.clone();
+    always.always_indexing = true;
+    let base = spawn_mock(always).await;
+    let client = Client::new(&base, TOKEN);
+    let _ = client.health().await;
+    let _ = client
+        .ensure_ready(
+            "qq_mock",
+            &serde_json::json!({"qq": "qq_mock", "db_path": "X:/db"}),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert_eq!(
+        *mock.sync_calls.lock().unwrap(),
+        0,
+        "readiness probing must never sync"
+    );
+}
+
+// ---- pull_page -----------------------------------------------------------
+
+#[tokio::test]
+async fn pull_page_decodes_the_sync_block_and_sends_the_cursors() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": [{
+            "accountName": "alice", "content": "m1", "groupNickname": "",
+            "platformMessageId": "1", "sender": "alice", "timestamp": 1000, "type": 1,
+        }],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "qq", "type": "chat"},
+        "sync": {"hasMore": true, "nextSince": 1000, "nextOffset": 4, "watermark": 2000},
+    })];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let page = client.pull_page("alice", Some(500), 7, Some(3)).await.unwrap();
+    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.messages[0].platform_message_id, "1");
+    assert!(page.sync.has_more);
+    assert_eq!(page.sync.next_since, 1000);
+    assert_eq!(page.sync.next_offset, 4);
+    assert_eq!(page.sync.watermark, 2000);
+
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1, "one page is one request");
+    assert!(queries[0].contains("since=500"), "since rides the query: {}", queries[0]);
+    assert!(queries[0].contains("offset=7"), "the group cursor rides the query: {}", queries[0]);
+    assert!(queries[0].contains("limit=3"), "the per-page cap rides the query: {}", queries[0]);
+}
+
+#[tokio::test]
+async fn pull_page_omits_defaulted_cursors_instead_of_sending_zero() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "members": [],
+        "messages": [],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "qq", "type": "chat"},
+        "sync": {"hasMore": false, "nextSince": 0, "nextOffset": 0, "watermark": 0},
+    })];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    client.pull_page("alice", None, 0, None).await.unwrap();
+    let queries = mock.pull_queries.lock().unwrap().clone();
+    assert_eq!(queries.len(), 1);
+    for key in ["since=", "offset=", "limit="] {
+        assert!(!queries[0].contains(key),
+            "{key} must be absent, not defaulted on the wire: {}", queries[0]);
+    }
+}
+
+// ---- chatlab_messages ----------------------------------------------------
+
+#[tokio::test]
+async fn chatlab_messages_decodes_the_chatlab_envelope_and_paging() {
+    let mock = Mock::default();
+    *mock.chatlab_page.lock().unwrap() = Some(serde_json::json!({
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "count": 1,
+        "members": [{
+            "accountName": "张三", "avatar": "", "groupNickname": "",
+            "platformId": "alice",
+        }],
+        "messages": [{
+            "accountName": "alice", "content": "hi", "groupNickname": "",
+            "platformMessageId": "42", "sender": "alice", "timestamp": 1700000000,
+            "type": 1,
+        }],
+        "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "qq", "type": "private"},
+        "page": {"hasMore": true, "nextCursor": "1000"},
+        "talker": "alice",
+    }));
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let mut q = MessageQuery::new("alice");
+    q.keyword = Some("hi".to_string());
+    q.limit = Some(50);
+
+    let page = client.chatlab_messages(&q).await.expect("chatlab page must decode");
+    assert_eq!(page.count, 1);
+    assert!(page.page.has_more);
+    assert_eq!(page.page.next_cursor.as_deref(), Some("1000"));
+    assert_eq!(page.messages[0].platform_message_id, "42");
+    assert_eq!(page.messages[0].type_, 1, "ChatLab type codes, not the native localType");
+
+    let recorded = mock.messages_query.lock().unwrap().clone();
+    let pairs = parse_query(&recorded);
+    for want in [("talker", "alice"), ("keyword", "hi"), ("limit", "50")] {
+        assert!(
+            pairs.iter().any(|(k, v)| k == want.0 && v == want.1),
+            "query must carry {want:?}: {recorded:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
     let mock = Mock::default();
     let sess = |u: &str| {
@@ -626,7 +856,7 @@ async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
     // request count is sessions / page_size, and the default page is two
     // orders of magnitude smaller than the cap.
     let all = client
-        .list_all_sessions(Some(10000))
+        .list_all_sessions(Some(10000), Some("ali"))
         .await
         .expect("both pages must be read");
     let users: Vec<&str> = all.iter().map(|s| s.username.as_str()).collect();
@@ -635,6 +865,7 @@ async fn list_all_sessions_pages_and_collapses_cross_page_duplicates() {
     assert_eq!(queries.len(), 3, "one request per page, including the empty terminator");
     for (i, q) in queries.iter().enumerate() {
         assert!(q.contains("limit=10000"), "page {i} must carry the page size: {q}");
+        assert!(q.contains("keyword=ali"), "page {i} must carry the keyword: {q}");
     }
     assert!(queries[0].contains("offset=0") && queries[1].contains("offset=2"),
         "the offset advances by the rows actually returned: {queries:?}");

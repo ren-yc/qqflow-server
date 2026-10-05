@@ -46,6 +46,7 @@ class Mock:
         # Request counters: which endpoints a call actually touched.
         self.post_calls: int = 0
         self.get_accounts_calls: int = 0
+        self.sync_calls: int = 0
         # Response body for POST /api/v1/accounts (registration semantics).
         self.register_body: dict | None = None
         # When set, GET /api/v1/accounts answers this page verbatim.
@@ -54,6 +55,9 @@ class Mock:
         self.native_page: dict | None = None
         # When set, GET /api/v1/contacts answers this page verbatim.
         self.contacts_page: dict | None = None
+        # When set, GET /api/v1/group-members answers this page verbatim.
+        self.group_members_page: dict | None = None
+        self.group_members_queries: list[dict] = []
         # FIFO pages for GET /api/v1/sessions.
         self.sessions_pages: list[dict] = []
         # Query params seen by the sessions route, in order.
@@ -125,6 +129,12 @@ class Mock:
                 })
                 await send({"type": "http.response.body", "body": b"png-bytes"})
                 return
+            elif path == "/api/v1/group-members":
+                mock.group_members_queries.append(query)
+                body = mock.group_members_page
+            elif path == "/api/v1/sync":
+                mock.sync_calls += 1
+                body = {"success": True, "newMessages": 7, "revokeMessages": 2}
             elif path == "/api/v1/messages":
                 mock.messages_query = query
                 # The native face is camelCase on the wire; a fallback with
@@ -249,6 +259,57 @@ async def test_drain_session_echoes_cursors_verbatim() -> None:
     assert len(mock.pull_queries) == 2
     assert mock.pull_queries[0] == {"since": "500"}
     assert mock.pull_queries[1] == {"since": "1000", "offset": "7"}
+    await client.aclose()
+
+
+async def test_pull_page_decodes_the_sync_block_and_sends_the_cursors() -> None:
+    mock = Mock()
+    mock.pull_pages = [pull_page([msg(1, 1000)], True, 1000, 4)]
+    client = make_client(mock)
+    page = await client.pull_page("alice", 500, offset=7, limit=3)
+    assert [m.platform_message_id for m in page.messages] == ["1"]
+    assert page.sync.has_more is True
+    assert page.sync.next_since == 1000
+    assert page.sync.next_offset == 4
+    assert page.sync.watermark == 2000
+    assert mock.pull_queries[0] == {"since": "500", "offset": "7", "limit": "3"}
+    await client.aclose()
+
+
+async def test_pull_page_omits_defaulted_cursors_instead_of_sending_zero() -> None:
+    """Absence, not ``0``: the server defaults both cursors, so a client that
+    sends ``since=0`` is claiming a cursor it never read."""
+    mock = Mock()
+    mock.pull_pages = [pull_page([], False, 0, 0)]
+    client = make_client(mock)
+    await client.pull_page("alice", None)
+    assert mock.pull_queries[0] == {}
+    await client.aclose()
+
+
+async def test_chatlab_messages_decodes_the_chatlab_envelope_and_paging() -> None:
+    mock = Mock()
+    mock.chatlab_page = {
+        "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+        "count": 1,
+        "members": [{"accountName": "张三", "avatar": "", "groupNickname": "",
+                     "platformId": "alice"}],
+        "messages": [{"accountName": "alice", "content": "hi",
+                      "groupNickname": "", "platformMessageId": "42",
+                      "sender": "alice", "timestamp": 1700000000, "type": 1}],
+        "meta": {"groupId": "", "name": "", "ownerId": "",
+                 "platform": "qq", "type": "private"},
+        "page": {"hasMore": True, "nextCursor": "1000"},
+        "talker": "alice",
+    }
+    client = make_client(mock)
+    page = await client.chatlab_messages("alice", keyword="hi", limit=50)
+    assert page.count == 1
+    assert page.page.has_more is True
+    assert page.page.next_cursor == "1000"
+    assert page.messages[0].platform_message_id == "42"
+    assert page.messages[0].type == 1, "ChatLab type codes, not the native localType"
+    assert mock.messages_query == {"talker": "alice", "keyword": "hi", "limit": "50"}
     await client.aclose()
 
 
@@ -885,6 +946,83 @@ async def test_contacts_page_decodes_rows_and_paging_fields() -> None:
     assert page.total == 42
     assert page.has_more is True
     assert page.contacts[0].display_name == "李四"
+
+
+async def test_group_members_decodes_roster_page_and_sends_chatroom_param() -> None:
+    mock = Mock()
+    mock.group_members_page = {
+        "success": True, "chatroomId": "123@chatroom", "count": 2,
+        "fromCache": False, "updatedAt": 1700000000123,
+        "members": [
+            {"alias": "", "avatarUrl": "", "displayName": "潜水者",
+             "groupNickname": "", "isFriend": False, "isOwner": False,
+             "messageCount": 0, "nickname": "", "remark": "", "wxid": "quiet"},
+            {"alias": "a", "avatarUrl": "", "displayName": "张三",
+             "groupNickname": "张三", "isFriend": True, "isOwner": True,
+             "messageCount": 9, "nickname": "三儿", "remark": "客户张三",
+             "wxid": "alice"},
+        ],
+    }
+    client = make_client(mock)
+    page = await client.group_members("123@chatroom", include_message_counts=True)
+    assert page.count == 2
+    assert page.updated_at == 1700000000123, (
+        "updatedAt is **milliseconds** — a seconds truncation silently halves "
+        "freshness precision")
+    # messageCount is a conditional key on this face: present only when counts
+    # were asked for, absent otherwise (not a placeholder 0).
+    assert page.members[0].message_count == 0
+    assert page.members[1].message_count == 9
+    assert page.members[1].is_owner
+    assert len(mock.group_members_queries) == 1
+    q = mock.group_members_queries[0]
+    assert q["chatroomId"] == "123%40chatroom"
+    assert q.get("includeMessageCounts") == "1", "counts asked for"
+    await client.aclose()
+
+
+async def test_group_members_omits_include_message_counts_when_false() -> None:
+    mock = Mock()
+    mock.group_members_page = {
+        "success": True, "chatroomId": "123@chatroom", "count": 0,
+        "fromCache": False, "updatedAt": 0, "members": [],
+    }
+    client = make_client(mock)
+    page = await client.group_members("123@chatroom")
+    assert page.members == []
+    assert len(mock.group_members_queries) == 1
+    assert "includeMessageCounts" not in mock.group_members_queries[0]
+    await client.aclose()
+
+
+async def test_sync_now_posts_with_the_bearer_token_and_decodes_counters() -> None:
+    """``sync_now`` is a write: one POST, bearer auth, counters decoded."""
+    mock = Mock()
+    client = make_client(mock)
+    result = await client.sync_now()
+    assert result.success is True
+    assert result.new_messages == 7
+    assert result.revoke_messages == 2
+    assert mock.sync_calls == 1
+    await client.aclose()
+
+
+async def test_no_read_path_triggers_a_sync() -> None:
+    """Readiness probing must never sync on its own.
+
+    A client that synced while merely asking whether the server is up would turn
+    every probe into a disk scan of the live database.
+    """
+    mock = Mock()
+    mock.states = ["indexing"] * 100
+    client = make_client(mock)
+    await client.health()
+    with pytest.raises(NotReady):
+        await client.ensure_ready("qq_mock",
+                                  {"qq": "qq_mock", "db_path": "X:/db"},
+                                  timeout=0.6)
+    assert mock.sync_calls == 0
+    await client.aclose()
 
 
 async def test_list_all_sessions_pages_and_collapses_cross_page_duplicates() -> None:
