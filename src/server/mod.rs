@@ -761,6 +761,10 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
 
 /// Full startup: parse CLI args, load token, scan accounts (discovery only),
 /// bind the server and wait for client-driven registrations. Runs until Ctrl-C.
+///
+/// `cli` 打开时起服务走 [`run_with`]（配置由子命令面解析），所以这个便捷入口只在关掉 CLI 时
+/// 被用到 —— 那不是「它没用了」。allow 只在那一种 feature 组合下生效。
+#[cfg_attr(feature = "cli", allow(dead_code))]
 pub async fn serve() -> Result<()> {
     let Some(cfg) = config::load()? else {
         return Ok(()); // help printed

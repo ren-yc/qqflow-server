@@ -6,8 +6,8 @@
 use qqflow_server::run_cli;
 
 fn main() {
-    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-    if let Err(e) = rt.block_on(run_cli()) {
+    // `run_cli` 自己做子命令分流，并在需要起服务时建运行时。二进制这一层只负责报错与退出码。
+    if let Err(e) = run_cli() {
         eprintln!("[fatal] {e:#}");
         std::process::exit(1);
     }

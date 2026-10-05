@@ -34,6 +34,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 库边界划定时（core 并入根 package、feature 化的那次改动）应把它换成服务层的 newtype，
 # 届时这些 derive 一起搬走。
 utoipa = { optional = true, version = "6", features = ["axum_extras"] }
+# 命令行子命令面的解析层。刻意 default-features = false：clap 的默认 feature 会带进
+# colorhelp／suggestions 等终端装饰依赖，而本仓的 CLI 输出要能被脚本消费。
+clap = { version = "4", optional = true, default-features = false, features = ["std", "env", "help", "usage", "error-context", "derive"] }
+# CLI 通过 HTTP 访问服务，因此**复用同工作区的 Rust SDK**，而不是在服务端 crate 里再手写
+# 一份 HTTP —— 两份实现的失败模式是漂移，而只有 SDK 那份被契约测试钉住。
+qqflow-client = { path = "clients/rust", optional = true }
 
 [[bin]]
 name = "qqflow-server"
@@ -43,7 +49,14 @@ path = "src/main.rs"
 required-features = ["server"]
 
 [features]
-default = ["server"]
+default = ["server", "cli"]
+
+# 命令行子命令面。
+#
+# 为什么必须是可选 feature：`--no-default-features` 的嵌入契约要求依赖树里不含 axum／tokio
+# （CI 的 embed 例子钉子守着）。本 feature 会带进 clap 与 SDK（进而 reqwest／tokio），所以
+# 关掉默认 feature 时它必须一并消失，而不是变成「库用户也得下载 clap」。
+cli = ["dep:clap", "dep:qqflow-client", "dep:tokio", "server"]
 
 # 服务层：HTTP/SSE。依赖 axum、tokio 运行时与 utoipa（OpenAPI 描述）。
 server = ["dep:axum", "dep:utoipa", "dep:tower-http", "dep:tokio-stream", "dep:tokio-util", "dep:tokio", "sync"]

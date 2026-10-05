@@ -3,10 +3,14 @@
 无头 HTTP API + SSE 服务：读取本地 QQ NT 版聊天记录（SQLCipher 解密 `nt_msg.db`）。
 独立实现，接口形态参考 **WeFlow HTTP API**。
 
-> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server"]`（连带 axum、tokio 与
-> utoipa）——嵌入者必须显式关掉默认 feature，否则会把整个服务栈拉进依赖树。feature 矩阵、
-> 承诺面（`pub mod api`）与真库示例见 [docs/architecture.md](docs/architecture.md) 的「库面与
-> feature」与 [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
+> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server", "cli"]`（连带 axum、
+> tokio、utoipa、clap 与 SDK）——嵌入者必须显式关掉默认 feature，否则会把整个服务栈拉进依赖树。
+> feature 矩阵、承诺面（`pub mod api`）与真库示例见 [docs/architecture.md](docs/architecture.md) 的
+> 「库面与 feature」与 [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
+>
+> **命令行子命令**：既有旗标之外还有 `serve` / `token` / `sessions` / `messages` / `search` /
+> `contacts` / `accounts` / `sync`（默认走 HTTP 复用 SDK；只读查询类可加 `--embedded`）。命令、
+> 退出码与环境变量见 [docs/qqflow-server-api.md](docs/qqflow-server-api.md) 的「命令行子命令」一节。
 
 ## 范围
 

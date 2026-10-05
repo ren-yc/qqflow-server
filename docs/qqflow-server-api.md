@@ -16,6 +16,39 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - 索引就绪前（账号处于 `indexing` / `error` 时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts`（含明细、注销）不检查就绪状态，可随时调用
 - 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
+## 命令行子命令（`cli`）
+
+裸跑仍是「起服务」；既有旗标（`--port`／`--help`／`--show-token` …）**逐字不变**。新增的子命令面与退出码：
+
+| 码 | 含义 | 例子 |
+| --- | --- | --- |
+| `0` | 成功 | `qqflow-server sessions` |
+| `1` | 运行期错误：连不上、被拒、缺 token／缺配置文件 | 未设 `QQFLOW_TOKEN` 就跑查询 |
+| `2` | 用法错误：未知子命令、缺必需参数 | `qqflow-server bogus`、`search` 不带 `--keyword` |
+
+| 子命令 | 打哪个面 | 要点 |
+| --- | --- | --- |
+| `serve` | — | 起服务；等价裸跑 |
+| `token` | 系统凭据库 | 打印 API token 并退出（等价 `--show-token`）|
+| `sessions` | SDK `list_all_sessions` | `page_size=10000`（服务端硬上限），一次取尽 |
+| `messages` | SDK `list_messages` | HTTP 形态必须给 `--talker`；`--since` 接受 unix 秒或 `YYYYMMDD` |
+| `search` | SDK `list_messages` 带 `keyword` | `--keyword` 必填；搜不到不是错误（退出 0）|
+| `contacts` | SDK `contacts` | **只走 HTTP**：本仓的嵌入面没有联系人读面 |
+| `accounts` | SDK `accounts` | **只有 HTTP 形态**：这一面问的是「服务端此刻实际绑定了什么」|
+| `sync` | SDK `sync_now` | **写动作**：立刻跑一次增量同步；没有 `--embedded` |
+
+环境变量：`QQFLOW_BASE_URL`（默认 `http://127.0.0.1:5032`）、`QQFLOW_TOKEN`（API token）。
+**token 一律不经命令行传递** —— 命令行会落进 shell history 与进程列表。
+
+`--embedded`（进程内直读本地库，不起也不打 HTTP）只开放给 `sessions`／`messages`／`search`：
+配置路径由 `QQFLOW_EMBED_CONFIG` 给出，JSON 形态 `{"db_path": "<nt_msg.db 文件>", "key": "<库密钥>"}`
+（本仓的嵌入面是 `api::open(db_path, key)`：一库一钥）。关键词在嵌入形态只对**解析后的正文**判命中
+（本仓不保存原始 XML）—— 这是与 weflow-server 的能力差异，写在这里而不是留给用户猜。
+
+输出：默认人类可读紧凑行，`--json` 给机器可读形状。
+
+回归位置：`tests/cli.rs`。
+
 ## 鉴权规范
 
 除健康检查接口外，所有 `/api/v1/*` 与 `/chatlab/*` 接口均受 Token 保护。支持**两种**传参方式（任选其一）：

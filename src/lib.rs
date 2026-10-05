@@ -69,15 +69,52 @@ internal!(server);
 #[allow(missing_docs)]
 pub mod testing;
 
-/// CLI 入口：起服务直到结束。
+/// 命令行子命令面（`cli` feature）。
+///
+/// `pub(crate)`：CLI 是**二进制的面**，不是嵌入者的承诺面 —— 把它做成 `pub` 会让只服务于
+/// 分流的类型进入 semver 契约。
+#[cfg(feature = "cli")]
+pub(crate) mod cli;
+
+/// CLI 入口。
 ///
 /// **二进制走这里，而不是直接用 `config`/`logging`。** `src/main.rs` 是**独立 crate**，只能看见
 /// `pub` —— 而实现面默认是 `pub(crate)`。所以「连自家二进制也得走承诺面」不是麻烦，正是这条
 /// 边界在起作用：它保证嵌入者能做的事，二进制没有多一分。
+#[cfg(all(feature = "server", feature = "cli"))]
+pub fn run_cli() -> anyhow::Result<()> {
+    match cli::dispatch()? {
+        cli::Entry::Serve(cfg) => run_config(cfg),
+        cli::Entry::Done => Ok(()),
+    }
+}
+
+/// 同上，但 `cli` 关掉时只剩「旗标」这一条老路。
 ///
-/// 本仓库的 `server::serve()` 自己载配置、自己初始化日志（与 weflow 那边把这两步放在入口不同），
-/// 所以这里是薄薄一层。
-#[cfg(feature = "server")]
-pub async fn run_cli() -> anyhow::Result<()> {
-    server::serve().await
+/// 保留这个分支是有意的：`--no-default-features` 的依赖树必须不含 clap 与 SDK，所以那条路上
+/// 不能引用 `cli` 模块，只能直接走 `config::load()`／`server::serve()`。
+#[cfg(all(feature = "server", not(feature = "cli")))]
+pub fn run_cli() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(server::serve())
+}
+
+/// 服务启动的公共入口：`--show-token` 预检、日志初始化、建运行时、跑服务。
+///
+/// 从 `cli::dispatch` 分流出来的「起服务」一路走这里。顺序（先预检再初始化日志）不能反：
+/// 反了会在只想打印 token 的那次调用里先把日志系统建起来。
+#[cfg(all(feature = "server", feature = "cli"))]
+fn run_config(cfg: config::Config) -> anyhow::Result<()> {
+    if cfg.show_token {
+        return match config::show_token()? {
+            Some(t) => {
+                println!("{t}");
+                Ok(())
+            }
+            None => anyhow::bail!("尚未生成 API token（先启动一次服务以生成）"),
+        };
+    }
+    logging::init(&cfg.log);
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(server::run_with(cfg))
 }

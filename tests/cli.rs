@@ -1,0 +1,128 @@
+//! 命令行子命令面的行为钉子：用真实二进制跑，断言**退出码**与**兼容口径**。
+//!
+//! 为什么不用单元测试代替：退出码是进程边界上的行为（clap 的 Error::exit、process::exit），
+//! 在进程内测不到；而这些码正是脚本据以分支的东西 —— 用 1 冒充 2，脚本就分不出「我参数写错了」
+//! 和「服务没起来」。
+//!
+//! 全部用 CARGO_BIN_EXE_qqflow-server 拿到 cargo 刚构建出来的二进制，不假设 target 目录结构。
+
+use std::process::Command;
+
+struct Out {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// 跑一次二进制。第三个参数是**额外**环境变量。
+///
+/// 为什么不用 std::env::set_var：那是进程级全局，而同一个测试二进制里的用例是并行跑的 ——
+/// 一个用例设的 token 会被另一个用例读到。基座里三个开关一律清掉，免得开发者本机的值把测试
+/// 变成非确定性。
+fn run(args: &[&str], extra: &[(&str, &str)]) -> Out {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_qqflow-server"));
+    c.env_remove("QQFLOW_BASE_URL");
+    c.env_remove("QQFLOW_TOKEN");
+    c.env_remove("QQFLOW_EMBED_CONFIG");
+    for (k, v) in extra {
+        c.env(k, v);
+    }
+    let r = c.args(args).output().expect("spawn qqflow-server");
+    Out {
+        code: r.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&r.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&r.stderr).to_string(),
+    }
+}
+
+fn bare(args: &[&str]) -> Out {
+    run(args, &[])
+}
+
+/// 兼容口径：**老写法一个字符都不用改**。
+#[test]
+fn legacy_flags_still_handled_by_the_old_parser() {
+    let o = bare(&["--version"]);
+    assert_eq!(o.code, 0, "--version 应退出 0；stderr: {}", o.stderr);
+    let expect = format!("qqflow-server {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        o.stdout.trim(),
+        expect,
+        "--version 必须由既有解析器处理（走 clap 会换掉文案），实际 stdout: {:?}",
+        o.stdout
+    );
+
+    let h = bare(&["--help"]);
+    assert_eq!(h.code, 0, "--help 应退出 0");
+    assert!(
+        h.stdout.contains("用法: qqflow-server [选项]") && h.stdout.contains("--watch-debounce-ms"),
+        "--help 应仍是既有解析器那份（含全部旗标说明），实际: {:?}",
+        h.stdout
+    );
+}
+
+/// serve 子命令 = 裸跑：后面的旗标仍由老解析器处理。
+#[test]
+fn serve_subcommand_is_the_same_as_bare_run() {
+    let o = bare(&["serve", "--version"]);
+    assert_eq!(o.code, 0, "serve 后面的旗标必须交给既有解析器；stderr: {}", o.stderr);
+    assert_eq!(
+        o.stdout.trim(),
+        format!("qqflow-server {}", env!("CARGO_PKG_VERSION")),
+        "serve --version 应与 --version 给出同一行文案，实际: {:?}",
+        o.stdout
+    );
+}
+
+/// 用法错误必须是 2，而且不能伪装成取值错误。
+#[test]
+fn unknown_subcommand_is_a_usage_error_exit_2() {
+    let o = bare(&["bogus"]);
+    assert_eq!(o.code, 2, "未知子命令应为用法错误；stderr: {}", o.stderr);
+    assert!(o.stderr.contains("bogus"), "报错要点名那个词，实际: {}", o.stderr);
+}
+
+/// search 的 --keyword 必填：缺了就是用法错误（2），不是运行期错误（1）。
+#[test]
+fn search_requires_keyword_as_usage_error() {
+    let o = bare(&["search"]);
+    assert_eq!(o.code, 2, "search 缺 --keyword 应为 2；stderr: {}", o.stderr);
+    assert!(o.stderr.contains("keyword"), "报错要点名 --keyword，实际: {}", o.stderr);
+}
+
+/// HTTP 形态的 messages 必须点名 --talker（服务端按会话查询）。
+#[test]
+fn messages_over_http_requires_talker() {
+    let o = run(&["messages"], &[("QQFLOW_TOKEN", "probe-token-not-used")]);
+    assert_eq!(o.code, 2, "缺 --talker 是用法错误，应为 2；stderr: {}", o.stderr);
+    assert!(o.stderr.contains("talker"), "报错要点名 --talker，实际: {}", o.stderr);
+}
+
+/// HTTP 形态缺 token 是运行期错误（1），并且要指路。
+#[test]
+fn missing_token_fails_before_touching_the_network() {
+    let o = bare(&["sessions"]);
+    assert_eq!(o.code, 1, "缺 token 是运行期错误；stderr: {}", o.stderr);
+    assert!(o.stderr.contains("QQFLOW_TOKEN"), "报错要给出补救（环境变量名），实际: {}", o.stderr);
+}
+
+/// --embedded 只开放给只读查询类：accounts／sync／contacts 没有这个开关。
+///
+/// contacts 在这一列是因为 qqflow 的嵌入面没有联系人读面 —— 硬凑一个比「只走 HTTP」更贵
+/// （理由见 src/cli.rs 的模块头）。
+#[test]
+fn embedded_is_refused_on_write_and_account_subcommands() {
+    for sub in ["accounts", "sync", "contacts"] {
+        let o = bare(&[sub, "--embedded"]);
+        assert_eq!(o.code, 2, "{sub} 不该接受 --embedded；stderr: {}", o.stderr);
+        assert!(o.stderr.contains("embedded"), "{sub} 的报错应指向 --embedded，实际: {}", o.stderr);
+    }
+}
+
+/// --embedded 缺配置文件时：运行期错误（1）＋ 点名环境变量。
+#[test]
+fn embedded_without_config_is_a_runtime_error() {
+    let o = bare(&["sessions", "--embedded"]);
+    assert_eq!(o.code, 1, "缺配置是运行期错误；stderr: {}", o.stderr);
+    assert!(o.stderr.contains("QQFLOW_EMBED_CONFIG"), "报错要给出补救（环境变量名），实际: {}", o.stderr);
+}

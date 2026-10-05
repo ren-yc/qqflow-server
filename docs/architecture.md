@@ -75,6 +75,7 @@ QQ 数据目录（nt_db 等）
 | `lib.rs` | 库入口：承诺面 `api` ＋ 实现面（默认 `pub(crate)`，见「库面与 feature」） | `api` | — |
 | `config.rs` | 命令行与数据目录解析（含平台差异）、token 凭据库读写 | `Config` | ← 无 |
 | `logging.rs` | 日志初始化 | `init()` | ← 无 |
+| `cli.rs` | **命令行子命令面**（`cli` feature）：子命令分流、退出码、HTTP 查询复用 SDK | `dispatch` / `Entry` | → `config` / SDK |
 | `pathsafe.rs` | **纯守卫**：路径分量与导出根目录的边界检查 | `slugify` / 校验函数 | ← 无（被 `store`、`server` 调用） |
 | `db/vfs.rs` | **自定义 VFS**：虚拟跳过明文头偏移 | 注册函数 | ← 无 |
 | `db/decrypt.rs` | 打开解密库、校验密钥 | `open_live` / `open_decrypted` | → `vfs` |
@@ -105,7 +106,7 @@ QQ 数据目录（nt_db 等）
 | 用途 | 怎么用 |
 |---|---|
 | 起服务 | `cargo run`（或 `cargo install <包名>`）—— 默认 feature 就是它 |
-| 当库用 | `default-features = false`，再按需开 feature。**必须显式关掉默认 feature**，否则会连带拉进 axum 与 tokio |
+| 当库用 | `default-features = false`，再按需开 feature。**必须显式关掉默认 feature**，否则会连带拉进 axum、tokio、clap 与 SDK |
 
 嵌入者从 **`api`** 入手，它始终可用（不随任何 feature 开关）—— 「读自己的聊天记录」是最小可用面。
 `examples/embed.rs` 是它的活文档：**不起 HTTP**，直接把一个账号读出来。
@@ -129,11 +130,12 @@ QQ 数据目录（nt_db 等）
 | feature | 内容 | 关掉的影响 |
 |---|---|---|
 | `server`（默认）| HTTP/SSE：axum ＋ tokio 运行时 ＋ OpenAPI 描述 | 没有服务，只剩库 |
+| `cli`（默认）| 命令行子命令面：clap ＋ `qqflow-client` SDK（进而 reqwest／tokio）| 只剩「旗标」式老入口，没有子命令 |
 | `sync` | watcher 与水位线增量：tokio ＋ notify | 没有增量同步；`api::Sync` 随之消失 |
 | `media` | 媒体导出（外部 ffmpeg 在**运行时**探测，缺失则降级） | 没有导出与媒体代理 |
 | `testing` | 把实现面转成 `pub`（见上） | 集成测试够不着实现面 |
 
-**依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum 与 tokio**。
+**依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum、tokio、clap 与 SDK**。
 核心面（解析、存储）因此不得依赖可选面 —— 这条边界由 CI 上的一条检查守着。
 
 ### `clients/`：类型化 SDK（workspace 成员）
