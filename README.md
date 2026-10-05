@@ -3,8 +3,9 @@
 无头 HTTP API + SSE 服务：读取本地 QQ NT 版聊天记录（SQLCipher 解密 `nt_msg.db`）。
 独立实现，接口形态参考 **WeFlow HTTP API**。
 
-> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server", "cli"]`（连带 axum、
-> tokio、utoipa、clap 与 SDK）——嵌入者必须显式关掉默认 feature，否则会把整个服务栈拉进依赖树。
+> **作为库嵌入**：`default-features = false`。默认 feature 是 `["server", "cli", "mcp"]`（连带
+> axum、tokio、utoipa、clap、SDK、rmcp 与 schemars）——嵌入者必须显式关掉默认 feature，否则会把
+> 整个服务栈拉进依赖树。
 > feature 矩阵、承诺面（`pub mod api`）与真库示例见 [docs/architecture.md](docs/architecture.md) 的
 > 「库面与 feature」与 [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
 >
@@ -12,6 +13,9 @@
 > `contacts` / `accounts` / `sync` / `export`（默认走 HTTP 复用 SDK；只读查询类可加 `--embedded`；
 > `export --with-media` 把媒体字节一并落盘）。命令、退出码与环境变量见
 > [docs/qqflow-server-api.md](docs/qqflow-server-api.md) 的「命令行子命令」与「批量导出」两节。
+>
+> **MCP（agent 客户端）**：`qqflow-server mcp` 在 stdio 上暴露只读查询工具，见
+> [docs/mcp.md](docs/mcp.md)。**工具输出会进入模型上下文 —— 也就是对话内容离开本机。**
 
 ## 范围
 

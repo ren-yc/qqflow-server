@@ -40,6 +40,12 @@ clap = { version = "4", optional = true, default-features = false, features = ["
 # CLI 通过 HTTP 访问服务，因此**复用同工作区的 Rust SDK**，而不是在服务端 crate 里再手写
 # 一份 HTTP —— 两份实现的失败模式是漂移，而只有 SDK 那份被契约测试钉住。
 qqflow-client = { path = "clients/rust", optional = true }
+# MCP 工具面。default-features = false 加自选 feature：rmcp 的默认 feature 会带进 HTTP
+# 传输层与 reqwest/tower，而本面只在 stdio 上跑 server/macros。
+rmcp = { version = "3.5", optional = true, default-features = false, features = ["server", "macros", "transport-io"] }
+# 工具参数与输出的 JSON Schema。rmcp 用的是 schemars 1，而 derive 生成的代码按 crate 名解析
+# 路径，所以它必须是本包的直接依赖（不能只靠 rmcp 传递进来）。
+schemars = { version = "1", optional = true }
 
 [[bin]]
 name = "qqflow-server"
@@ -49,7 +55,7 @@ path = "src/main.rs"
 required-features = ["server"]
 
 [features]
-default = ["server", "cli"]
+default = ["server", "cli", "mcp"]
 
 # 命令行子命令面。
 #
@@ -57,6 +63,10 @@ default = ["server", "cli"]
 # （CI 的 embed 例子钉子守着）。本 feature 会带进 clap 与 SDK（进而 reqwest／tokio），所以
 # 关掉默认 feature 时它必须一并消失，而不是变成「库用户也得下载 clap」。
 cli = ["dep:clap", "dep:qqflow-client", "dep:tokio", "server"]
+
+# MCP 工具面：在 stdio 上把只读查询暴露成工具。隐含 `cli` —— 入口是 mcp 子命令。
+# 关掉默认 feature 时它必须一并消失（嵌入契约要求依赖树里没有 cli／rmcp）。
+mcp = ["dep:rmcp", "dep:schemars", "cli"]
 
 # 服务层：HTTP/SSE。依赖 axum、tokio 运行时与 utoipa（OpenAPI 描述）。
 server = ["dep:axum", "dep:utoipa", "dep:tower-http", "dep:tokio-stream", "dep:tokio-util", "dep:tokio", "sync"]

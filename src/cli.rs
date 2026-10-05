@@ -80,6 +80,19 @@ enum Command {
     Sync(HttpArgs),
     /// 批量导出：把会话写成 ChatLab Format 的 JSONL / JSON 落盘
     Export(ExportArgs),
+    /// 以 MCP（stdio）方式暴露只读查询工具，供 agent 客户端调用
+    #[cfg(feature = "mcp")]
+    Mcp(McpArgs),
+}
+
+/// `mcp` 的参数。刻意只有服务地址：token 只从环境变量取（与其它子命令同一口径），
+/// 而 MCP 进程不碰数据库密钥 —— 那是服务端的事。
+#[cfg(feature = "mcp")]
+#[derive(clap::Args)]
+struct McpArgs {
+    /// 服务地址；默认取环境变量 QQFLOW_BASE_URL，再默认 http://127.0.0.1:5032
+    #[arg(long, env = "QQFLOW_BASE_URL")]
+    base_url: Option<String>,
 }
 
 /// 只读查询类子命令的共用参数（带 `--embedded`）。
@@ -276,6 +289,12 @@ pub(crate) fn dispatch() -> Result<Entry> {
                 return export_corpus(&a.out, rows).map(|_| Entry::Done);
             }
             run_export(&a).map(|_| Entry::Done)
+        }
+        #[cfg(feature = "mcp")]
+        Command::Mcp(a) => {
+            let base = a.base_url.unwrap_or_else(|| "http://127.0.0.1:5032".to_string());
+            crate::mcp::run(base, env_token()?)?;
+            Ok(Entry::Done)
         }
     }
 }
