@@ -40,6 +40,8 @@ fn native_message() -> Value {
 fn pull_message() -> Value {
     json!({
         "accountName": "alice", "content": "hi", "groupNickname": "",
+        // 媒体句柄：`--with-media` 要据此下载字节，而服务端只对**内容摘要命名**的句柄保证可取。
+        "media": {"fileName": "deadbeef.png", "type": "image"},
         "platformMessageId": "42", "sender": "alice", "timestamp": 1_700_000_000, "type": 1,
     })
 }
@@ -53,6 +55,7 @@ async fn spawn_stub() -> String {
         .route("/api/v1/sessions/{id}/messages", get(pull))
         .route("/api/v1/messages", get(messages))
         .route("/api/v1/contacts", get(contacts))
+        .route("/api/v1/media/{id}", get(media))
         .route("/chatlab/messages", get(chatlab));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -102,6 +105,11 @@ async fn contacts() -> Json<Value> {
         "alias": "", "avatarUrl": "", "displayName": "张三", "nickname": "三儿",
         "remark": "客户张三", "type": "friend", "username": "alice",
     }]}))
+}
+
+/// 媒体字节：`--with-media` 的下载目标。
+async fn media(axum::extract::Path(_id): axum::extract::Path<String>) -> Vec<u8> {
+    b"PNG-BYTES".to_vec()
 }
 
 async fn chatlab() -> Json<Value> {
@@ -167,6 +175,34 @@ async fn export_writes_a_file_against_a_live_service() {
     )
     .unwrap();
     assert!(body.contains("\"type\":\"group\""), "群会话的 meta.type 应为 group，实际: {body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 验收 1c：`--with-media` 把字节落盘，且导出物里的句柄就是落盘名。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_with_media_lands_bytes_and_keeps_the_handle() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("qqflow-e2e-withmedia-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl", "--with-media"],
+    );
+    assert_eq!(code, 0, "export --with-media 应退出 0；stdout: {stdout} stderr: {stderr}");
+    let file = dir.join("media").join("deadbeef.png");
+    assert!(file.exists(), "字节应落到 media/ 下");
+    assert_eq!(std::fs::read(&file).unwrap(), b"PNG-BYTES", "落盘的应是媒体字节");
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("应有 jsonl");
+    let body = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(
+        body.contains("\"fileName\":\"deadbeef.png\""),
+        "导出物里的句柄应指向落盘文件，实际: {body}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
