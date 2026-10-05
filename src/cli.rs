@@ -49,6 +49,8 @@ use serde_json::{json, Value};
 
 use crate::api;
 use crate::config::Config;
+use crate::export;
+use crate::parser::types::ChatType;
 
 /// 顶层：一个子命令。`name` 固定成二进制名，因为 dispatch 用 parse_from 手工喂 argv。
 #[derive(Parser)]
@@ -76,6 +78,8 @@ enum Command {
     Accounts(HttpArgs),
     /// 让服务端立刻跑一次增量同步（写动作）
     Sync(HttpArgs),
+    /// 批量导出：把会话写成 ChatLab Format 的 JSONL / JSON 落盘
+    Export(ExportArgs),
 }
 
 /// 只读查询类子命令的共用参数（带 `--embedded`）。
@@ -114,6 +118,40 @@ struct MessageArgs {
 struct HttpArgs {
     #[command(flatten)]
     common: Common,
+}
+
+/// `export` 的参数。
+///
+/// 两条硬约束的落点：`--embedded` **不提供** —— 批量导出只走 HTTP（服务端已经把密钥握在内存里，
+/// CLI 只做编排与落盘；否则一个长任务会长时间持有密钥，还得把密钥带上命令行）。`--with-media` 把
+/// 字节下载到导出目录下的 `media/`，而**导出物里不写任何 URL**。
+#[derive(clap::Args)]
+struct ExportArgs {
+    /// 输出目录（必需：落盘是有意的动作，不给默认路径）
+    #[arg(long)]
+    out: PathBuf,
+    /// 格式：jsonl（流式、内存与条数无关）或 json（每会话一个完整信封）
+    #[arg(long, default_value = "jsonl", value_parser = ["jsonl", "json"])]
+    format: String,
+    /// 只导这些会话（可重复）
+    #[arg(long)]
+    session: Vec<String>,
+    /// 起始时间：unix 秒或 YYYYMMDD
+    #[arg(long)]
+    since: Option<String>,
+    /// 已存在的会话文件跳过（幂等续跑）
+    #[arg(long)]
+    resume: bool,
+    /// 下载本会话用到的媒体字节到 <out>/media/，并把导出物里的 fileName 限定为确实落盘的句柄
+    #[arg(long)]
+    with_media: bool,
+    #[command(flatten)]
+    common: Common,
+
+    /// 测试专用的语料生成入口：**不进 --help，且只在 testing feature 下编译**。
+    #[cfg(feature = "testing")]
+    #[arg(long, hide = true)]
+    rows: Option<usize>,
 }
 
 #[derive(clap::Args)]
@@ -231,6 +269,13 @@ pub(crate) fn dispatch() -> Result<Entry> {
             let r = block(client.sync_now())?;
             emit(&json!({"success": r.success, "newMessages": r.new_messages, "revokeMessages": r.revoke_messages}), q.common.json, "sync");
             Ok(Entry::Done)
+        }
+        Command::Export(a) => {
+            #[cfg(feature = "testing")]
+            if let Some(rows) = a.rows {
+                return export_corpus(&a.out, rows).map(|_| Entry::Done);
+            }
+            run_export(&a).map(|_| Entry::Done)
         }
     }
 }
@@ -462,3 +507,313 @@ fn human_row(v: &Value, kind: &str) -> String {
         _ => format!("{}\t{}\t{}", n("createTime"), s("senderName"), s("content")),
     }
 }
+// ---- export ---------------------------------------------------------------
+
+/// Pull 面的消息项 → 导出的中立 Row。单独一个函数是因为取数面的类型属于 SDK，而「怎么写盘」只认
+/// Row —— 这样导出模块能在不装 SDK 类型的情况下被测全。
+fn row_from_pull(m: &qqflow_client::generated::r#gen::types::PullMessage) -> export::Row {
+    export::Row {
+        platform_message_id: m.platform_message_id.clone(),
+        sender: m.sender.clone(),
+        account_name: m.account_name.clone(),
+        group_nickname: m.group_nickname.clone(),
+        timestamp: m.timestamp,
+        msg_type: m.type_,
+        content: m.content.clone(),
+        reply_to_message_id: m.reply_to_message_id.clone(),
+        // 媒体只写元数据（type + fileName）：服务的媒体链接带 token，而导出文件会被拷进聊天
+        // 工具、传上网盘。
+        media_file_name: m.media.as_ref().map(|x| x.file_name.clone()).filter(|s| !s.is_empty()),
+        media_type: m.media.as_ref().map(|x| x.type_.clone()),
+    }
+}
+
+/// 把 --since 转成 unix 秒。接受 unix 秒或 YYYYMMDD（后者取当天 00:00，与服务端对**下界**的
+/// 口径一致；上界才取整天）。
+fn to_unix(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+        let y: i64 = s[0..4].parse().unwrap_or(0);
+        let m: u32 = s[4..6]
+            .parse()
+            .with_context(|| format!("--since 月份非法: {}", s))?;
+        let d: u32 = s[6..8]
+            .parse()
+            .with_context(|| format!("--since 日非法: {}", s))?;
+        let naive = chrono::NaiveDate::from_ymd_opt(y as i32, m, d)
+            .with_context(|| format!("--since 不是合法日期: {}", s))?;
+        return Ok(naive.and_time(chrono::NaiveTime::MIN).and_utc().timestamp());
+    }
+    s.parse::<i64>()
+        .with_context(|| format!("--since 需为 unix 秒或 YYYYMMDD: {}", s))
+}
+
+fn run_export(a: &ExportArgs) -> Result<()> {
+    let format = match a.format.as_str() {
+        "jsonl" => export::Format::Jsonl,
+        "json" => export::Format::Json,
+        other => anyhow::bail!("--format 只支持 jsonl|json: {}", other),
+    };
+    let client = http_client(&a.common)?;
+    // 令牌就是导出物里绝不允许出现的那串（见 export 模块头的硬约束一）。
+    let secret = std::env::var("QQFLOW_TOKEN").unwrap_or_default();
+    let all = block(client.list_all_sessions(Some(10_000), None))?;
+    let find = |t: &str| all.iter().find(|s| s.username == t);
+    // 会话类型无法从 talker 反推（QQ 的群号与 uid 都是数字串），只能用发现面的 type 码。
+    let chat_type = |t: &str| {
+        find(t)
+            .map(|s| if s.type_ == 2 { ChatType::Group } else { ChatType::C2c })
+            .unwrap_or(ChatType::C2c)
+    };
+    let targets: Vec<export::SessionTarget> = if a.session.is_empty() {
+        all.iter()
+            .map(|s| export::SessionTarget {
+                talker: s.username.clone(),
+                display_name: s.display_name.clone(),
+                chat_type: if s.type_ == 2 { ChatType::Group } else { ChatType::C2c },
+            })
+            .collect()
+    } else {
+        a.session
+            .iter()
+            .map(|t| export::SessionTarget {
+                talker: t.clone(),
+                display_name: find(t).map(|s| s.display_name.clone()).unwrap_or_default(),
+                chat_type: chat_type(t),
+            })
+            .collect()
+    };
+    let opts = export::Options {
+        out_dir: a.out.clone(),
+        format,
+        resume: a.resume,
+        secret,
+    };
+    let since = a.since.as_deref().map(to_unix).transpose()?;
+    let media_dir = a.out.join("media");
+    let mut media_total = 0usize;
+    let start = std::time::Instant::now();
+    let outcome = export::run(&targets, &opts, |target, on_page| {
+        // Pull 面的 since 是**排他**下界，而 --since 对用户是含边界的：差一秒就会让「起点那一条」
+        // 凭空消失，故这里减一。
+        let talker = target.talker.clone();
+        let since_pull = since.map(|s| s - 1);
+        // --with-media：**先**触发导出并把字节落盘，**再**拉行 —— 服务端只有在真的写出了本地副本
+        // 之后，才把 Pull 面的 fileName 回填成可取句柄。
+        let downloaded = if a.with_media {
+            let got = block_anyhow(download_session_media(&client, &talker, &media_dir))?;
+            media_total += got.len();
+            got
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**：错误先存起来、循环后
+        // 立即上抛，后续页只跳过不再写（半途而废的会话由 run 删掉，交给 --resume 重来）。
+        let mut write_err: Option<anyhow::Error> = None;
+        block(client.drain_session(&talker, since_pull, |msgs| {
+            if write_err.is_none() {
+                let mut rows: Vec<export::Row> = msgs.iter().map(row_from_pull).collect();
+                if a.with_media {
+                    for r in rows.iter_mut() {
+                        export::retain_downloaded_media(r, &downloaded);
+                    }
+                }
+                if let Err(e) = on_page(&rows) {
+                    write_err = Some(e);
+                }
+            }
+            Ok(())
+        }))?;
+
+        match write_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })?;
+    println!(
+        "[export] {} 个会话、{} 条消息、{} 个媒体 → {}（跳过 {}，索引 {}），用时 {:?}",
+        outcome.written.len(),
+        outcome.messages,
+        media_total,
+        opts.out_dir.display(),
+        outcome.skipped.len(),
+        outcome.index.display(),
+        start.elapsed()
+    );
+    if !outcome.skipped.is_empty() {
+        for s in &outcome.skipped {
+            println!("[export] 跳过: {}", s);
+        }
+        // 少导了东西必须以非零码说话：静默的部分成功是这类工具最坏的失败方式。
+        anyhow::bail!("{} 个会话未能导出（见上面的 跳过: 行）", outcome.skipped.len());
+    }
+    Ok(())
+}
+
+/// 把一个会话的媒体导出并下载到 `<out>/media/`，返回**确实落盘**的句柄集合。
+///
+/// 为什么先走 `/chatlab/messages?media=1`：服务端**只有在真的写出了本地副本之后**才把
+/// `fileName` 回填成可取句柄（外链与平台名给不出跨会话唯一的句柄），所以「触发导出」与「拿到
+/// 句柄」是同一次请求的两面。该面每请求最多导出 200 项，超出部分靠翻页续传。
+///
+/// 单个媒体拿不到（404）只跳过，不升级成会话级失败：外链媒体本来就没有可取句柄，把它升格会让
+/// 「这个群里有一个表情包不是本地文件」变成「这个群一条都没导出」。
+async fn download_session_media(
+    client: &Client,
+    talker: &str,
+    media_dir: &std::path::Path,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut downloaded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut offset = 0u64;
+    loop {
+        let mut q = MessageQuery::new(talker.to_string());
+        q.media = true;
+        q.limit = Some(200);
+        q.offset = Some(offset);
+        let page = client.chatlab_messages(&q).await?;
+        let count = page.messages.len();
+        for m in &page.messages {
+            let Some(media) = &m.media else { continue };
+            let name = media.file_name.clone();
+            if name.is_empty() || downloaded.contains(&name) {
+                continue;
+            }
+            match client.media_bytes_by_id(&name).await {
+                Ok(bytes) => {
+                    std::fs::create_dir_all(media_dir)
+                        .with_context(|| format!("创建媒体目录失败: {}", media_dir.display()))?;
+                    let path = media_dir.join(&name);
+                    std::fs::write(&path, &bytes)
+                        .with_context(|| format!("写媒体失败: {}", path.display()))?;
+                    downloaded.insert(name);
+                }
+                // 不是可取句柄（外链、或服务端没写出副本）：跳过该条，继续。
+                Err(e) => tracing::debug!("跳过不可取句柄 {name}: {e}"),
+            }
+        }
+        if !page.page.has_more || count == 0 {
+            return Ok(downloaded);
+        }
+        offset += count as u64;
+    }
+}
+
+/// 与 [`block`] 同形，但面向返回 `anyhow::Result` 的 future：`anyhow::Error` 不实现
+/// `std::error::Error`，塞不进 `block` 的约束里。
+fn block_anyhow<T>(f: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("建 tokio 运行时失败")?;
+    rt.block_on(f)
+}
+
+/// 测试专用的语料生成＋导出入口（`--rows N`，隐藏且只在 `testing` 下编译）。
+///
+/// **它为什么存在**：「大语料下内存恒定」这条断言在小语料上根本看不出来 —— 把整个会话读进内存
+/// 的实现，在一百条的夹具上一样表现为常数内存。要让它显形，语料必须大到「整会话驻留」与「流式
+/// 写」差出量级，所以这里按需造库。
+///
+/// 与用户面的 `export` 唯一的区别是取数来源：这里进程内直读夹具库（`api::open`），因为测试环境里
+/// 没有服务可打；写盘路径、行形状、`--resume` 与令牌检查用的是同一套代码（`crate::export`）。
+#[cfg(feature = "testing")]
+fn export_corpus(out: &std::path::Path, rows: usize) -> Result<()> {
+    use crate::testing::{self, BULK_GROUPS};
+    let dir = std::env::temp_dir().join(format!("qqflow-export-corpus-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("建临时目录失败: {}", dir.display()))?;
+    let source = testing::build_source_with_rows(&dir, rows);
+    let index = api::open(&source, testing::FAKE_KEY)?;
+    let sessions: Vec<export::SessionTarget> = index
+        .conversations()
+        .iter()
+        .map(|c| export::SessionTarget {
+            talker: c.talker.clone(),
+            display_name: c.name.clone(),
+            chat_type: c.chat_type,
+        })
+        .collect();
+    let opts = export::Options {
+        out_dir: out.to_path_buf(),
+        format: export::Format::Jsonl,
+        resume: false,
+        // 夹具里没有真令牌；留空表示「不检查」，而检查逻辑本身由单测直接测。
+        secret: String::new(),
+    };
+    let started = std::time::Instant::now();
+    let mut sample_idx = 0usize;
+    let outcome = export::run(&sessions, &opts, |target, on_page| {
+        let msgs = index.messages(target.chat_type, &target.talker);
+        let rowsv: Vec<export::Row> = msgs
+            .iter()
+            .map(|m| export::Row {
+                platform_message_id: m.seq.to_string(),
+                sender: m.from_uid.clone(),
+                account_name: m.from_nick.clone(),
+                group_nickname: String::new(),
+                timestamp: m.ts,
+                msg_type: m.parsed.msg_type.chatlab_type(),
+                content: m.parsed.content.clone(),
+                reply_to_message_id: None,
+                media_file_name: None,
+                media_type: None,
+            })
+            .collect();
+        let n = rowsv.len();
+        on_page(&rowsv)?;
+        // 采样点：每导完一个会话取一次峰值 RSS。
+        println!("[rss] session={sample_idx} rows={n} peak_kb={:?}", peak_rss_kb());
+        sample_idx += 1;
+        Ok(())
+    })?;
+    println!(
+        "[corpus] rows={rows} sessions={} written={} messages={} 用时 {:?}",
+        BULK_GROUPS,
+        outcome.written.len(),
+        outcome.messages,
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// 进程峰值 RSS（KB）。取不到时返回 `None` —— 调用方据此跳过断言，而不是拿 0 当成「内存恒定」
+/// 的证据。
+#[cfg(feature = "testing")]
+fn peak_rss_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                return rest.trim().trim_end_matches(" kB").trim().parse().ok();
+            }
+        }
+        None
+    }
+    #[cfg(windows)]
+    {
+        let pid = std::process::id();
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &format!("(Get-Process -Id {pid}).PeakWorkingSet64")])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        s.parse::<u64>().ok().map(|bytes| bytes / 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    {
+        None
+    }
+}
+

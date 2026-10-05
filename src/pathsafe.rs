@@ -58,6 +58,35 @@ pub fn safe_segment(s: &str) -> bool {
         && !s.ends_with(' ')
 }
 
+/// Fold an arbitrary string into one safe path component.
+///
+/// For names that are *derived* from untrusted input rather than matched against
+/// it — the batch export's file-name scope, where a session's display name is a
+/// display detail of the artifact name and rejecting it outright would break a
+/// working export. Non-`[A-Za-z0-9-_]` bytes become `_`, so the result can hold no
+/// separator, no `:`, and no dot at all — which also means it cannot end in one, so
+/// the Windows trailing-dot rule is satisfied by construction rather than by a
+/// follow-up trim. Only an empty result needs `fallback`.
+///
+/// Truncation is by `char`, never by byte, so a multi-byte UTF-8 name cannot be cut
+/// mid-sequence.
+pub fn slugify(s: &str, fallback: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if out.is_empty() {
+        return fallback.to_string();
+    }
+    out
+}
 /// Assert that `path` really resolves inside `root`, as the last line of
 /// defense after a name was derived.
 ///
@@ -143,6 +172,35 @@ mod tests {
             .join(format!("pathsafe-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
+    }
+
+    #[test]
+    fn slugify_folds_every_traversal_shape() {
+        assert_eq!(slugify("10001", "scope"), "10001");
+        assert_eq!(slugify("all", "scope"), "all");
+        // the PoC payload: every separator and dot folds away
+        // 8 dots + 4 separators fold to 12 underscores
+        assert_eq!(slugify(r"..\..\..\..\outside\pwned", "scope"), "____________outside_pwned");
+        assert_eq!(slugify("../../etc/passwd", "scope"), "______etc_passwd");
+        assert_eq!(slugify("..", "scope"), "__");
+        // dots fold to '_' like everything else, so the result is inert rather than
+        // empty; only a genuinely empty input needs the fallback
+        assert_eq!(slugify("...", "scope"), "___");
+        assert_eq!(slugify("", "scope"), "scope");
+        // group ids keep their shape well enough to stay readable
+        assert_eq!(slugify("12345678@chatroom", "scope"), "12345678_chatroom");
+        // every output is usable as one component
+        for probe in ["..", "../x", r"..\x", "a:b", "x.", "", "..."] {
+            assert!(safe_segment(&slugify(probe, "scope")), "slug of {probe:?} must be a safe segment");
+        }
+    }
+
+    #[test]
+    fn slugify_truncates_by_char_not_byte() {
+        let long = "中".repeat(100);
+        let slug = slugify(&long, "scope");
+        assert!(slug.chars().count() <= 64);
+        assert!(safe_segment(&slug));
     }
 
     #[test]

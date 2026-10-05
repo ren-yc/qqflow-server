@@ -9,8 +9,9 @@
 > 「库面与 feature」与 [examples/embed.rs](examples/embed.rs)（CI 以 `--no-default-features` 编译它作为守门）。
 >
 > **命令行子命令**：既有旗标之外还有 `serve` / `token` / `sessions` / `messages` / `search` /
-> `contacts` / `accounts` / `sync`（默认走 HTTP 复用 SDK；只读查询类可加 `--embedded`）。命令、
-> 退出码与环境变量见 [docs/qqflow-server-api.md](docs/qqflow-server-api.md) 的「命令行子命令」一节。
+> `contacts` / `accounts` / `sync` / `export`（默认走 HTTP 复用 SDK；只读查询类可加 `--embedded`；
+> `export --with-media` 把媒体字节一并落盘）。命令、退出码与环境变量见
+> [docs/qqflow-server-api.md](docs/qqflow-server-api.md) 的「命令行子命令」与「批量导出」两节。
 
 ## 范围
 

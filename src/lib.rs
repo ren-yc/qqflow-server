@@ -76,6 +76,11 @@ pub mod testing;
 #[cfg(feature = "cli")]
 pub(crate) mod cli;
 
+/// 批量导出（ChatLab Format 落盘）。只在 `cli` 下编译：它是子命令 `export` 的实现，不是承诺面，
+/// 也不是服务运行期要用的东西（服务端只在内存里给数据）。
+#[cfg(feature = "cli")]
+pub(crate) mod export;
+
 /// CLI 入口。
 ///
 /// **二进制走这里，而不是直接用 `config`/`logging`。** `src/main.rs` 是**独立 crate**，只能看见

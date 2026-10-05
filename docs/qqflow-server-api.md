@@ -36,6 +36,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 | `contacts` | SDK `contacts` | **只走 HTTP**：本仓的嵌入面没有联系人读面 |
 | `accounts` | SDK `accounts` | **只有 HTTP 形态**：这一面问的是「服务端此刻实际绑定了什么」|
 | `sync` | SDK `sync_now` | **写动作**：立刻跑一次增量同步；没有 `--embedded` |
+| `export` | SDK `list_all_sessions` ＋ `drain_session` ＋ `chatlab_messages` | **只走 HTTP**：批量导出到 ChatLab Format 文件；`--with-media` 时另用 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
 
 环境变量：`QQFLOW_BASE_URL`（默认 `http://127.0.0.1:5032`）、`QQFLOW_TOKEN`（API token）。
 **token 一律不经命令行传递** —— 命令行会落进 shell history 与进程列表。
@@ -48,6 +49,45 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 输出：默认人类可读紧凑行，`--json` 给机器可读形状。
 
 回归位置：`tests/cli.rs`。
+
+## 批量导出（`export`）
+
+`qqflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume] [--with-media]`
+
+**只走 HTTP**：这个面不提供 `--embedded`。服务端已经把数据库密钥握在内存里，CLI 只做编排与落盘；
+否则一个可能跑几分钟的任务会长时间持有密钥，还得把密钥带上命令行。
+
+产物布局：
+
+- **每个会话一个文件**（`<slug>.jsonl` 或 `<slug>.json`）。`<slug>` 由会话显示名经 `pathsafe::slugify`
+  得到；**折叠后不含任何 ASCII 字母数字时**（纯中文群名会被折成一串下划线，既不可读也极易互撞）
+  **回落到会话 id 的 slug**；同名会话按出现顺序追加 `-2`／`-3`。文件名是确定性函数 —— 这是
+  `--resume` 成立的前提。
+- **JSONL 形态**：第一行是 `_type: header`（含 `chatlab` 与 `meta`），其后是 `_type: message` 行。
+  规范建议按时间升序，因此**页内**排序（跨页排序会把内存恒定这条承诺打破）。**不写 member 行**：
+  流式写不出「先集齐成员再写消息」的顺序，而消息行自带 `accountName` 与 `groupNickname`，信息不丢。
+- **JSON 形态**：一个会话一个完整信封（`chatlab`／`meta`／`members`／`messages`）。整会话留在内存，
+  因此大语料请用 jsonl。
+- **`index.json`**：本服务自造的编排清单。**它不属于 ChatLab 规范，导入请用单个 `<slug>.jsonl`／`.json`。**
+- **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的 `media.fileName`
+  **限定为确实落盘的那些句柄**。实现上先走 `/chatlab/messages?media=1` 触发导出（该面**每请求最多导出
+  200 项**，超出部分靠翻页续传），再取字节；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把
+  `fileName` 回填成可取句柄。外链媒体与未能导出的媒体**不会**留下句柄：宁可少一个 `media` 字段，也不给
+  一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
+
+两条硬约束：
+
+1. **导出物里不得出现访问令牌**。媒体在服务端是按带 token 的 URL 暴露的，而导出文件会被拷进聊天工具、
+   传上网盘。因此导出**不写任何 URL**，媒体只以 `{type, fileName}` 表达；并且每一行写盘前会拿调用方给的
+   令牌做一次子串检查，**命中即整轮中止**（不是跳过该会话）并删掉半成品。
+2. **会话级失败不静默**：取数失败的会话被跳过、半途产物被删除，而只要 `skipped` 非空，CLI 就以退出码 1
+   结束。静默少导几个会话是这类工具最坏的失败方式。
+
+内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与条数无关**。大语料的实测口径与造库工具（隐藏的 `--rows`
+参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
+
+回归位置：`export::tests::*`（行形状、slug、`--resume`、令牌熔断、`--with-media` 的句柄契约）与
+`tests/cli.rs` 的 `export_help_does_not_advertise_the_rows_param`／`export_requires_out_dir_as_usage_error`。
 
 ## 鉴权规范
 
