@@ -46,7 +46,7 @@ fn free_port() -> u16 {
     port
 }
 
-fn test_cfg(dir: &std::path::Path, port: u16) -> Config {
+fn test_cfg(dir: &std::path::Path, port: u16, token: String) -> Config {
     Config {
         host: "127.0.0.1".into(),
         port,
@@ -56,6 +56,7 @@ fn test_cfg(dir: &std::path::Path, port: u16) -> Config {
         media_export_dir: Some(dir.join("media")),
         base_url: None,
         show_token: false,
+        token: Some(token),
     }
 }
 
@@ -64,6 +65,23 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// Mint the token this test run hands to its server and probe with. The
+/// server takes it through `Config::token` (no OS credential store involved),
+/// so the readiness predicate no longer depends on the store being readable.
+/// Why that matters: the store is an environment dependency, not a logic one —
+/// on a headless CI runner the keyring daemon can be absent or half-started,
+/// and the failure mode was exactly the nasty one: the server fell back to a
+/// session token while the probe kept reading "no token" and the wait timed
+/// out, failing an unrelated shutdown assertion (regression:
+/// shutdown_ends_a_live_sse_stream_within_the_grace_period on CI). Both tests
+/// still run with distinct tokens; the credential guard keeps the two in-flight
+/// servers from sharing any state.
+fn mint_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Drop any pre-existing API token so `load_or_create_token()` deterministically
@@ -106,10 +124,6 @@ enum UpFailure {
         port: u16,
         waited: Duration,
     },
-    Token {
-        port: u16,
-        waited: Duration,
-    },
     Auth {
         port: u16,
         status: u16,
@@ -124,9 +138,7 @@ impl UpFailure {
             Self::Port { .. } => {
                 "nothing is listening on that port: check the server task did not exit early, and that another process is not holding the port"
             }
-            Self::Token { .. } => {
-                "the port accepts connections but the OS credential store returned no token: the test process likely cannot read the store (Windows Credential Manager / libsecret); run --show-token once by hand to confirm the entry is readable"
-            }
+
             Self::Auth { .. } => {
                 "a token was read but the server rejected it: the stored token and the running server's token disagree (a credential-store write race between parallel tests); delete the stored entry and re-run"
             }
@@ -141,10 +153,7 @@ impl std::fmt::Display for UpFailure {
                 "port",
                 format!("no TCP connection on 127.0.0.1:{port} within {waited:?}"),
             ),
-            Self::Token { port, waited } => (
-                "token",
-                format!("127.0.0.1:{port} is up but show_token() returned none within {waited:?}"),
-            ),
+
             Self::Auth { port, status, body, waited } => (
                 "auth",
                 format!("127.0.0.1:{port} answered {status} to an authenticated request within {waited:?} ({body})"),
@@ -158,19 +167,18 @@ impl std::fmt::Display for UpFailure {
     }
 }
 
-/// Wait until the server is *usable*, in three stages:
+/// Wait until the server is *usable*, in two stages:
 ///
 /// 1. the port accepts a TCP connection;
-/// 2. `show_token()` returns a token (the credential store is readable);
-/// 3. that token authenticates a real request.
+/// 2. the token this test handed to the server authenticates a real request.
 ///
-/// Stage 3 is the one that matters for the historical flake: two parallel
-/// tests could both mint tokens before either stored theirs, so the port was
-/// up and *a* token was readable — just not the one the server held. A
-/// predicate that stops at stage 1 or 2 cannot tell that state from a healthy
-/// one; waiting on the authenticated round trip means the test proceeds only
-/// when the server would actually accept the token it is about to use.
-async fn wait_until_up(port: u16) -> Result<ServerProbe, UpFailure> {
+/// The old stage 2 read the token back through the OS credential store. That
+/// made readiness depend on the store being readable — an environment
+/// property the test neither controls nor cares about (the server may even be
+/// legitimately running on a session-token fallback). The token now travels
+/// through `Config::token`, so the authenticated round trip below is against
+/// exactly the value the server holds.
+async fn wait_until_up(port: u16, token: &str) -> Result<ServerProbe, UpFailure> {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_secs(10);
     loop {
@@ -179,21 +187,13 @@ async fn wait_until_up(port: u16) -> Result<ServerProbe, UpFailure> {
             waited: started.elapsed(),
         };
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            match qqflow_server::config::show_token().ok().flatten() {
-                Some(token) => match probe_auth(port, &token).await {
-                    Ok(()) => return Ok(ServerProbe { token }),
-                    Err((status, body)) => {
-                        stuck = UpFailure::Auth {
-                            port,
-                            status,
-                            body,
-                            waited: started.elapsed(),
-                        }
-                    }
-                },
-                None => {
-                    stuck = UpFailure::Token {
+            match probe_auth(port, token).await {
+                Ok(()) => return Ok(ServerProbe { token: token.to_string() }),
+                Err((status, body)) => {
+                    stuck = UpFailure::Auth {
                         port,
+                        status,
+                        body,
                         waited: started.elapsed(),
                     }
                 }
@@ -253,7 +253,10 @@ async fn shutdown_signal_stops_the_server() {
     let port = free_port();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
-    let cfg = test_cfg(&dir, port);
+    // The token travels through `Config::token`: the server never touches the
+    // OS credential store, and the probe authenticates with the same value.
+    let token = mint_token();
+    let cfg = test_cfg(&dir, port, token.clone());
     let server = tokio::spawn(async move {
         qqflow_server::server::run_with_shutdown(cfg, async move {
             let _ = rx.await;
@@ -262,9 +265,9 @@ async fn shutdown_signal_stops_the_server() {
     });
 
     // Wait until the server is serving authenticated traffic — and so a failure
-    // reports which stage stalled (port / token / auth) instead of one generic
+    // reports which stage stalled (port / auth) instead of one generic
     // "never came up" line.
-    let probe = wait_until_up(port).await.unwrap_or_else(|e| panic!("{e}"));
+    let probe = wait_until_up(port, &token).await.unwrap_or_else(|e| panic!("{e}"));
     assert!(!probe.token.is_empty(), "probe token must not be empty");
     // Dropping the guard here is what serializes the two tests: by the time
     // the next test acquires it, our server has finished `load_or_create_token`
@@ -306,7 +309,11 @@ async fn shutdown_ends_a_live_sse_stream_within_the_grace_period() {
     let port = free_port();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
-    let cfg = test_cfg(&dir, port);
+    // The token travels through `Config::token`, and the predicate hands it
+    // back only after it has authenticated a real request, so the handshake
+    // below cannot use a token the server will reject.
+    let token = mint_token();
+    let cfg = test_cfg(&dir, port, token.clone());
     let server = tokio::spawn(async move {
         qqflow_server::server::run_with_shutdown(cfg, async move {
             let _ = rx.await;
@@ -314,10 +321,7 @@ async fn shutdown_ends_a_live_sse_stream_within_the_grace_period() {
         .await
     });
 
-    // The predicate hands the token back only after it has authenticated a real
-    // request, so the handshake below cannot use a token the server will
-    // reject — which is what the old inline read could not rule out.
-    let token = wait_until_up(port)
+    let token = wait_until_up(port, &token)
         .await
         .unwrap_or_else(|e| panic!("{e}"))
         .token;

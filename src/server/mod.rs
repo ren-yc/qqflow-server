@@ -790,7 +790,15 @@ pub async fn run_with_shutdown(
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let data_dir = config::data_dir()?;
-    let token = config::load_or_create_token()?;
+    // 显式给定的 token 直接用，不碰 OS 凭据库：凭据库是环境依赖而非逻辑依赖 ——
+    // 无密钥环守护的环境里服务端会降级成会话级 token，而读方（测试探针、另开的
+    // --show-token）在同样的环境里只会持续读到「无 token」，两侧永远对不上
+    // （回归：shutdown_ends_a_live_sse_stream_within_the_grace_period 在 CI 的形态）。
+    // 拿着 token 起服务的调用方（进程内测试、自带密钥管理的嵌入者）经 Config 传入。
+    let token = match cfg.token.clone() {
+        Some(t) => t,
+        None => config::load_or_create_token()?,
+    };
 
     // ---- accounts: platform scan for discovery only ----------------------
     // Zero accounts is a valid start state — a client will register them

@@ -40,6 +40,19 @@ pub struct Config {
     pub base_url: Option<String>,
     /// Print the stored API token (from the OS credential store) and exit.
     pub show_token: bool,
+    /// Explicit API token. `None` (the default, and the CLI shape) reads/
+    /// mints the token through the OS credential store; `Some` takes this
+    /// value verbatim and never touches the store.
+    ///
+    /// Why the escape hatch exists: the OS credential store is an *environment*
+    /// dependency, not a logic one — on headless CI runners the keyring daemon
+    /// may be absent or only half-started, and the failure mode is nasty
+    /// precisely because the server has a session-token fallback while a
+    /// reader (a test probe, `--show-token` in another shell) sees "no token"
+    /// for as long as it keeps failing. Callers that already hold a token
+    /// (tests spinning the server in-process, embedders managing their own
+    /// secret) pass it here so both sides agree without asking the store.
+    pub token: Option<String>,
 }
 
 impl Default for Config {
@@ -53,6 +66,7 @@ impl Default for Config {
             media_export_dir: None,
             base_url: None,
             show_token: false,
+            token: None,
         }
     }
 }
