@@ -11,6 +11,8 @@ Two layers with different ownership:
 """
 
 from .client import (
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
     BadDate,
     Client,
     ClientError,
@@ -21,6 +23,8 @@ from .client import (
 )
 
 __all__ = [
+    "CONNECT_TIMEOUT",
+    "READ_TIMEOUT",
     "BadDate",
     "Client",
     "ClientError",
