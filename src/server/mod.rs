@@ -316,13 +316,40 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
 /// Replace the store with a freshly built index and re-baseline SSE
 /// subscribers: a client that connected while we were indexing received a
 /// `sync(0,0)` event and would otherwise never learn the real watermarks.
-fn install_index(store: &Arc<RwLock<Store>>, tx: &broadcast::Sender<Event>, st: Store) {
+/// Install a freshly built index — **only if the registration that asked for it
+/// is still current**. The epoch re-check lives inside the same write-lock
+/// critical section as the store swap: `deregister_account` clears the store
+/// under that same lock *after* bumping the epoch, so holding it here means
+/// the two orders (bump→clear→install vs install→bump→clear) can no longer
+/// interleave. Without this, an `init_account` whose `cancelled_in_build()`
+/// check passed a few instructions ago could still land its index into the
+/// just-emptied store — and then re-baseline every SSE subscriber from a
+/// phantom account that was already deregistered (regression:
+/// `cancelled_build_cannot_install_after_deregister`).
+/// Returns false = the build lost its race against a deregistration.
+///
+/// `cancelled` 是调用方带来的 epoch 判据闭包：这个 helper 同时被初始化路径与测试用，
+/// 把 AppState 拖进来只会让它更难组合，判据本身留在调用方。
+fn install_index(
+    store: &Arc<RwLock<Store>>,
+    tx: &broadcast::Sender<Event>,
+    st: Store,
+    cancelled: impl Fn() -> bool,
+) -> bool {
     let (wm_g, wm_c) = {
         let mut guard = store.write();
+        // 重验发生在**换锁临界区内**：注销先在锁外 bump epoch、再进同一把锁清空 store，
+        // 于是「先清空后安装」与「先安装后清空」两种交错都被这把锁挡住 —— 检查与交换
+        // 若分成两步，被取消的构建仍可能把索引落进刚清空的 store，并向所有订阅者广播
+        // 幽灵账号的水位。
+        if cancelled() {
+            return false;
+        }
         *guard = st;
         (guard.watermark_group, guard.watermark_c2c)
     };
     let _ = tx.send(Event::sync(wm_g, wm_c, chrono::Utc::now().timestamp()));
+    true
 }
 
 /// Insert or update one account's state entry, unconditionally.
@@ -671,11 +698,12 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
         let st = index::build_with(conn, nt_db_dir, &key_for_build)?;
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         // Cancelled during the build (decrypt + index is the slow part) —
-        // drop the freshly built index instead of installing it.
-        if cancelled_in_build() {
+        // drop the freshly built index instead of installing it. The check
+        // and the swap are one critical section inside install_index, so no
+        // deregistration can slip between them.
+        if !install_index(&store, &tx, st, cancelled_in_build) {
             return Ok(None);
         }
-        install_index(&store, &tx, st);
         Ok(Some((Arc::new(Mutex::new(reader)), count)))
     })
     .await;
@@ -1000,12 +1028,46 @@ mod tests {
         })
     }
 
+    /// 取消与安装的**互斥性**：epoch 重验发生在写锁临界区内（检查与交换不可分两步）。
+    ///
+    /// 时序钉法：主线程占住 store 的写锁（模拟「注销已 bump epoch、还没清空」的半途），
+    /// 安装线程此时必须被挡在锁外；主线程随后 bump 并放锁。若判据在**取锁前**求值
+    /// （被删除的两步写法），它会看到尚未 bump 的旧 epoch 放行自己，把索引落进
+    /// 刚被清空的 store 并向所有订阅者广播幽灵账号的水位。
+    #[test]
+    fn cancelled_build_cannot_install_after_deregister() {
+        let store = Arc::new(RwLock::new(Store::default()));
+        let (tx, _idle) = broadcast::channel::<Event>(16);
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(7));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        // 主线程占住写锁。
+        let guard = store.write();
+        let store2 = store.clone();
+        let tx2 = tx.clone();
+        let epoch2 = epoch.clone();
+        let builder = std::thread::spawn(move || {
+            let st = Store { watermark_group: 42, ..Store::default() };
+            let installed = install_index(&store2, &tx2, st, move || {
+                epoch2.load(Ordering::SeqCst) != 7
+            });
+            let _ = done_tx.send(installed);
+        });
+        // 让 builder 确实走到锁上排队，再演「注销发生」。
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        epoch.fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+        let installed = done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("builder settles");
+        builder.join().unwrap();
+        assert!(!installed, "重验必须在锁内：拿到锁时 epoch 已变，安装必须被拒");
+        assert_eq!(store.read().watermark_group, 0, "store 保持注销后的空态");
+    }
+
     #[tokio::test]
     async fn install_index_rebaselines_subscribers() {
         let store = Arc::new(RwLock::new(Store::default()));
         let (tx, mut rx) = broadcast::channel::<Event>(16);
         let st = Store { watermark_group: 42, watermark_c2c: 7, ..Store::default() };
-        install_index(&store, &tx, st);
+        install_index(&store, &tx, st, || false);
         assert_eq!(store.read().watermark_group, 42, "store replaced");
         let ev = rx.try_recv().expect("build completion broadcasts a sync baseline");
         assert_eq!(ev.event, "sync");
