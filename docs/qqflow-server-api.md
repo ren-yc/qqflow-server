@@ -162,6 +162,17 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 > **读端点只有 GET**：`messages`/`sessions`/`contacts`/`group-members`/`media/{id}`/`push/messages`
 > 的 POST 一律 **405**。动作端点（注册、同步）与免鉴权的 `/health` 保留两个方法。
 
+> **三个「上限」是三个不同的面，别互相换算**（文档里 200 与 10000 都出现过，混读会得出
+> 「两仓口径不一致」的错误结论——两仓的 HTTP 上限实际同为 10000）：
+>
+> | 数字 | 属于哪个面 | 含义 |
+> |---|---|---|
+> | **10000** | HTTP 的 `limit` / `page_size`（`sessions`／`contacts`／`group-members`／原生 `messages`）| 服务端对**单个请求返回条数**的硬上限，两仓相同；SDK 的 `list_all_sessions` 用它作页大小 |
+> | **200**（MCP）| MCP 工具参数 `limit`（`docs/mcp.md`）| **工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它与 HTTP 上限不构成矛盾，因为它是「模型经 MCP 取数据」这一层的自限 |
+> | **200**（导出）| `media=1` 的**每请求导出项上限**（见「媒体导出」小节）| 一次请求**最多触发 200 项媒体导出**，不是返回条数上限；超出的项保持未导出，`exported` 不为真 |
+>
+> 所以「联系人一次最多能拿多少」＝10000（HTTP），走 MCP 则被压到 200，而 `media=1` 的 200 与这两者**无关**。
+
 > v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（§3.2，WeFlow 形状）。
 
 ---

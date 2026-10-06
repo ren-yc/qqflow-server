@@ -80,6 +80,21 @@
   `media_precondition_errors_name_the_real_endpoint_not_prose`（含「本地拒绝不得发出任何请求」的计数断言）与
   `test_media_bytes_reject_an_empty_handle_without_a_request`（含纯空白句柄）。
 
+- **子集导出不再静默覆盖别的会话已交付的产物**（行为变化）：`export --session` 的**非续跑轮**此前把
+  文件名去重集合从空开始、编号按本轮输入重算，于是本轮会话能算出与某个**未在本轮**的会话已交付产物
+  同名的文件名，`.part` 收尾 rename 直接把它盖掉；而新一轮 `index.json` 又没有那个会话的条目 ⇒
+  交付物被换掉、清单不再提它、下一轮也无从自愈。现于 rename **之前**按**归属**判定并拒绝：既有产物
+  登记在别的会话名下、或没有被任何一轮清单认领时，该会话记入 `skipped`（起手前就拒，不发请求、
+  不留 `.part`），`skipped` 非空 ⇒ CLI 以 1 退出（沿用既有退出码口径，不新增码）。
+  **同会话的有意重导不算覆盖**——它覆盖的是自己的旧产物，判据用归属区分这两种情形；若一并拒绝，
+  「重跑同一个会话」就变成必须先手工删文件。回归位置：
+  `subset_export_refuses_to_clobber_another_sessions_artifact`、`intentional_rerun_of_same_session_overwrites_itself`、
+  `unowned_leftover_file_is_not_clobbered`。
+
+- **文档：三个「上限」的口径区分**（无行为变化）：`limit`/`page_size` 的 HTTP 硬上限是 **10000**（两仓相同），
+  MCP 工具层的 `limit` 上限 **200** 是另一个面，`media=1` 的**每请求导出项上限 200** 又是第三个面。
+  三者过去常被混读成「两仓文档口径不一致」，现于「端点」一节列出对照表。
+
 ### 新增
 
 - **两个 SDK 各补五项公共面（Rust 与 Python 同名同义）**：`sync_now()`（手动触发一次增量同步）、`pull_page(talker, since, offset, limit)`（**单页** Pull 入口，`drain_session` 改为复用它 ⇒ 游标装配从两处回到一处）、`chatlab_messages(...)`（ChatLab 形状的消息面，此前该面只被内部当触发导出用、没有公共入口）、`group_members(chatroom_id, include_message_counts)`、`list_all_sessions` 的关键词与页大小。
@@ -125,7 +140,6 @@
   `test_global_option_before_subcommand_still_gets_testing`、
   `test_features_after_double_dash_does_not_suppress_injection`、`test_merged_features_form_is_not_reinjected`、
   `test_package_selection_does_not_inject_root_only_feature`。
-
 ## [0.8.0] - 2026-10-04
 
 ### 变更
