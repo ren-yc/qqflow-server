@@ -38,9 +38,9 @@ QQFLOW_BASE_URL=http://127.0.0.1:6032 qqflow-server mcp
 | 工具 | 取数面 | 说明 |
 | --- | --- | --- |
 | `list_sessions` | 会话发现面 | 可选 `keyword`（服务端过滤）；返回 username / displayName / lastTimestamp / type / unreadCount |
-| `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextSince` 与 `nextOffset` |
+| `get_messages` | Pull 面 | ChatLab 形状、时间升序；游标 `nextSince`/`nextOffset`，另回 `sinceResolved`（本轮 `since` 的绝对下界） |
 | `get_messages_raw` | 原生消息面 | 带 `rawContent` / `isSend` / `localType` 与媒体元数据；按 `offset` 翻页 |
-| `search_messages` | ChatLab 消息面 | 会话内关键词检索；游标 `nextCursor` |
+| `search_messages` | ChatLab 消息面 | 会话内关键词检索；按 `offset` 翻页（游标 `nextOffset`） |
 | `get_contacts` | 联系人面 | 备注 / 昵称 / 别名只在这个面出现 |
 | `get_media` | —— | 只给句柄与访问地址，**不下发字节** |
 | `group_members` | 群成员面 | 名册与发言人的并集（潜水成员也会出现）；`messageCount` 是**条件键**（只在要求计数时出现，不是占位 0） |
