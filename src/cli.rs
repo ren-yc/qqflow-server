@@ -73,7 +73,7 @@ enum Command {
     /// 按关键词搜消息（`--keyword` 必填）
     Search(MessageArgs),
     /// 联系人列表（只走 HTTP：嵌入面没有联系人读面）
-    Contacts(HttpArgs),
+    Contacts(ContactsArgs),
     /// 账号明细：绑定方、状态机值、消息数、`error` 根因
     Accounts(HttpArgs),
     /// 让服务端立刻跑一次增量同步（写动作）
@@ -124,6 +124,20 @@ struct MessageArgs {
     /// 进程内直读本地库，不经过 HTTP（仅只读查询类可用）
     #[arg(long)]
     embedded: bool,
+}
+
+/// 联系人面的参数：分页语义与其它面一致（limit/offset 直接透传）。只有 HTTP
+/// 形态：联系人面没有进程内索引路径。
+#[derive(clap::Args)]
+struct ContactsArgs {
+    #[command(flatten)]
+    common: Common,
+    /// 单页条数（服务端上限 10000）
+    #[arg(long)]
+    limit: Option<u32>,
+    /// 起始偏移（翻页用）
+    #[arg(long)]
+    offset: Option<u64>,
 }
 
 /// 只有 HTTP 形态的子命令：刻意没有 `--embedded`（见模块头的边界说明）。
@@ -230,7 +244,11 @@ pub(crate) fn dispatch() -> Result<Entry> {
         }
         Command::Contacts(q) => {
             let client = http_client(&q.common)?;
-            let page = block(client.contacts(&ContactsQuery::default()))?;
+            let page = block(client.contacts(&ContactsQuery {
+                limit: q.limit,
+                offset: q.offset,
+                ..Default::default()
+            }))?;
             let rows: Vec<Value> = page
                 .contacts
                 .iter()
@@ -244,7 +262,11 @@ pub(crate) fn dispatch() -> Result<Entry> {
                     })
                 })
                 .collect();
-            emit(&Value::Array(rows), q.common.json, "contacts");
+            emit(
+                &json!({"total": page.total, "hasMore": page.has_more, "contacts": rows}),
+                q.common.json,
+                "contacts",
+            );
             Ok(Entry::Done)
         }
         Command::Messages(m) => {
@@ -327,7 +349,7 @@ fn run_messages(m: &MessageArgs) -> Result<Vec<Value>> {
     if m.embedded {
         return embedded_messages(m.talker.as_deref(), m.since.as_deref(), m.keyword.as_deref(), m.limit);
     }
-    let Some(talker) = m.talker.clone() else {
+    let Some(talker) = m.talker.clone().filter(|t| !t.trim().is_empty()) else {
         usage_error("HTTP 形态的 messages/search 需要 --talker（服务端按会话查询；要跨会话请配 --embedded）")
     };
     let client = http_client(&m.common)?;
@@ -426,9 +448,9 @@ fn embedded_messages(
 ) -> Result<Vec<Value>> {
     let index = embedded_index()?;
     let start = match since {
-        // 进程内形态只接受 unix 秒：YYYYMMDD 的换算规则（当天零点起、含整天）是服务端解析器定的，
-        // 在 CLI 里另写一份就是第二套规则。
-        Some(s) => s.parse::<i64>().with_context(|| format!("--since 需为 unix 秒: {s}"))?,
+        // 与 HTTP 分支共用同一套解析（to_unix）：YYYYMMDD 的换算规则只允许存在一份，
+        // 两份实现迟早给出不同的答案。
+        Some(s) => to_unix(s)?,
         None => 0,
     };
     let cap = limit.unwrap_or(200) as usize;
@@ -590,7 +612,9 @@ fn reused_dangling_handles(
 /// 而 `--since abc` 若只在后面手工解析就会退 1 —— 同一类「用法写错了」给出两种退出码，
 /// 脚本没法按码分流（`1` 是「连不上/被拒」那类可重试的运行期错误）。
 fn parse_since(s: &str) -> Result<String, String> {
-    to_unix(s).map(|_| s.to_string()).map_err(|e| format!("{e:#}"))
+    // 返回 trim 后的值：验证用 trim 后的串、原串却原样入库的话，一个带前导空白的
+    // `--since " 20250101"` 会以原样进查询参数，同一输入在两处得到两种行为。
+    to_unix(s).map(|_| s.trim().to_string()).map_err(|e| format!("{e:#}"))
 }
 
 /// 把 --since 转成 unix 秒。接受 unix 秒或 YYYYMMDD（后者取当天 00:00，与服务端对**下界**的

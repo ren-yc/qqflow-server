@@ -124,8 +124,8 @@ QQ 数据目录（nt_db 等）
 | `api` | 只读索引、同步句柄、事件类型、密钥类型、数据本身 | 有 semver 承诺；`#![deny(missing_docs)]` 只作用在这里 |
 | 其余模块 | 解析、存储、同步、服务层的实现 | 随时可变；仅 `--features testing` 下对集成测试可见 |
 
-严格地说，**「只有 `api`」是空 feature 树下的口径**：打开 `cli`／`server` 之后，根上还会多出几个
-**入口函数**（`run_cli`，以及 `run`／`serve_with_shutdown`）—— 它们是**二进制的入口**，不是给嵌入者的
+严格地说，**「只有 `api`」是空 feature 树下的口径**：打开 `cli`／`server` 之后，根上还会多出**入口函数**
+（`run_cli`）—— 它们是**二进制的入口**，不是给嵌入者的
 承诺面，签名里带的 `config::Config` 在默认构建下也不是公开可命名的类型。嵌入契约只约束**空 feature 树**，
 所以这一点不影响它；写在这里是为了让读到这句话的人知道：公开面在开 feature 之后**确实会变大**，
 而不是以为编译器只放出了 `api`。
@@ -141,7 +141,6 @@ QQ 数据目录（nt_db 等）
 | `cli`（默认）| 命令行子命令面：clap ＋ `qqflow-client` SDK（进而 reqwest／tokio）| 只剩「旗标」式老入口，没有子命令 |
 | `mcp`（默认）| MCP 工具面：`rmcp`（server／macros／transport-io）＋ `schemars`，stdio 上暴露只读工具 | 没有 `mcp` 子命令 |
 | `sync` | watcher 与水位线增量：tokio ＋ notify | 没有增量同步；`api::Sync` 随之消失 |
-| `media` | 媒体导出（外部 ffmpeg 在**运行时**探测，缺失则降级） | 没有导出与媒体代理 |
 | `testing` | 把实现面转成 `pub`（见上） | 集成测试够不着实现面 |
 
 **依赖面的实际约束**（可测，不是口号）：`--no-default-features` 的依赖树里**不含 axum、tokio、clap、SDK、rmcp 与 schemars**。
