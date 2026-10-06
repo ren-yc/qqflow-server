@@ -13,6 +13,7 @@ Two layers with different ownership:
 from .client import (
     CONNECT_TIMEOUT,
     READ_TIMEOUT,
+    STALL_TIMEOUT,
     BadDate,
     Client,
     ClientError,
@@ -20,11 +21,13 @@ from .client import (
     NotReady,
     ShapeError,
     StatusError,
+    TransportError,
 )
 
 __all__ = [
     "CONNECT_TIMEOUT",
     "READ_TIMEOUT",
+    "STALL_TIMEOUT",
     "BadDate",
     "Client",
     "ClientError",
@@ -32,4 +35,5 @@ __all__ = [
     "NotReady",
     "ShapeError",
     "StatusError",
+    "TransportError",
 ]
