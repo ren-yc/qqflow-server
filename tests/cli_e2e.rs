@@ -86,7 +86,13 @@ async fn sessions(axum::extract::RawQuery(q): axum::extract::RawQuery) -> Json<V
 async fn pull(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
     // map-talker：拉取面给**原始名**（photo.png），而消息面给回填名（digest.png，见 chatlab 分支），
     // 同一条消息 id——CLI 必须按消息 id 把导出物的句柄对回实际落盘的名字。
-    let messages = if id == "map-talker" {
+    let messages = if id == "gone-talker" {
+        // 同一个不可取句柄在**两个面**都出现：否则「删掉对账调用」的回归不会红
+        // （gone.png 从不出现在 Pull 输入里，对账逻辑无从触发）。
+        let mut m = pull_message();
+        m["media"] = json!({"fileName": "gone.png", "type": "image"});
+        vec![m]
+    } else if id == "map-talker" {
         let mut m = pull_message();
         m["media"] = json!({"fileName": "photo.png", "type": "image"});
         vec![m]
@@ -399,6 +405,7 @@ async fn with_media_skips_an_unfetchable_handle_without_failing() {
         .expect("应有 jsonl");
     let body = std::fs::read_to_string(&jsonl).unwrap();
     assert!(!body.contains("gone.png"), "没有字节的句柄不该写进导出物: {body}");
+    // 对账是承重的：两面都带这个句柄，删掉对账调用 ⇒ 本用例必红。
     let _ = std::fs::remove_dir_all(&dir);
 }
 
