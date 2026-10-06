@@ -347,6 +347,11 @@ fn usage_error(msg: &str) -> ! {
 /// 进程内形态可以省略（索引里所有会话都能翻）。
 fn run_messages(m: &MessageArgs) -> Result<Vec<Value>> {
     if m.embedded {
+        // None 是「跨全部会话」的合法语义；显式空串/纯空白不是 —— 它会变成一个
+        // 永远匹配不到的会话键，静默给出空结果退 0，与 HTTP 形态的用法错误不一致。
+        if m.talker.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            usage_error("--talker 不能是空串（要跨全部会话请省略 --talker）")
+        }
         return embedded_messages(m.talker.as_deref(), m.since.as_deref(), m.keyword.as_deref(), m.limit);
     }
     let Some(talker) = m.talker.clone().filter(|t| !t.trim().is_empty()) else {

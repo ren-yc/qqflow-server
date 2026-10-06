@@ -214,9 +214,12 @@ export class QqflowClient {
         }
       } catch (err) {
         if (signal?.aborted) return;
+        // Transport errors escalate here (the framing branches escalate at
+        // their own break points above); the doubling lives in one place per
+        // path so a single round is 2x, not 4x.
+        backoff = Math.min(backoff * 2, 30000);
       }
       await new Promise((r) => setTimeout(r, backoff));
-      backoff = Math.min(backoff * 2, 30000);
     }
   }
 }
