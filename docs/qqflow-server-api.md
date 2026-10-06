@@ -1303,7 +1303,7 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
   | `chatlab_messages(talker, …)` | `GET /chatlab/messages` | **ChatLab 形状面，一页语义**：升序、ChatLab type 码、`media` 在消息上、`count`/`page` 翻页、**没有 `success`**；查询参数与 `list_messages` 同一套（含 `keyword`） |
   | `contacts(query)` | `GET /api/v1/contacts` | **一页语义**；ChatLab 面完全不覆盖联系人 |
   | `list_all_sessions(page_size, keyword)` | `GET /api/v1/sessions` | **取尽语义**（内部翻页到空页），跨页重复折叠并告警；`keyword` 是**服务端过滤**（翻的是过滤后的列表，不是取回来再剪）；`page_size` 上限 10000 |
-  | `media_bytes(message)` | `GET /api/v1/media/{id}` | 从 ChatLab 消息取；404 后按「先 `media=1` 导出再取」自动重试一次 |
+  | `media_bytes(message, talker)` | `GET /api/v1/media/{id}` | 从 ChatLab 消息取；`talker` 是**会话 id**（不是 `accountName` 显示名）；404 后按「先 `media=1` 导出再取」自动重试一次 |
   | `media_bytes_by_id(id)` | `GET /api/v1/media/{id}` | 按**单段句柄**取（原生面的 `mediaId`，或 `mediaUrl` 末段）；不触发导出 |
   | `group_members(chatroom, include_message_counts)` | `GET /api/v1/group-members` | 成员集合＝**名册 ∪ 发言人**；`messageCount` 是**条件键**（只在要求计数时出现，不是占位 0）；计数开关关闭时不发参数；**空群号本地拒绝**（空名册会被读成「这个群没有成员」） |
   | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |

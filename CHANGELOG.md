@@ -4,6 +4,16 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 
+## [未发布]
+
+### 变更
+
+- **`clients/rust`（`qqflow-client`）与 `clients/python`（`qqflow-sdk`）的 `media_bytes` 增加 `talker` 参数（破坏性）**：
+  404 重试用的导出门需要**会话 id**，而此前用的是 `message.account_name`——那是发信人显示名，
+  私聊里它是对面昵称、群聊里是发信人昵称，与会话 id 只在「显示名恰好没被改过」时相同，真实数据几乎必然对不上。**迁移方式**：
+  `media_bytes(&message)` 改为 `media_bytes(&message, talker)`（Rust）/ `media_bytes(message, talker)`（Python），
+  `talker` 用发起导出时传给 ChatLab 面的同一个会话 id。`media_bytes_by_id(id)` 不受影响。
+
 ## [0.8.0] - 2026-10-04
 
 ### 变更
