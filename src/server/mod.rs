@@ -16,7 +16,6 @@ use anyhow::{Context, Result};
 use axum::Router;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use tokio::sync::broadcast;
 
 use crate::config;
 use crate::db;
@@ -139,65 +138,8 @@ pub fn bump_generation() -> u64 {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
 }
 
-/// One buffered SSE event (WeFlow contract: replay cap 1000, TTL 10 min).
-///
-/// **存的是原始事件，不是序列化后的载荷。** 载荷形状是**视图**的事：两个面对同一个事件有不同的
-/// 形状要求（WeFlow 兼容面发完整消息，ChatLab 面只发元信息）。存序列化结果的话，后加的那个面
-/// 重放时会吐出**另一个面的形状** —— 而且这种错在只连新面时看不出来。
-pub struct HistoryItem {
-    pub id: u64,
-    pub at: std::time::Instant,
-    pub event: crate::sync::events::Event,
-}
+pub use crate::sync::history::{EventBus, HistoryBuf, HistoryItem, Stamped};
 
-#[derive(Default)]
-pub struct HistoryBuf {
-    items: std::collections::VecDeque<HistoryItem>,
-    last_id: u64,
-}
-
-impl HistoryBuf {
-    pub const MAX: usize = 1000;
-    pub const TTL: std::time::Duration = std::time::Duration::from_secs(600);
-
-    /// Append an event and return its id (monotonic).
-    pub fn append(&mut self, event: crate::sync::events::Event) -> u64 {
-        self.last_id += 1;
-        self.items.push_back(HistoryItem {
-            id: self.last_id,
-            at: std::time::Instant::now(),
-            event,
-        });
-        while self.items.len() > Self::MAX {
-            self.items.pop_front();
-        }
-        self.last_id
-    }
-
-    /// Drop every buffered event while KEEPING the id counter.
-    ///
-    /// Used by deregistration: the buffered events describe an account that
-    /// no longer exists, so replaying them would hand a reconnecting client
-    /// messages the server can no longer serve. The counter must survive —
-    /// ids are what `Last-Event-ID` resumes from, so restarting at 1 would
-    /// leave a client holding `last-event-id: 500` silently receiving nothing
-    /// until the next 500 events had accumulated.
-    pub fn clear_items(&mut self) {
-        self.items.clear();
-    }
-
-    /// Events with id > `since`, still within the TTL window.
-    ///
-    /// 返回**事件本身** —— 由调用它的那个面决定怎么序列化（见 [`HistoryItem`] 的说明）。
-    pub fn replay_since(&self, since: u64) -> Vec<(u64, crate::sync::events::Event)> {
-        let now = std::time::Instant::now();
-        self.items
-            .iter()
-            .filter(|i| i.id > since && now.duration_since(i.at) < Self::TTL)
-            .map(|i| (i.id, i.event.clone()))
-            .collect()
-    }
-}
 
 /// Runtime per-account registration machinery (client-driven startup).
 pub struct AccountRegistry {
@@ -332,7 +274,7 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
 /// 把 AppState 拖进来只会让它更难组合，判据本身留在调用方。
 fn install_index(
     store: &Arc<RwLock<Store>>,
-    tx: &broadcast::Sender<Event>,
+    bus: &EventBus,
     st: Store,
     cancelled: impl Fn() -> bool,
 ) -> bool {
@@ -348,7 +290,7 @@ fn install_index(
         *guard = st;
         (guard.watermark_group, guard.watermark_c2c)
     };
-    let _ = tx.send(Event::sync(wm_g, wm_c, chrono::Utc::now().timestamp()));
+    bus.publish(Event::sync(wm_g, wm_c, chrono::Utc::now().timestamp()));
     true
 }
 
@@ -624,11 +566,11 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
         *guard = Store::default();
         (talkers, had_index)
     };
-    state.history.lock().clear_items();
+    state.bus.history().lock().clear_items();
     // 代号与清条目**同时**推进：客户端据此区分「注销后新账号刚开始」与「自己漏收了」。
     // 事件 id 计数器**不动** —— 见 `GENERATION` 的说明。
     bump_generation();
-    let _ = state.events.send(Event::sync(0, 0, chrono::Utc::now().timestamp()));
+    state.bus.publish(Event::sync(0, 0, chrono::Utc::now().timestamp()));
 
     // 4. Reset the account entry. A scanned account reverts to `awaiting_key`
     // and keeps its db_path (the platform will find it again next boot, so
@@ -679,7 +621,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
     };
 
     let store = state.store.clone();
-    let tx = state.events.clone();
+    let bus = state.bus.clone();
     let info_for_build = info.clone();
     let key_for_build = key.clone();
     let cancelled_in_build = cancelled.clone();
@@ -701,7 +643,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
         // drop the freshly built index instead of installing it. The check
         // and the swap are one critical section inside install_index, so no
         // deregistration can slip between them.
-        if !install_index(&store, &tx, st, cancelled_in_build) {
+        if !install_index(&store, &bus, st, cancelled_in_build) {
             return Ok(None);
         }
         Ok(Some((Arc::new(Mutex::new(reader)), count)))
@@ -719,7 +661,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
                 qq.clone(),
                 reader,
                 state.store.clone(),
-                state.events.clone(),
+                state.bus.clone(),
                 info.path.clone(),
                 watch_dir.clone(),
                 key.clone(),
@@ -860,7 +802,7 @@ pub async fn run_with_shutdown(
 
     // ---- state -----------------------------------------------------------
     let store = Arc::new(RwLock::new(Store::default()));
-    let (tx, _) = broadcast::channel::<Event>(1024);
+    let bus = EventBus::new(1024);
     // Scanned accounts are listed as awaiting keys; initialization is
     // entirely client-driven via POST /api/v1/accounts.
     let accounts_state = Arc::new(RwLock::new(
@@ -894,7 +836,7 @@ pub async fn run_with_shutdown(
     let base_url = Arc::new(derive_base_url(&cfg.host, cfg.port, cfg.base_url.as_deref()));
     let state = Arc::new(AppState {
         store: store.clone(),
-        events: tx.clone(),
+        bus: bus.clone(),
         accounts: accounts_state.clone(),
         ready: ready.clone(),
         token: Arc::new(token.clone()),
@@ -902,7 +844,6 @@ pub async fn run_with_shutdown(
         init: AccountRegistry::new(accounts, watch_cfg, shutdown_rx.clone()),
         export_root,
         base_url,
-        history: Arc::new(Mutex::new(HistoryBuf::default())),
         shutdown: shutdown_tx.clone(),
     });
     update_ready(&state);
@@ -962,7 +903,10 @@ pub async fn run_with_shutdown(
 /// 搬家之后那条 cfg 为什么是多余的）。
 pub struct AppState {
     pub store: Arc<RwLock<Store>>,
-    pub events: tokio::sync::broadcast::Sender<sync::Event>,
+    /// 进程级事件总线（weflow-server 同构）：重放历史 ＋ 广播通道，**绑成一件**。
+    /// 历史与通道必须成对：把裸 `Sender` 交给生产者，它就会忘记写历史 —— 而忘记的后果
+    /// （重放窗口里没有断线期间的事件）要等第一次重连才显形，见 `sync::history`。
+    pub bus: EventBus,
     /// One entry per loaded account: qq number -> readiness state.
     pub accounts: Arc<RwLock<Vec<crate::server::AccountState>>>,
     /// True once all account indexes are built.
@@ -979,8 +923,7 @@ pub struct AppState {
     pub export_root: Arc<std::path::PathBuf>,
     /// Base URL for exported media links (`http://{host}:{port}`).
     pub base_url: Arc<String>,
-    /// SSE replay history for Last-Event-ID (1000 items / 10 min TTL).
-    pub history: Arc<parking_lot::Mutex<crate::server::HistoryBuf>>,
+
     /// Shutdown broadcast. Live SSE streams subscribe so they can end
     /// themselves rather than holding the graceful drain open for the whole
     /// grace period.
@@ -1001,7 +944,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Arc::new(AppState {
             store: Arc::new(RwLock::new(Store::default())),
-            events: broadcast::channel::<Event>(16).0,
+            bus: EventBus::new(16),
             accounts: Arc::new(RwLock::new(
                 accounts
                     .iter()
@@ -1023,7 +966,6 @@ mod tests {
             ),
             export_root: Arc::new(std::path::PathBuf::from(".")),
             base_url: Arc::new("http://127.0.0.1:5032".into()),
-            history: Arc::new(Mutex::new(HistoryBuf::default())),
             shutdown: shutdown_tx,
         })
     }
@@ -1037,17 +979,17 @@ mod tests {
     #[test]
     fn cancelled_build_cannot_install_after_deregister() {
         let store = Arc::new(RwLock::new(Store::default()));
-        let (tx, _idle) = broadcast::channel::<Event>(16);
+        let bus = EventBus::new(16);
         let epoch = Arc::new(std::sync::atomic::AtomicU64::new(7));
         let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
         // 主线程占住写锁。
         let guard = store.write();
         let store2 = store.clone();
-        let tx2 = tx.clone();
+        let bus2 = bus.clone();
         let epoch2 = epoch.clone();
         let builder = std::thread::spawn(move || {
             let st = Store { watermark_group: 42, ..Store::default() };
-            let installed = install_index(&store2, &tx2, st, move || {
+            let installed = install_index(&store2, &bus2, st, move || {
                 epoch2.load(Ordering::SeqCst) != 7
             });
             let _ = done_tx.send(installed);
@@ -1065,11 +1007,12 @@ mod tests {
     #[tokio::test]
     async fn install_index_rebaselines_subscribers() {
         let store = Arc::new(RwLock::new(Store::default()));
-        let (tx, mut rx) = broadcast::channel::<Event>(16);
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
         let st = Store { watermark_group: 42, watermark_c2c: 7, ..Store::default() };
-        install_index(&store, &tx, st, || false);
+        install_index(&store, &bus, st, || false);
         assert_eq!(store.read().watermark_group, 42, "store replaced");
-        let ev = rx.try_recv().expect("build completion broadcasts a sync baseline");
+        let ev = rx.try_recv().expect("build completion broadcasts a sync baseline").event;
         assert_eq!(ev.event, "sync");
         assert_eq!(ev.last_rowid_group, Some(42));
         assert_eq!(ev.last_rowid_c2c, Some(7));
@@ -1261,7 +1204,7 @@ mod tests {
         }
         update_ready(&state);
         assert!(state.ready.load(Ordering::SeqCst));
-        let mut rx = state.events.subscribe();
+        let mut rx = state.bus.subscribe();
 
         let outcome = deregister_account(&state, "10001", false);
         assert_eq!(
@@ -1278,7 +1221,7 @@ mod tests {
         assert!(bound_account(&state.accounts.read()).is_none(), "nothing bound");
 
         // Subscribers are told their watermarks went back to zero.
-        let ev = rx.try_recv().expect("deregistration broadcasts a reset baseline");
+        let ev = rx.try_recv().expect("deregistration broadcasts a reset baseline").event;
         assert_eq!(ev.event, "sync");
         assert_eq!(ev.last_rowid_group, Some(0));
         assert_eq!(ev.last_rowid_c2c, Some(0));
@@ -1296,7 +1239,7 @@ mod tests {
         let info = DbInfo { qq: "10001".into(), path: std::path::PathBuf::from("C:\\x\\nt_msg.db") };
         let state = Arc::new(AppState {
             store: Arc::new(RwLock::new(Store::default())),
-            events: broadcast::channel::<Event>(16).0,
+            bus: EventBus::new(16),
             accounts: Arc::new(RwLock::new(vec![AccountState {
                 qq: "10001".into(),
                 state: AccountStatus::Ready,
@@ -1313,7 +1256,6 @@ mod tests {
             ),
             export_root: Arc::new(std::path::PathBuf::from(".")),
             base_url: Arc::new("http://127.0.0.1:5032".into()),
-            history: Arc::new(Mutex::new(HistoryBuf::default())),
             shutdown: shutdown_tx,
         });
 

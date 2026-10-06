@@ -15,6 +15,7 @@
 //! the parser and emitted as `message.revoke`.
 
 pub mod events;
+pub mod history;
 pub mod watch;
 
 use std::path::PathBuf;
@@ -23,13 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::broadcast;
 
 use crate::db::live::LiveReader;
 use crate::parser::types::{ChatType, MsgType};
 use crate::store::index;
 use crate::store::query::MessageOut;
 use crate::store::Store;
+use crate::sync::history::EventBus;
 
 pub use events::Event;
 
@@ -41,10 +42,14 @@ pub struct AccountSync {
     pub qq: String,
     pub reader: Arc<Mutex<LiveReader>>,
     pub store: Arc<RwLock<Store>>,
-    /// 内部事件总线。服务层的 SSE 直接订阅它 —— **这不是承诺面**：它要求调用方用 tokio 的
-    /// `broadcast` 并处理 `RecvError::Lagged`，而嵌入者不该被绑到这两件事上（见
-    /// [`crate::api::Sync::drain_events`]）。
-    pub(crate) tx: broadcast::Sender<Event>,
+    /// 内部事件总线（重放历史 ＋ 广播通道）。服务层的 SSE 直接订阅它 —— **这不是承诺面**：
+    /// 它要求调用方用 tokio 的 `broadcast` 并处理 `RecvError::Lagged`，而嵌入者不该被绑到这两件
+    /// 事上（见 [`crate::api::Sync::drain_events`]）。
+    ///
+    /// 发布只走 `publish`：**历史由生产者在广播前单点写入**。订阅端各自 append 会让事件 id
+    /// 随在线连接数跳号、把同一条塞进缓冲多次，而零订阅者时广播根本没人接 —— 那段事件就永远
+    /// 不在重放窗口里（回归：`sse_history_is_recorded_once_without_subscribers`）。
+    pub(crate) bus: EventBus,
     /// Set when a sync failed; the poll loop then retries even though the
     /// reader state is unchanged.
     retry: AtomicBool,
@@ -70,7 +75,7 @@ impl AccountSync {
         qq: String,
         reader: Arc<Mutex<LiveReader>>,
         store: Arc<RwLock<Store>>,
-        tx: broadcast::Sender<Event>,
+        bus: EventBus,
         db_path: PathBuf,
         db_dir: PathBuf,
         key: String,
@@ -79,7 +84,7 @@ impl AccountSync {
             qq,
             reader,
             store,
-            tx,
+            bus,
             retry: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             db_path,
@@ -290,7 +295,7 @@ impl AccountSync {
             (events, outs)
         };
         for ev in events {
-            let _ = self.tx.send(ev);
+            self.bus.publish(ev);
         }
         Ok(outs)
     }

@@ -38,10 +38,10 @@ fn state_with_scanned(
     ready: bool,
     scanned: Vec<qqflow_server::db::scan::DbInfo>,
 ) -> Arc<AppState> {
-    let (tx, _) = tokio::sync::broadcast::channel(1024);
+
     Arc::new(AppState {
         store: Arc::new(RwLock::new(store)),
-        events: tx,
+        bus: qqflow_server::sync::history::EventBus::new(1024),
         accounts: Arc::new(RwLock::new(Vec::new())),
         ready: Arc::new(AtomicBool::new(ready)),
         token: Arc::new("test-token-123456".into()),
@@ -55,7 +55,6 @@ fn state_with_scanned(
             std::env::temp_dir().join(format!("qqflow_smoke_export_{}", unique_suffix())),
         ),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     })
 }

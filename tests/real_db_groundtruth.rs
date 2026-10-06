@@ -312,7 +312,7 @@ async fn fake_db_group_members_is_roster_union_senders() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         store: Arc::new(parking_lot::RwLock::new(store)),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        bus: qqflow_server::sync::history::EventBus::new(16),
         accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         token: Arc::new("test-token".into()),
@@ -320,7 +320,6 @@ async fn fake_db_group_members_is_roster_union_senders() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_members_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
@@ -445,7 +444,7 @@ async fn fake_db_media_endpoint_serves_bytes() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         store: Arc::new(parking_lot::RwLock::new(store)),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        bus: qqflow_server::sync::history::EventBus::new(16),
         accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         token: Arc::new("test-token".into()),
@@ -453,7 +452,6 @@ async fn fake_db_media_endpoint_serves_bytes() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
@@ -540,7 +538,7 @@ async fn fake_db_media_fallback_registers_and_serves() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         store: Arc::new(parking_lot::RwLock::new(store)),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        bus: qqflow_server::sync::history::EventBus::new(16),
         accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         token: Arc::new("test-token".into()),
@@ -548,7 +546,6 @@ async fn fake_db_media_fallback_registers_and_serves() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
@@ -641,7 +638,7 @@ async fn fake_db_media_export_serves_exported_bytes() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
         store: Arc::new(parking_lot::RwLock::new(store)),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16).0,
+        bus: qqflow_server::sync::history::EventBus::new(16),
         accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         token: Arc::new("test-token".into()),
@@ -649,7 +646,6 @@ async fn fake_db_media_export_serves_exported_bytes() {
         init: AccountRegistry::new(Vec::new(), qqflow_server::sync::watch::WatchConfig::default(), shutdown_rx),
         export_root: Arc::new(export_root.clone()),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());
@@ -751,12 +747,13 @@ fn manual_sync_picks_up_new_rows() {
     ));
     reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
+    let bus = qqflow_server::sync::history::EventBus::new(16);
+    let mut rx = bus.subscribe();
     let account = qqflow_server::sync::AccountSync::new(
         FAKE_QQ.into(),
         reader,
         store,
-        tx,
+        bus,
         fake_db_path(),
         fake_db_path().parent().unwrap().to_path_buf(),
         FAKE_KEY.into(),
@@ -794,7 +791,7 @@ fn manual_sync_picks_up_new_rows() {
     assert_eq!(second[0].sender_name, "张三群名片", "incremental rows too");
 
     // The new row must also be broadcast as an SSE event.
-    let ev = rx.try_recv().unwrap();
+    let ev = rx.try_recv().unwrap().event;
     assert_eq!(ev.event, "message.new");
     assert_eq!(ev.content, "手动同步新增");
     // SSE `sourceName` and the response row's `senderName` are the same
@@ -822,12 +819,12 @@ fn failed_sync_leaves_store_untouched() {
     ));
     reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
-    let (tx, _rx) = tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(16);
+    let bus = qqflow_server::sync::history::EventBus::new(16);
     let account = qqflow_server::sync::AccountSync::new(
         FAKE_QQ.into(),
         reader,
         store.clone(),
-        tx,
+        bus,
         fake_db_path(),
         fake_db_path().parent().unwrap().to_path_buf(),
         FAKE_KEY.into(),
@@ -885,7 +882,7 @@ async fn client_registers_account_with_key_and_db_path() {
 
     let state = Arc::new(AppState {
         store: Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default())),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(64).0,
+        bus: qqflow_server::sync::history::EventBus::new(64),
         accounts: Arc::new(parking_lot::RwLock::new(vec![AccountState {
             qq: FAKE_QQ.into(),
             state: AccountStatus::AwaitingKey,
@@ -902,7 +899,6 @@ async fn client_registers_account_with_key_and_db_path() {
         ),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_fake_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());

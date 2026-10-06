@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use qqflow_server::db::live::LiveReader;
 use qqflow_server::sync::watch::{self, WatchConfig};
-use qqflow_server::sync::{AccountSync, Event};
+use qqflow_server::sync::AccountSync;
 
 mod common;
 use common::{FAKE_KEY, FAKE_QQ, write_fake_source};
@@ -26,14 +26,15 @@ async fn watch_event_drives_sse_push() {
     let src = nt_db.join("nt_msg.db");
 
     let store = Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<Event>(64);
+    let bus = qqflow_server::sync::history::EventBus::new(64);
+    let mut rx = bus.subscribe();
     let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
     let account = Arc::new(AccountSync::new(
         FAKE_QQ.into(),
         reader,
         store,
-        tx,
+        bus,
         src.clone(),
         nt_db.clone(),
         FAKE_KEY.into(),
@@ -61,7 +62,8 @@ async fn watch_event_drives_sse_push() {
     let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("watch-driven SSE event within 5 s")
-        .unwrap();
+        .unwrap()
+        .event;
     assert_eq!(ev.event, "message.new");
     assert!(ev.content.contains("事件驱动新增"), "got: {}", ev.content);
 
@@ -89,14 +91,14 @@ fn fallback_changed_detects_wal_writes() {
     let src = nt_db.join("nt_msg.db");
 
     let store = Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
-    let (tx, _rx) = tokio::sync::broadcast::channel::<Event>(64);
+    let bus = qqflow_server::sync::history::EventBus::new(64);
     let reader = Arc::new(parking_lot::Mutex::new(LiveReader::new(src.clone(), FAKE_KEY.into())));
     reader.lock().open().unwrap();
     let account = Arc::new(AccountSync::new(
         FAKE_QQ.into(),
         reader,
         store,
-        tx,
+        bus,
         src.clone(),
         nt_db.clone(),
         FAKE_KEY.into(),
@@ -143,7 +145,7 @@ async fn deregister_stops_the_watch_task() {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(qqflow_server::server::AppState {
         store: Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default())),
-        events: tokio::sync::broadcast::channel::<Event>(256).0,
+        bus: qqflow_server::sync::history::EventBus::new(256),
         accounts: Arc::new(parking_lot::RwLock::new(Vec::new())),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         token: Arc::new("test-token-123456".into()),
@@ -158,7 +160,6 @@ async fn deregister_stops_the_watch_task() {
         ),
         export_root: Arc::new(dir.join("export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: shutdown_tx,
     });
     let app = qqflow_server::server::build_router(state.clone());
@@ -180,12 +181,12 @@ async fn deregister_stops_the_watch_task() {
 
     // Prove the watch is live first, so the negative assertion below cannot
     // pass just because the plumbing never worked.
-    let mut rx = state.events.subscribe();
+    let mut rx = state.bus.subscribe();
     common::append_group_row(&writer, 7, "注销前新增-7");
     common::materialize_source(&nt_db);
     let ev = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let ev = rx.recv().await.unwrap();
+            let ev = rx.recv().await.unwrap().event;
             if ev.event == "message.new" {
                 return ev;
             }
@@ -208,13 +209,13 @@ async fn deregister_stops_the_watch_task() {
 
     // A fresh subscriber, so the reset baseline the deregistration already
     // broadcast is not in this receiver's queue.
-    let mut rx = state.events.subscribe();
+    let mut rx = state.bus.subscribe();
     common::append_group_row(&writer, 8, "注销后新增-8");
     common::materialize_source(&nt_db);
     // 2 s is ~20x the debounce: a surviving watcher would have fired by now.
     let leaked = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let ev = rx.recv().await.unwrap();
+            let ev = rx.recv().await.unwrap().event;
             if ev.event == "message.new" {
                 return ev;
             }

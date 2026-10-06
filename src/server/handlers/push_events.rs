@@ -128,14 +128,13 @@ fn sync_payload(ev: &Event) -> serde_json::Value {
 
 /// 组装 SSE 响应。`serialize` 决定帧的形状，其余部分是两面的公共部分。
 pub(crate) fn sse_from(state: Arc<AppState>, last_id: u64, serialize: Serializer) -> impl IntoResponse {
-    let replay = state.history.lock().replay_since(last_id);
-    let rx = state.events.subscribe();
+    let replay = state.bus.history().lock().replay_since(last_id);
+    let rx = state.bus.subscribe();
     let (wm_g, wm_c) = {
         let store = state.store.read();
         (store.watermark_group, store.watermark_c2c)
     };
     let now = chrono::Utc::now().timestamp();
-    let history = state.history.clone();
     // An SSE stream never ends on its own, so it would hold graceful shutdown
     // open for the whole grace period. Watching the shutdown channel lets the
     // stream close itself and the drain finish promptly.
@@ -178,8 +177,9 @@ pub(crate) fn sse_from(state: Arc<AppState>, last_id: u64, serialize: Serializer
                     None => break,
                 },
             };
-            let ev = match item {
-                Ok(ev) => ev,
+            // 生产者已单点写入历史并分配 id；这里只消费，不再 append、不再编号。
+            let (id, ev) = match item {
+                Ok(stamped) => (stamped.id, stamped.event),
                 Err(_lagged) => {
                     // Subscriber fell behind: re-sync from the CURRENT
                     // watermarks. No history id — this frame is specific to
@@ -199,7 +199,6 @@ pub(crate) fn sse_from(state: Arc<AppState>, last_id: u64, serialize: Serializer
                     continue;
                 }
             };
-            let id = history.lock().append(ev.clone());
             let (name, payload) = serialize(ev);
             yield Ok(SseEvent::default()
                 .id(id.to_string())

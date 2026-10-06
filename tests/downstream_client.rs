@@ -73,7 +73,7 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
 
     let state = Arc::new(AppState {
         store: Arc::new(RwLock::new(qqflow_server::store::Store::default())),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(1024).0,
+        bus: qqflow_server::sync::history::EventBus::new(1024),
         accounts: Arc::new(RwLock::new(Vec::new())),
         ready: Arc::new(AtomicBool::new(false)),
         token: Arc::new(TEST_TOKEN.into()),
@@ -85,7 +85,6 @@ fn build_real_app() -> Option<(axum::Router, Arc<AppState>, String, String, Stri
         ),
         export_root: Arc::new(std::env::temp_dir().join("qqflow_client_export")),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(parking_lot::Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     });
     let app = build_router(state.clone());

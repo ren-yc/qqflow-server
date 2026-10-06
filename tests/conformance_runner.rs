@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, Request};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -48,7 +48,7 @@ fn contract_dir() -> Option<std::path::PathBuf> {
 fn app_state(export_root: std::path::PathBuf) -> Arc<AppState> {
     Arc::new(AppState {
         store: Arc::new(RwLock::new(qqflow_server::store::Store::default())),
-        events: tokio::sync::broadcast::channel::<qqflow_server::sync::Event>(1024).0,
+        bus: qqflow_server::sync::history::EventBus::new(1024),
         accounts: Arc::new(RwLock::new(Vec::new())),
         ready: Arc::new(AtomicBool::new(false)),
         token: Arc::new(TOKEN.into()),
@@ -60,7 +60,6 @@ fn app_state(export_root: std::path::PathBuf) -> Arc<AppState> {
         ),
         export_root: Arc::new(export_root),
         base_url: Arc::new("http://127.0.0.1:5032".into()),
-        history: Arc::new(Mutex::new(Default::default())),
         shutdown: tokio::sync::watch::channel(false).0,
     })
 }

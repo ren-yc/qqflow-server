@@ -171,7 +171,7 @@ impl Index {
 pub struct Sync {
     inner: crate::sync::AccountSync,
     store: Arc<RwLock<Store>>,
-    rx: tokio::sync::broadcast::Receiver<crate::sync::Event>,
+    rx: tokio::sync::broadcast::Receiver<crate::sync::history::Stamped>,
 }
 
 #[cfg(feature = "sync")]
@@ -194,12 +194,13 @@ impl Sync {
         // 因为后面还要靠它做增量。
         let (reader, st) = crate::store::index::open_reader_and_build(db_path, key)?;
         let store = Arc::new(RwLock::new(st));
-        let (tx, rx) = tokio::sync::broadcast::channel(1024);
+        let bus = crate::sync::history::EventBus::new(1024);
+        let rx = bus.subscribe();
         let inner = crate::sync::AccountSync::new(
             qq.to_string(),
             Arc::new(parking_lot::Mutex::new(reader)),
             store.clone(),
-            tx,
+            bus,
             db_path.to_path_buf(),
             db_dir,
             key.to_string(),
@@ -234,7 +235,7 @@ impl Sync {
         let mut out = Vec::new();
         loop {
             match self.rx.try_recv() {
-                Ok(ev) => out.push(ev),
+                Ok(stamped) => out.push(stamped.event),
                 // `Lagged` 说明调用方太慢，中间的事件已被丢弃 —— 剩下的仍然取走。
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(_) => break,
