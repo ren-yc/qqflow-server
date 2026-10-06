@@ -278,19 +278,24 @@ fn install_index(
     st: Store,
     cancelled: impl Fn() -> bool,
 ) -> bool {
-    let (wm_g, wm_c) = {
-        let mut guard = store.write();
-        // 重验发生在**换锁临界区内**：注销先在锁外 bump epoch、再进同一把锁清空 store，
-        // 于是「先清空后安装」与「先安装后清空」两种交错都被这把锁挡住 —— 检查与交换
-        // 若分成两步，被取消的构建仍可能把索引落进刚清空的 store，并向所有订阅者广播
-        // 幽灵账号的水位。
-        if cancelled() {
-            return false;
-        }
-        *guard = st;
-        (guard.watermark_group, guard.watermark_c2c)
-    };
+    let mut guard = store.write();
+    // 重验、换 store、基线发布**同在这一把写锁的临界区内**：注销的顺序是「锁外 bump
+    // epoch → 锁内清空 store → 清历史 → 广播 reset」。发布若在锁外（曾经如此），交错
+    // 「install 放锁 → deregister 完整执行（清历史、bump 代号、广播 reset）→ install 才
+    // 发布」就会把已取消账号的基线**追加在 reset 之后** —— `clear_items` 保留 id 计数器，
+    // 幽灵基线拿到更大的新 id、盖着注销后的新代号，看起来像个合法的新事件，客户端无从
+    // 识别。锁内发布则两种交错都被挡住：要么 install 先完成（deregister 随后的清历史把
+    // 它连基线一起清掉，终态干净），要么 epoch 重验先失败（根本不发布）。
+    // 锁序为 store→history 单向：注销侧拿历史锁时不持 store，订阅端读历史时也不持 store，
+    // 不存在反向嵌套，不会死锁。
+    if cancelled() {
+        return false;
+    }
+    *guard = st;
+    let (wm_g, wm_c) = (guard.watermark_group, guard.watermark_c2c);
+    // publish 就在这把 store 写锁仍被持有时发出：guard 直到本函数返回才 drop。
     bus.publish(Event::sync(wm_g, wm_c, chrono::Utc::now().timestamp()));
+    drop(guard);
     true
 }
 
@@ -551,12 +556,16 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
         w.abort();
     }
 
-    // 2. Invalidate any in-flight initialization.
-    state.init.epoch.fetch_add(1, Ordering::SeqCst);
-
-    // 3. Drop the index, collecting the talkers to purge while we still can.
+    // 2. Invalidate any in-flight initialization **并清空索引 —— 两者在同一把 store 写锁
+    //    的临界区内完成**。bump 若留在锁外（本函数曾经的形态）：一个在 bump 之后才开始、
+    //    读到新 epoch 的新注册，其 install 可能赶在清空之前拿到写锁装入索引，而它随后
+    //    set_account_state_if_current 用的正是这个新 epoch、照常通过 ⇒ 账号 Ready 但
+    //    store 是空的。bump 与清空同临界区后，这种新注册要么在锁前拿到（旧 epoch 被拒），
+    //    要么在锁后（清空已完成，装入的是自己的新索引），不存在半途交错。
+    //    install_index 的基线发布也在同一把锁内（见其注释）。
     let (talkers, index_cleared) = {
         let mut guard = state.store.write();
+        state.init.epoch.fetch_add(1, Ordering::SeqCst);
         let talkers: Vec<String> = if purge_media {
             guard.convs.values().map(|c| c.talker.clone()).collect()
         } else {
@@ -566,6 +575,9 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
         *guard = Store::default();
         (talkers, had_index)
     };
+    // 清重放条目排在**清空索引之后**：install_index 的基线发布也在 store 写锁内，
+    // 两种交错都被锁挡住（要么 install 先完成、这里连它的基线一起清掉，要么 install
+    // 被 epoch 重验拒掉、根本没发布）—— 幽灵基线不可能留在归零基线之后。
     state.bus.history().lock().clear_items();
     // 代号与清条目**同时**推进：客户端据此区分「注销后新账号刚开始」与「自己漏收了」。
     // 事件 id 计数器**不动** —— 见 `GENERATION` 的说明。
@@ -1002,6 +1014,10 @@ mod tests {
         builder.join().unwrap();
         assert!(!installed, "重验必须在锁内：拿到锁时 epoch 已变，安装必须被拒");
         assert_eq!(store.read().watermark_group, 0, "store 保持注销后的空态");
+        assert!(
+            bus.history().lock().replay_since(0).is_empty(),
+            "被拒的安装也不得留下幽灵基线 —— 发布与换库在同一临界区",
+        );
     }
 
     #[tokio::test]
