@@ -1,9 +1,10 @@
 [package]
 name = "qqflow-server"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "Headless HTTP API + SSE service for reading local QQ NT chat records (WeFlow-compatible interface)"
 license = "MIT"
+repository = "https://github.com/ren-yc/qqflow-server"
 
 [dependencies]
 anyhow = "1"
@@ -39,7 +40,7 @@ utoipa = { optional = true, version = "6", features = ["axum_extras"] }
 clap = { version = "4", optional = true, default-features = false, features = ["std", "env", "help", "usage", "error-context", "derive"] }
 # CLI 通过 HTTP 访问服务，因此**复用同工作区的 Rust SDK**，而不是在服务端 crate 里再手写
 # 一份 HTTP —— 两份实现的失败模式是漂移，而只有 SDK 那份被契约测试钉住。
-qqflow-client = { path = "clients/rust", optional = true }
+qqflow-client = { path = "clients/rust", version = "0.9.0", optional = true }
 # MCP 工具面。default-features = false 加自选 feature：rmcp 的默认 feature 会带进 HTTP
 # 传输层与 reqwest/tower，而本面只在 stdio 上跑 server/macros。
 rmcp = { version = "3.5", optional = true, default-features = false, features = ["server", "macros", "transport-io"] }
