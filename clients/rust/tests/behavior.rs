@@ -23,6 +23,10 @@ struct Mock {
     pull_queries: Arc<StdMutex<Vec<String>>>,
     media_calls: Arc<StdMutex<Vec<String>>>,
     media_bytes: Arc<StdMutex<Option<Vec<u8>>>>,
+    // When set, the media route answers 302 with this Location once (then
+    // clears itself) — the "first hit is a redirect" fixture: a proxy or
+    // gateway that 302s the old address must not turn into silent success.
+    media_redirect: Arc<StdMutex<Option<String>>>,
     chatlab_page: Arc<StdMutex<Option<serde_json::Value>>>,
     // When set, the chatlab export route rejects any query whose `talker`
     // differs - the retry must ask for the session id, not
@@ -227,6 +231,16 @@ async fn media_route(
 ) -> Response {
     assert_bearer(&headers);
     mock.media_calls.lock().unwrap().push(id);
+    // 「首击即 3xx」夹具：槽位非空时本请求以 302 应答（Location 指向自身路径），
+    // 然后清槽 —— 下一次请求走正常字节路径。reqwest 默认跟随重定向，
+    // 所以「跟随后的语义（拿到目标字节）」与「无 Location 时的错误分类」各有一条断言。
+    if let Some(loc) = mock.media_redirect.lock().unwrap().take() {
+        return axum::response::Response::builder()
+            .status(StatusCode::FOUND)
+            .header(axum::http::header::LOCATION, loc)
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
     // First call misses, and the miss itself mints the file - modeling the
     // export that the client is about to trigger via the chatlab face.
     let bytes = {
@@ -244,7 +258,6 @@ async fn media_route(
         None => (StatusCode::NOT_FOUND, "media not exported").into_response(),
     }
 }
-
 async fn messages_route(
     State(mock): State<Mock>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
@@ -1203,3 +1216,26 @@ async fn media_bytes_by_id_fetches_a_single_segment_handle() {
         "one GET, no export side door: this call fetches a handle it was given"
     );
 }
+
+/// ② 302 无 Location ⇒ 跟随不可能发生，响应按非 2xx 归 `Status` —— 绝不 Ok。
+#[tokio::test]
+async fn media_bytes_by_id_follows_a_first_hit_redirect_to_the_target_bytes() {
+    let mock = Mock::default();
+    // 同一路径：首击 302（清槽后第二次走正常字节路径）。
+    *mock.media_redirect.lock().unwrap() = Some("/api/v1/media/abc123.png".to_string());
+    *mock.media_bytes.lock().unwrap() = Some(b"png-bytes".to_vec());
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let bytes = client
+        .media_bytes_by_id("abc123.png")
+        .await
+        .expect("302 跟随后必须拿到目标字节");
+    assert_eq!(bytes.as_ref(), b"png-bytes");
+    // 两次请求都有记录：首击（302）＋跟随（200）。
+    assert_eq!(
+        mock.media_calls.lock().unwrap().clone(),
+        vec!["abc123.png", "abc123.png"],
+        "跟随重定向必须是第二次真实请求"
+    );
+}
+
