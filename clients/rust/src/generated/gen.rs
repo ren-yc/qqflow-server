@@ -650,6 +650,21 @@ same mapping out of /api/v1/contacts + /api/v1/group-members.*/
         pub group_nickname: ::std::string::String,
         #[serde(skip_serializing_if = "::std::option::Option::is_none")]
         pub media: ::std::option::Option<MediaBrief>,
+        /**本条消息的媒体**此刻就能取字节**时给出的句柄（`GET /api/v1/media/{id}`）。
+
+「出现即可取」是承诺而非尽力而为：判据与各面**同一条**（store 登记过这条媒体的本地缓存
+路径才算，见 `store::query::fetchable_media_id`）；不成立时**整个键省略**而不是给 `null`
+—— 通告一个必 404 的 id 比不给更坏：调用方拿到 404 只会以为服务坏了，而它无从区分。
+QQ 会清理媒体缓存：缓存里的文件没了，这个键就跟着消失（原生面与 SSE 同理）。
+
+它在**消息这一层**而不在 `media` 对象里：`media` 的键集由契约钉死为
+`{type, fileName, md5}`（`media_shape_in_pull` 拒绝多余键）；而 `fileName` 是元数据名，
+「有名字」与「取得到」是两件事，塞进同一个键会把它们混谈。*/
+        #[serde(
+            rename = "mediaId",
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub media_id: ::std::option::Option<::std::string::String>,
         #[serde(rename = "platformMessageId")]
         pub platform_message_id: ::std::string::String,
         #[serde(

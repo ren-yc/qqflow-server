@@ -883,6 +883,57 @@ async fn media_id_omitted_when_store_has_no_entry() {
     assert!(m0["mediaId"].is_null(), "mediaId omitted when not fetchable");
 }
 
+/// 拉取面的 `mediaId`：与原生面**同一条**可取性规则（store 登记过本地缓存路径才通告），
+/// 且**只有**在 `media` 键也出现时才出现。两侧都要钉：
+///
+/// · 正向 —— 登记在位时，拉取面带媒体那一行给出 `mediaId`，且该句柄经字节路由**真的取得到**
+///   （「出现即可取」不能只是一句注释）。
+/// · 反向 —— 清空登记表后同一页：`media` 键仍在（元数据与可取是两件事），`mediaId` 必须
+///   **整个消失**（不是 `null`）。漏掉这一侧的后果是：客户端拿一个必 404 的句柄，而它无从
+///   区分「本来就不可取」与「服务坏了」。
+#[tokio::test]
+async fn pull_advertises_media_id_only_when_fetchable() {
+    let uri = "/api/v1/sessions/10001/messages?limit=5000&access_token=test-token-123456";
+    // 正向。
+    let (s, v) = call(build_router(test_state()), uri).await;
+    assert_eq!(s, StatusCode::OK);
+    let row = find_media_row(&v);
+    assert!(row.get("media").is_some(), "夹具里应有一行带媒体: {v}");
+    let id = row
+        .get("mediaId")
+        .and_then(|x| x.as_str())
+        .unwrap_or_else(|| panic!("登记在位时拉取面必须给出 mediaId: {row}"));
+    assert!(!id.is_empty(), "句柄不得为空串");
+    // 端到端：那个句柄真的能取到字节。
+    let (ms, _) = call(
+        build_router(test_state()),
+        &format!("/api/v1/media/{id}?access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(ms, StatusCode::OK, "通告出去的句柄必须取到字节（id={id}）");
+
+    // 反向：登记表清空。
+    let state = test_state();
+    state.store.write().media.clear();
+    let (s2, v2) = call(build_router(state), uri).await;
+    assert_eq!(s2, StatusCode::OK);
+    let row2 = find_media_row(&v2);
+    assert!(row2.get("media").is_some(), "元数据不因不可取而消失");
+    assert!(
+        row2.get("mediaId").is_none(),
+        "不可取时整个键省略（而不是 null）：给一个必 404 的句柄比不给更坏 —— {row2}"
+    );
+}
+
+/// 取第一行带 `media` 键的消息；没有就给一个 `Null`，让断言以「应有一行带媒体」失败，
+/// 而不是在索引上 panic —— 拉取面的行序由时间戳决定，硬写索引会让夹具改动变成误报。
+fn find_media_row(v: &Value) -> &Value {
+    v.get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| arr.iter().find(|m| m.get("media").is_some()))
+        .unwrap_or(&Value::Null)
+}
+
 /// `{id}` 的两个来源：store 键（本地缓存，直服）与**导出文件名**（导出根回落）。
 ///
 /// 三条规则在这里钉住：① store 键优先；② 同名多命中时**内容一致才服务**（不一致 404）；

@@ -165,6 +165,15 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET /chatlab/messages`（ChatLab 消息面：原 `?chatlab=1` 的新家）
 - `GET /chatlab/sessions/{id}/messages`（ChatLab Pull）
 - `GET /chatlab/push/messages`（SSE 通知面，只发元信息）
+
+> **拉取面的 `messages[].mediaId`**：出现时**按它取字节必须成功**（承诺，不是尽力而为）。
+> 它在**消息这一层**而不是 `media` 对象里 —— `media` 的键集由一致性套件钉成 `{type, fileName, md5}`
+> 并拒绝多余键（`media_shape_in_pull`），而含义本就不同：`fileName` 说「这条媒体叫什么」，
+> `mediaId` 说「这份字节现在取得到」。不可取时**整个键省略**（不是 `null`）：给一个必 404 的
+> 句柄比不给更坏 —— 调用方拿到 404 只会以为服务坏了，而它无从区分这两种情况。
+> 契约侧的钉子是 `media_id_shape_in_pull`（句柄必须是非空字符串，且 `media` 键必须同时存在）。
+> **与 weflow 的关键差别**：本仓的句柄来自**QQ 本地缓存的登记路径**，不需要先执行导出；
+> 所以 `--with-media` 在拉取面已经给得出句柄的那些行上**一发导出请求都不发**（快路径）。
 - `GET /openapi.json`（接口描述，**免鉴权**，见 §1.0）
 
 > **读端点只有 GET**：`messages`/`sessions`/`contacts`/`group-members`/`media/{id}`/`push/messages`
@@ -1052,7 +1061,9 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | `POST /api/v1/accounts` | `dbPath`、`status` | 无值时**省略键** | 注册的三个分支键集不同，见该端点小节 |
 | `GET /chatlab/sessions` | `sessions[].memberCount` | 不掌握名册时**省略键** | 可选字段，断言不得写成必填 |
 | `GET /chatlab/sessions`、`GET /chatlab/messages` | `page.nextCursor` | 键恒出现，已排空时 `null` | 与「整个 `page` 块不存在」（＝完整单页）是两件事 |
-| `GET /chatlab/messages`、拉取面（两条路径同形） | `messages[].media`、`replyToMessageId` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
+| `GET /chatlab/messages` | `messages[].media`、`replyToMessageId` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
+| 拉取面 | `messages[].media`、`replyToMessageId` | 无值时**省略键** | 与消息面同一处取法（`chatlab::media_brief`）；`mediaId` 与它**同源**（brief 省略时句柄也跟着省略，见下条） |
+| 拉取面 | `messages[].mediaId` | 不可取时**省略键**（不给 `null`、不给空串） | 「出现即可取」是承诺：判据＝索引登记了可读取的本地缓存路径（`store::query::fetchable_media_id`，与原生面／手动同步／SSE **同一条规则**）。QQ 会清理媒体缓存，缓存里的文件没了这个键就跟着消失 |
 | 拉取面 | `page` | **不出现在响应里** | 进度走 `sync` 块（`hasMore` / `nextSince` / `nextOffset` / `watermark`），四个键恒出现 |
 | `GET /api/v1/group-members` | `members[].messageCount` | **只在 `includeMessageCounts=1` 时出现** | 未请求计数时省略，而不是给 `0`（见第 6 节） |
 | `GET /api/v1/group-members` | `members[].isOwner` | 键**恒保留**（值为 `false` 时也出现） | 与 `messageCount` 相反：它表达的是「判定过，不是群主」 |

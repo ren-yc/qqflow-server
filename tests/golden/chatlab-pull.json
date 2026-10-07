@@ -38,6 +38,7 @@
           "md5": "aabbccddeeff00112233445566778899",
           "type": "image"
         },
+        "mediaId": "aabbccddeeff00112233445566778899",
         "platformMessageId": "113737825910786",
         "sender": "u_b",
         "timestamp": 26481,
@@ -87,6 +88,7 @@
     "fileName",
     "md5",
     "type",
+    "mediaId",
     "platformMessageId",
     "sender",
     "timestamp",

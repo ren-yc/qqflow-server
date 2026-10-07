@@ -130,15 +130,34 @@ pub async fn handler(
                 .as_ref()
                 .and_then(|index| crate::store::query::resolve_reply_to(index, m))
                 .map(|target| target.to_string());
+            // 与 `media` 键**同一次求值**里赋值（见下面那个 match）：两个键的一致性不靠约定。
+            let mut media_id: Option<String> = None;
             PullMessage {
                 account_name: account_name(&m.from_uid),
                 content: m.parsed.content.clone(),
                 group_nickname: group_card(&m.from_uid),
                 // 媒体元数据（无媒体省略整个键）—— 与消息面**同一处**取法。
-                media: crate::server::chatlab::media_brief(
+                // `media` 与 `mediaId` **同源**：brief 省略（类型归不到 image/voice/video）时
+                // 句柄也必须跟着省略。「有句柄却声称自己没媒体」是矛盾态，契约的
+                // `media_id_shape_in_pull` 直接判红；而下游若按「有 media 键才有媒体」读，会整条
+                // 漏掉那份本来取得到的字节。两者写在同一个 `match` 里，就不可能只改一半。
+                // 「出现即可取」的判据与原生面（`shape_record`）、手动同步响应、SSE **同一条**
+                // 规则（store 登记过本地缓存路径才通告）；写第二遍就会分叉。
+                media: match crate::server::chatlab::media_brief(
                     m.parsed.msg_type.media_type_str(),
                     m.parsed.media.as_ref(),
-                ),
+                ) {
+                    brief @ Some(_) => {
+                        media_id = m
+                            .parsed
+                            .media
+                            .as_ref()
+                            .and_then(|media| crate::store::query::fetchable_media_id(&store, media));
+                        brief
+                    }
+                    None => None,
+                },
+                media_id,
                 platform_message_id: m.seq.to_string(),
                 reply_to_message_id,
                 sender: m.from_uid.clone(),
