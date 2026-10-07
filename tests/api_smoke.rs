@@ -880,7 +880,7 @@ async fn media_id_omitted_when_store_has_no_entry() {
     assert_eq!(s, StatusCode::OK);
     let m0 = &v["messages"][0];
     assert!(m0["media"]["md5"].is_string(), "media object still rides along");
-    assert!(m0["mediaId"].is_null(), "mediaId omitted when not fetchable");
+    assert!(m0.get("mediaId").is_none(), "mediaId omitted (key absent, never null) when not fetchable");
 }
 
 /// 拉取面的 `mediaId`：与原生面**同一条**可取性规则（store 登记过本地缓存路径才通告），
