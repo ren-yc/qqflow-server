@@ -95,5 +95,6 @@ async function main(): Promise<void> {
     return;
   }
 
+
   console.log("smoke: PASS");
 }
