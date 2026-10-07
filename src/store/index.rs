@@ -455,6 +455,7 @@ pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> R
     for conv in store.convs.values_mut() {
         conv.ensure_sorted();
     }
+    store.mark_index_built();
     Ok(store)
 }
 

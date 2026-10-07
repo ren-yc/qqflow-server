@@ -126,7 +126,8 @@ pub async fn handler(
         from_cache: false,
         members,
         success: true,
-        updated_at: chrono::Utc::now().timestamp_millis(),
+        // 数据时刻而非请求墙钟：客户端靠它判断「这份数据有多旧」（与 weflow 同语义）。
+        updated_at: store.index_built_at_ms,
     })
     .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;
     Ok(Json(body))

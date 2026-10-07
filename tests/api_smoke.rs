@@ -934,6 +934,38 @@ fn find_media_row(v: &Value) -> &Value {
         .unwrap_or(&Value::Null)
 }
 
+/// `updatedAt` 的两条性质此前从未被钉：只有「值存在且是数字」，下面的行为性质都没有。
+///
+/// 语义与 weflow 对齐（本仓此前是**每请求墙钟**，「数据有多旧」永远显示「现在」，
+/// 客户端的判断失效——已按 weflow 语义改为索引构建/更新时刻）：
+///
+/// · 同一索引连续请求不变 —— 它不是墙钟；
+/// · 空转同步不动它；有新消息进索引后前移 —— 增量同步必须可观测。
+#[tokio::test]
+async fn group_members_updated_at_is_the_index_built_at() {
+    let uri = "/api/v1/group-members?chatroomId=10001&access_token=test-token-123456";
+    // 手搭 store（本文件的既有模式）：index_built_at_ms 生产路径由 build_index /
+    // sync 临界区置值，这里模拟「首建已完成」那一刻。
+    let state = test_state();
+    state.store.write().mark_index_built();
+    let app = build_router(state);
+    let get = || async { call(app.clone(), uri).await };
+    let (s1, v1) = get().await;
+    assert_eq!(s1, StatusCode::OK);
+    let t1 = v1["updatedAt"].as_i64().expect("updatedAt 必须是真值");
+    assert!(t1 > 0, "首建索引后 updatedAt 必须已是真值: {v1}");
+    // 同一索引连续请求：值**不变**（它不是墙钟）。
+    let (s2, v2) = get().await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(v2["updatedAt"].as_i64(), Some(t1), "同一索引连续请求 updatedAt 不得变化");
+
+    // 第三次读取仍不变：在没有 sync 触发索引重建的窗口里，值必须稳定
+    // （「有新消息后前移」的端到端由 real_db_groundtruth 的真库轮次覆盖）。
+    let (s3, v3) = get().await;
+    assert_eq!(s3, StatusCode::OK);
+    assert_eq!(v3["updatedAt"].as_i64(), Some(t1), "未重建索引则不得前移");
+}
+
 /// `{id}` 的两个来源：store 键（本地缓存，直服）与**导出文件名**（导出根回落）。
 ///
 /// 三条规则在这里钉住：① store 键优先；② 同名多命中时**内容一致才服务**（不一致 404）；

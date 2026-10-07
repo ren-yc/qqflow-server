@@ -240,6 +240,10 @@ impl AccountSync {
             index::apply_records(&mut guard, &new_c);
             guard.watermark_group = new_wm_g;
             guard.watermark_c2c = new_wm_c;
+            // 只有这一轮确实动过索引才更新时刻：空转的一轮不该让 updatedAt 看起来更新了。
+            if !new_g.is_empty() || !new_c.is_empty() {
+                guard.mark_index_built();
+            }
             let events: Vec<Event> = new_g
                 .iter()
                 .chain(&new_c)

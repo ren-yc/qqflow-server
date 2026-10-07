@@ -124,9 +124,22 @@ pub struct Store {
     /// Highest rowid seen per table (poller watermark).
     pub watermark_group: i64,
     pub watermark_c2c: i64,
+    /// 索引刚刚构建/更新完成的时刻（毫秒）。`group-members` 的 `updatedAt` 取它，
+    /// 让客户端判断「这份数据有多旧」——它是**数据时刻**而不是请求墙钟：空转的一轮
+    /// 同步不该让它看起来更新了（与 weflow 同语义；此前这里是每请求墙钟，
+    /// 「数据有多旧」因此永远显示「现在」，客户端的判断失效）。
+    pub index_built_at_ms: i64,
 }
 
 impl Store {
+    /// 记下索引刚刚构建/更新完成（见 `index_built_at_ms`）。
+    pub fn mark_index_built(&mut self) {
+        self.index_built_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+    }
+
     pub fn conversation(&self, chat_type: ChatType, talker: &str) -> Option<&Conversation> {
         self.convs.get(&conv_key(chat_type, talker))
     }
