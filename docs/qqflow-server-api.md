@@ -176,8 +176,11 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 > 所以 `--with-media` 在拉取面已经给得出句柄的那些行上**一发导出请求都不发**（快路径）。
 - `GET /openapi.json`（接口描述，**免鉴权**，见 §1.0）
 
-> **读端点只有 GET**：`messages`/`sessions`/`contacts`/`group-members`/`media/{id}`/`push/messages`
-> 的 POST 一律 **405**。动作端点（注册、同步）与免鉴权的 `/health` 保留两个方法。
+> **读端点只有 GET**：`/api/v1/` 下的 `messages`、`sessions`、`sessions/{id}/messages`、`contacts`、
+> `group-members`、`media/{id}`、`push/messages`，以及 `/chatlab/` 下的 `sessions`、`messages`、
+> `sessions/{id}/messages`、`push/messages`，以及描述面 `/openapi.json`——这些的 POST 一律
+> **405**（逐条见 `routes.rs` 的 `GET_ONLY`）。例外是**动作端点**（`POST /api/v1/accounts` 注册、`/api/v1/sync`）与免鉴权的
+> `/health`、`/api/v1/health`：它们保留两个方法。
 
 > **「上限」分属四个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出
 > 「两仓口径不一致」的错误结论；下表按源码实测逐端点列出）：
@@ -1199,7 +1202,8 @@ GET /api/v1/group-members
 
 ## 7. 手动同步
 
-> 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
+> GET/POST 均可。**除鉴权外没有任何参数**——body 里放什么都会被忽略，
+> 它只是「立刻跑一轮增量」的触发器（下面请求体示例仅演示鉴权键的写法）。
 
 立即对所有账号执行一次完整同步（直连活库的增量读取，**绕过后台变化检测循环**），
 返回本次新增的**条数**。客户端初始化或手动刷新时调用；新增消息同时广播给 SSE
