@@ -155,7 +155,12 @@
         "AccountRegistered": {
           "description": "注册**受理**（或幂等命中）。\n\n`status` 与 `db_path` 都是**条件键**：未知时不出现。`db_path` 回显的是服务器**实际解析\n到的**库（请求里的 `db_path` 很松散：可以是文件、可以是 Tencent Files 风格的根目录、\n也可以省略走启动扫描），所以回显解析结果才告诉客户端「在跟哪个库说话」。",
           "properties": {
-            "db_path": "<volatile>",
+            "db_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "qq": {
               "type": "string"
             },
@@ -196,7 +201,12 @@
         "AccountView": {
           "description": "账号列表项。\n\n键名是**蛇形**（`message_count` / `db_path`），与 `weflow-server` 的 `message_count` /\n`db_storage` 不是同一套 —— 不要跨仓库统一。\n\n`error` 与 `db_path` 都是**条件键**：不知道就**不出现**，而不是 `null`。",
           "properties": {
-            "db_path": "<volatile>",
+            "db_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "error": {
               "type": [
                 "string",
@@ -243,7 +253,10 @@
         "ChatlabHeader": {
           "description": "ChatLab 信封头。`exportedAt` 是**墙钟**（每次请求都不同）—— 快照里靠时钟哨兵掩码。",
           "properties": {
-            "exportedAt": "<volatile>",
+            "exportedAt": {
+              "format": "int64",
+              "type": "integer"
+            },
             "generator": {
               "type": "string"
             },
@@ -545,7 +558,7 @@
               "type": "integer"
             },
             "fromCache": {
-              "description": "`true` 表示这份成员表来自缓存而不是刚扫的。**与 weflow 的 `refreshed` 语义相反**\n（那边是「刚刷新过」），不要照抄。",
+              "description": "v1 恒为 `false`：名册与消息都在内存索引里，本请求既不读盘也不触发同步\n（要强制对账请调 `/api/v1/sync`）。与 weflow 的同名字段同语义、同为常量。",
               "type": "boolean"
             },
             "members": {
@@ -557,7 +570,11 @@
             "success": {
               "type": "boolean"
             },
-            "updatedAt": "<volatile>"
+            "updatedAt": {
+              "description": "**毫秒级**时间戳，取值是**索引构建/更新的完成时刻**（store 里的 `index_built_at_ms`），\n不是本次响应的墙钟：空转同步不会推进它，真吸收了新数据才前移。客户端据此判断\n「这份成员表有多旧」。与 weflow 的同名字段同语义。\n迁移提示：0.9.0 之前这里是响应生成时刻，依赖「每次请求都拿到新值」的调用方需要改用\n自己的时钟，或按「值不变＝数据未变」判读。",
+              "format": "int64",
+              "type": "integer"
+            }
           },
           "required": [
             "chatroomId",
@@ -622,7 +639,12 @@
             "enabled": {
               "type": "boolean"
             },
-            "exportPath": "<volatile>"
+            "exportPath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           },
           "required": [
             "count",
@@ -648,7 +670,13 @@
                 "null"
               ]
             },
-            "localPath": "<volatile>",
+            "localPath": {
+              "description": "Local cache path (45812) — served by /api/v1/media/{id}.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "md5": {
               "description": "Image MD5 hex string (45424) — the media store lookup key.",
               "type": [
@@ -736,7 +764,12 @@
                 "null"
               ]
             },
-            "mediaLocalPath": "<volatile>",
+            "mediaLocalPath": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "mediaUrl": {
               "type": [
                 "string",
@@ -997,8 +1030,14 @@
               "minimum": 0,
               "type": "integer"
             },
-            "nextSince": "<volatile>",
-            "watermark": "<volatile>"
+            "nextSince": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "watermark": {
+              "format": "int64",
+              "type": "integer"
+            }
           },
           "required": [
             "hasMore",
@@ -1192,7 +1231,10 @@
               "description": "表名。",
               "type": "string"
             },
-            "watermark": "<volatile>"
+            "watermark": {
+              "$ref": "#/components/schemas/WatermarkValue",
+              "description": "水位值。"
+            }
           },
           "required": [
             "table",

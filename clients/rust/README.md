@@ -22,7 +22,7 @@ let sessions = client.list_all_sessions(Default::default()).await?;
 
 ## Scope
 
-The server exposes a strictly read-only surface: accounts, sessions, messages, contacts, group members, SNS timelines (WeChat only), media export, and an SSE push stream. This client mirrors that surface one-to-one; see the server repository for the API reference and the interface contract the client is tested against.
+The server exposes a strictly read-only surface: accounts, sessions, messages, contacts, group members, media export, and an SSE push stream. (Moments / `sns` endpoints belong to the sibling WeChat service — QQ NT local databases carry no such data.) This client mirrors that surface one-to-one; see the server repository for the API reference and the interface contract the client is tested against.
 
 ## License
 

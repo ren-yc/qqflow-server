@@ -2377,7 +2377,13 @@ mod golden {
             Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
                     if VOLATILE_KEYS.contains(&key.as_str()) {
-                        *val = Value::String("<volatile>".into());
+                        // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
+                        // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
+                        // description 与类型一起从比对里抹掉——字段语义写红也不会红。
+                        match val {
+                            Value::Object(_) | Value::Array(_) => mask(val),
+                            _ => *val = Value::String("<volatile>".into()),
+                        }
                     } else {
                         mask(val);
                     }
