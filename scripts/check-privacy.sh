@@ -8,8 +8,11 @@
 # local config are out of scope by construction):
 #   1. exact real values from the gitignored qqflow-server.json — qq, key and
 #      db_path (skipped when the file is absent, e.g. CI)
-#   2. the local username and machine-specific paths (D:\AppData\Tencent
-#      Files, C:\Users\*)
+#   2. the local username, the user-profile path (C:\Users\<name>) and this
+#      machine's data root — the latter is DERIVED from the local config at run
+#      time, never stored here as a literal (an earlier revision hardcoded the
+#      author's real root in this tracked, published file, which is itself a
+#      leak the self-exclusion below could never catch).
 #
 # Exits non-zero (and lists every hit) when anything leaks, which aborts the
 # commit; findings go to stderr, which git shows verbatim. Values are NEVER
@@ -50,6 +53,25 @@ report() {
   fi
 }
 
+# report_strict <label> <fixed-string-pattern>
+# Same, but WITHOUT the self-exclusion. Used for values derived from the local
+# config: PATHSPEC drops this script because it legitimately holds *pattern
+# strings*, but that exemption is exactly how a real machine root once ended up
+# hardcoded here unnoticed (the gate cannot see its own file). A config-derived
+# value has no legitimate reason to appear in the scanner source, so it gets
+# scanned there too.
+report_strict() {
+  local label="$1"
+  local pattern="$2"
+  local found
+  found=$(git grep -lF -e "$pattern" -- ':!*.lock' 2>/dev/null)
+  if [ -n "$found" ]; then
+    echo "[隐私检查] 检测到 $label:" >&2
+    echo "$found" | sed 's/^/    /' >&2
+    hits=$((hits + 1))
+  fi
+}
+
 # JSON field reader for the config: tries the interpreters that may exist
 # on a dev machine (python / python3 / the Windows `py` launcher). Prints one
 # `label<TAB>value` line per present field. Returns 1 when no interpreter
@@ -72,6 +94,25 @@ for field in ("qq", "key", "db_path"):
     value = cfg.get(field)
     if isinstance(value, str) and value:
         print("%s\t%s" % (field, value))
+
+# Data root: the config's db_path trimmed up to and including the
+# "Tencent Files" marker, else drive + first segment. Checked as a *prefix*
+# class, so a doc that only shows the deeper path still gets caught.
+import re
+db = cfg.get("db_path")
+if isinstance(db, str) and db:
+    parts = re.split(r"[\\/]", db)
+    cut = None
+    for i, seg in enumerate(parts):
+        if seg.lower() == "tencent files":
+            cut = i
+            break
+    if cut is None:
+        cut = min(1, len(parts) - 1)
+    root = "\\".join(parts[: cut + 1])
+    if root:
+        print("data_root\t%s" % root)
+        print("data_root_fwd\t%s" % root.replace("\\", "/"))
 PY
   done
   return 1
@@ -93,9 +134,13 @@ if [ -f "$CONFIG" ]; then
     value="${value%$'\r'}"
     [ -n "${value:-}" ] || continue
     case "$label" in
-      qq)    report "真实 QQ 号（$CONFIG）" "$value" ;;
-      key)   report "真实数据库密钥（$CONFIG 的 key）" "$value" ;;
-      *)     report "真实数据库路径（$CONFIG 的 $label）" "$value" ;;
+      # every value below comes from the local config, so none of them has any
+      # business appearing in tracked files — including this scanner's source.
+      qq)            report_strict "真实 QQ 号（$CONFIG）" "$value" ;;
+      key)           report_strict "真实数据库密钥（$CONFIG 的 key）" "$value" ;;
+      data_root)     report_strict "本机数据根（由 $CONFIG 的 db_path 派生）" "$value" ;;
+      data_root_fwd) report_strict "本机数据根的正斜杠变体" "$value" ;;
+      *)             report_strict "真实数据库路径（$CONFIG 的 $label）" "$value" ;;
     esac
   done <<< "$CONFIG_VALUES"
 fi
@@ -114,10 +159,10 @@ if [ -n "$USER_NAME" ]; then
   report "本机用户名" "$USER_NAME"
   report "用户目录绝对路径 C:\\Users\\<用户名>" "C:\\Users\\$USER_NAME"
 fi
-# Real QQ NT data roots carry the "Tencent Files" marker; scanning the bare
-# prefix would false-positive on docs that mention the pattern generically.
-report "D 盘腾讯数据路径" 'D:\AppData\Tencent Files'
-report "D 盘腾讯数据路径（正斜杠变体）" 'D:/AppData/Tencent Files'
+# The data-root check lives in the config-driven layer above: deriving it from
+# db_path keeps this file free of any real machine path. Hardcoding an example
+# root here would defeat the point — this script is excluded from its own scan
+# (see PATHSPEC), so a literal stored here is invisible to the gate forever.
 
 if [ "$hits" -gt 0 ]; then
   echo "[隐私检查] 发现 $hits 类敏感信息泄露，请清理后再继续。" >&2

@@ -323,10 +323,12 @@ POST /api/v1/accounts
 {
   "qq": "1234567890",
   "key": "<16字节ASCII密钥>",
-  "db_path": "C:\\Users\\<用户名>\\Documents\\Tencent Files",
-  "access_token": "YOUR_TOKEN"
+  "db_path": "C:\\Users\\<用户名>\\Documents\\Tencent Files"
 }
 ```
+
+**Token 走请求头** `Authorization: Bearer <TOKEN>`（或查询串 `?access_token=`）。**body 里的
+`access_token`/`token` 会被跳过**（既不鉴权也不覆盖查询串）——把它写进 body 会得到 401。
 
 | 参数 | 类型 | 必填 | 说明 |
 | ---- | ---- | ---- | ---- |
@@ -460,7 +462,7 @@ Authorization: Bearer YOUR_TOKEN
 GET /api/v1/push/messages
 ```
 
-或 POST（参数仍走 Query/Header）。
+**只有 GET**（POST 一律 405）。SSE 长连接推荐 `?access_token=`（见 §1 的两条通道）。
 
 ### 说明
 
@@ -616,7 +618,7 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 
 ## 3. 获取消息
 
-> 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）；Body 字段优先于 Query 参数
+> **只接受 GET**（POST 一律 405）。参数走查询串，鉴权走 Header 或 `?access_token=`。
 
 读取指定会话的消息，支持原始 JSON 和 ChatLab 格式。
 
@@ -1096,7 +1098,7 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 
 ## 5. 获取联系人列表
 
-> 当使用 POST 时，请将参数放在 JSON Body 中（Content-Type: application/json）
+> **只接受 GET**（POST 一律 405），参数走查询串。
 
 v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。昵称来自联系人档案（`profile_info.db` 的 `20002`，经 ground-truth 探针确认），QQ 号来自 `nt_msg.db` 的 `nt_uid_mapping_table` + 档案（版本相关，列结构按值探测，缺表/缺列时退化为消息昵称列表）。备注（remark）：来自 `profile_info.db` 的 `20009` 列（QQDecrypt 字段 id，真库 ground-truth 确认——本账号实测 17 个联系人设置备注）；分类按字段 id `20009` 直接识别（绕过 CJK 门槛，兼容拉丁备注），列名/字段 id 提示（`remark`/`20003`/`60026`）保留作兜底。
 
@@ -1266,11 +1268,12 @@ POST /api/v1/sync
 ### cURL
 
 ```bash
-TOKEN=$(Get-Content "$env:LOCALAPPDATA\qqflow-server\系统凭据库（--show-token 获取）")   # PowerShell
-# 注册账号（客户端驱动启动；密钥仅内存保存）
+# 取 token：存在系统凭据库里，不落文件；用子命令打印（PowerShell 与 bash 都可用）
+TOKEN=$(qqflow-server token)
+# 注册账号（客户端驱动启动；密钥仅内存保存）。鉴权走 Header，别把 token 放进 body。
 curl -X POST http://127.0.0.1:5032/api/v1/accounts \
-  -H "Content-Type: application/json" \
-  -d "{\"qq\": \"1234567890\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\", \"access_token\": \"$TOKEN\"}"
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"qq\": \"1234567890\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\"}"
 # 账号明细（需鉴权；/health 只给标量 account 阶段）
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:5032/api/v1/accounts
 # 注销账号（恢复未注册状态；加 purge_media=1 才删导出媒体）
@@ -1278,10 +1281,9 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:5032/api/v1/accounts/1234567890?purge_media=1"
 # GET 带 Token Header
 curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=20"
-# POST 带 JSON Body（参数走 Body，token 亦可走 Body）
-curl -X POST http://127.0.0.1:5032/api/v1/messages \
-  -H "Content-Type: application/json" \
-  -d "{\"access_token\": \"$TOKEN\", \"talker\": \"10001\", \"limit\": 50}"
+# 读端点只有 GET：参数走查询串（POST 会得 405，body 里的 token 也不是鉴权通道）
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=50"
 # SSE
 curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=$TOKEN"
 ```
@@ -1294,9 +1296,10 @@ import requests
 BASE_URL = "http://127.0.0.1:5032"
 headers = {"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/json"}
 
-messages = requests.post(
+# 读端点只接受 GET（POST 得 405）
+messages = requests.get(
     f"{BASE_URL}/api/v1/messages",
-    json={"talker": "10001", "limit": 50},
+    params={"talker": "10001", "limit": 50},
     headers=headers,
 ).json()
 
@@ -1377,11 +1380,11 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
   `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，
   不是只读常量）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
-- 本轮**不发布** crates.io：本地 `cargo build -p qqflow-client` 即可使用。
+- 自 0.9.0 起发布到 crates.io（crate `qqflow-client`）；本地开发仍可直接 `cargo build -p qqflow-client`。
 
 - **Python 侧**：`clients/python`（包 `qqflow-sdk`）。模型生成走 `scripts/regen.py`
   （spec 经 Rust 生成工具的 `--dump-spec` 取得，绕开 golden 的占位掩码）；行为层是
   `httpx.AsyncClient` 异步实现，`from qqflow_sdk import Client` 即用；老面 SSE 事件由
   客户端自有 `MessageEvent` 模型解码（camelCase 载荷），`sync` 帧用生成的 `SyncFrame`。
   测试对进程内 ASGI mock 跑：`clients/python/.venv/Scripts/python -m pytest tests/`。
-  本轮**不发布** PyPI：本地 `pip install -e clients/python` 即可使用。
+  自 0.9.0 起发布到 PyPI（包 `qqflow-sdk`）；本地开发仍可用 `pip install -e clients/python`。
