@@ -293,12 +293,25 @@ pub fn count_sessions(store: &Store, keyword: Option<&str>) -> usize {
         .count()
 }
 
-/// Sessions sorted by last message time (newest first). Display names
-/// resolve through the name maps (remark / group-info > message-derived).
+/// Sessions sorted by last message time (newest first), ties broken by talker id
+/// ascending. Display names resolve through the name maps (remark / group-info >
+/// message-derived).
+///
+/// The tiebreaker is load-bearing, not cosmetic: `convs` is a **HashMap**, so its
+/// iteration order varies between processes. Without a deterministic secondary key,
+/// two conversations sharing a last-message timestamp come out in arbitrary order -
+/// and paging is `skip(offset).take(limit)` over exactly that order, so a client
+/// walking pages can receive one session twice while missing another entirely. The
+/// API doc promises stable cursor paging; this comparison is what makes it true
+/// (regression: `same_timestamp_sessions_page_stably_across_rebuilt_stores`).
 pub fn query_sessions(store: &Store, keyword: Option<&str>, limit: usize, offset: usize) -> Vec<SessionInfo> {
     let kw = keyword.map(|k| k.to_lowercase());
     let mut all: Vec<&crate::store::Conversation> = store.convs.values().collect();
-    all.sort_by_key(|c| std::cmp::Reverse(conv_last_ts(c)));
+    all.sort_by(|a, b| {
+        conv_last_ts(b)
+            .cmp(&conv_last_ts(a))
+            .then_with(|| a.talker.cmp(&b.talker))
+    });
     all.into_iter()
         .filter(|c| matches_keyword(store, c, kw.as_deref()))
         .skip(offset)
@@ -350,6 +363,44 @@ mod tests {
             reply_inner_seq: None,
             parsed: ParsedMessage { msg_type: MsgType::Text, content: "x".into(), media: None },
         }
+    }
+
+    fn store_of(talkers: &[&str], ts: i64) -> Store {
+        let mut store = Store::default();
+        for talker in talkers {
+            let conv = Conversation {
+                chat_type: ChatType::Group,
+                talker: (*talker).into(),
+                name: (*talker).into(),
+                msgs: vec![rec(1, ts)],
+                dirty: false,
+            };
+            store.convs.insert(conv_key(ChatType::Group, talker), conv);
+        }
+        store
+    }
+
+    fn names(s: &Store, limit: usize, offset: usize) -> Vec<String> {
+        query_sessions(s, None, limit, offset)
+            .into_iter()
+            .map(|x| x.username)
+            .collect()
+    }
+
+    #[test]
+    fn same_timestamp_sessions_page_stably_across_rebuilt_stores() {
+        // 全部同刻：唯一能区分顺序的就是次键。插入顺序反转，输出必须逐位相同。
+        let a = store_of(&["10003", "10001", "10002", "10004"], 500);
+        let b = store_of(&["10004", "10002", "10001", "10003"], 500);
+        assert_eq!(names(&a, 3, 0), vec!["10001", "10002", "10003"], "同刻按 talker 升序");
+        assert_eq!(names(&a, 3, 0), names(&b, 3, 0), "插入顺序不得影响输出");
+        // 翻页拼接等于全量排序 => 不重不漏（文档承诺的机制）。
+        let mut paged = names(&a, 3, 0);
+        paged.extend(names(&a, 3, 3));
+        assert_eq!(paged, vec!["10001", "10002", "10003", "10004"]);
+        let mut paged_b = names(&b, 3, 0);
+        paged_b.extend(names(&b, 3, 3));
+        assert_eq!(paged, paged_b);
     }
 
     #[test]
