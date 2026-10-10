@@ -194,7 +194,7 @@ SQLite 行号（weflow 是三元组），`generation` 变化后的补拉语义�
 | **契约套件** | 「**两个仓库是否一致**」：同一份用例跑两边 | `tests/conformance_runner.rs`（`#[ignore]`，CI 独立步骤） |
 
 契约套件在 CI 里是**独立一步**（不是靠 `cargo test` 顺带跑的）：克隆 `conformance.pin` 所指的
-tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（四条数据不变量）。**停用某一步时要在
+tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（五条数据不变量；`FLOW_CONTRACT_CASE` 是子串过滤，改名别改漏——第五条约 2024 起就在跑，防的是拉取面复活 `mediaPath`）。**停用某一步时要在
 注释里写清原因** —— 一个不会红的门禁等于没有门禁。
 
 
@@ -352,7 +352,7 @@ QQ 数据目录（含 `nt_msg.db`、同族库 `group_info.db`、
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-34 条用例。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+36 条用例（`v0.6.0`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 

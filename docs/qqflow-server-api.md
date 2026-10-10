@@ -488,7 +488,7 @@ GET /api/v1/push/messages
 | `timestamp` | 消息时间，秒级 Unix 时间戳 |
 | `media` | 仅图片/语音/视频消息：媒体元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`urls`，**不含 `localPath`**——推送不携带任何本地路径），缺失时省略 |
 | `mediaId` | 仅 `message.new`：媒体获取键（md5 hex 或 uuid），用于 `GET /api/v1/media/{id}` 直取字节；**仅当索引注册了可读取的本地缓存路径时提供**（与 REST `messages.mediaId` 同规则），否则省略——出现即保证可取，绝不 404 承诺 |
-| （`sync` 无上面这些字段）| **`sync` 是唯一的例外**：它的载荷收敛成 `{"event":"sync","watermarks":[…]}`，见下 |
+| （`sync` 无上面这些字段）| **`sync` 是唯一的例外**：它的载荷收敛成 `{"event":"sync","generation":…,"watermarks":[…]}`（三键恒出现），见下 |
 
 **`sync` 的水位线是数组，不是字段。** 原来是 `lastRowidGroup` / `lastRowidC2c` 两个平铺字段 —— 那等于把
 「哪张表」编码进**字段名**里，加第三张表就必须再加一个字段，消费方得靠约定去配对。现在它是数据：
@@ -517,7 +517,7 @@ event: ready
 data: {"status":"ok"}
 
 event: sync
-data: {"event":"sync","watermarks":[{"table":"group_msg_table","watermark":{"rowid":12345}},{"table":"c2c_msg_table","watermark":{"rowid":678}}]}
+data: {"event":"sync","generation":3,"watermarks":[{"table":"group_msg_table","watermark":{"rowid":12345}},{"table":"c2c_msg_table","watermark":{"rowid":678}}]}
 
 id: 1
 event: message.new
@@ -608,7 +608,7 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 - **为什么不带正文**：规范对这条通道的定位是「仅通知：ChatLab 不假设 SSE 事件可靠送达」——
   客户端收到后**去拉**那一页。带正文会诱导调用方把它当数据源，而它并不保证送达；不带，语义就
   没有歧义。**契约套件里有一条断言就查这个**（帧里出现 `content` 或 `messages` 即失败）。
-- 基线类事件（`session.sync`）额外带 **`generation`**（注销时递增）：客户端据此区分「注销后新
+- 基线事件（`sync`）额外带 **`generation`**（注销时递增）：客户端据此区分「注销后新
   账号刚开始」（该丢弃本地状态重新拉）与「自己漏收了」（该补拉）。少了它，两者在协议上是同一
   件事。
 - **老面一行未改。**
@@ -1077,7 +1077,7 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | SSE `message.new` | `groupName`、`avatarUrl`、`sourceName`、`media`、`mediaId` | 都是**条件键**：没有就不出现 | 不是给 `null`（回归见 `message_new_text_payload_keys_are_pinned`、`message_new_media_payload_carries_no_local_path`）。其中 `avatarUrl` 目前**恒不出现**：QQ 侧没有头像来源，构造点一律传 `None`；它留在类型里，是为了将来源可用时不必改形状 |
 | SSE `message.revoke` | `groupName`、`avatarUrl`、`sourceName` | 条件键（`avatarUrl` 同上，恒不出现） | 撤销事件**没有** `media`（回归见 `message_revoke_payload_has_no_media`） |
 | SSE `sync` | `event`、`generation`、`watermarks` | 三个键恒出现 | 某张表没有水位时，是**数组里少一项**，而不是给 `null` 或 `0`（回归见 `sync_omits_tables_without_a_watermark`） |
-| 通知面 `/chatlab/push/messages` | `eventId`、`sessionId`、`platformMessageId`、`generation` | 都是**条件键** | 基线事件（`session.sync` 一类）带 `generation`、不带 `eventId` / `sessionId`；消息事件反之。`sessionId` 为空串时**显式映射成省略**——空串与「没有会话」在下游是两件事 |
+| 通知面 `/chatlab/push/messages` | `eventId`、`sessionId`、`platformMessageId`、`generation` | 都是**条件键** | 基线事件（`sync`）带 `generation`、不带 `eventId` / `sessionId`；消息事件反之。`sessionId` 为空串时**显式映射成省略**——空串与「没有会话」在下游是两件事 |
 
 **空串是另一套约定**：`group-members` 的 `alias` / `avatarUrl`（v1 恒为空串）、`remark`（未设置时
 为空串），以及 ChatLab `members[].avatar`（恒为空串），在没有该值时给空串而不是 `null`；

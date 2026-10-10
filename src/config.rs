@@ -27,8 +27,11 @@ pub struct Config {
     /// state, zero IO) as a safety net against file-watch events being
     /// silently lost (inotify / ReadDirectoryChangesW buffer overflow).
     /// 0 = disabled (not recommended: missed events would never recover).
-    /// The watcher re-attach retry (every 10 s) is independent of this
-    /// setting.
+    /// NOTE: one interval drives BOTH jobs (`sync/watch.rs`), so this value IS
+    /// the watcher re-attach cadence whenever it is non-zero; the independent
+    /// 10 s re-attach (`REATTACH_INTERVAL`) only takes effect when the fallback
+    /// is disabled (0) - that is when losing watcher events would otherwise
+    /// permanently kill event-driven sync.
     pub watch_fallback_ms: u64,
     /// Media export root for `media=1` (WeFlow exportPath semantics);
     /// default `<data-dir>/api-media`.

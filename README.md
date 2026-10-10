@@ -74,8 +74,8 @@ bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）�
 首发顺序、人工审批闸门都在那里）。这里不复述流程——复述过就会漂移：被替换掉的那段
 示例里，版本号停在 0.3.0，而仓库已经发到 v0.7.0（第 11 个 tag）。要点三句：
 
-- 版本号在 `Cargo.toml`（根包与 `clients/rust`）与 `clients/python/pyproject.toml` 三处声明，
-  必须同步；tag 与根包版本不一致时 CI 的 guard 直接失败。
+- 版本号不止 `Cargo.toml`：完整清单（含 ts 示例与**必须重新生成**的生成物）以手册第 1 步为准。
+  tag 与根包版本不一致时 CI 的 guard 直接失败——但 guard **只**看根包，其余各漏改不会有人拦。
 - 推送 `v<版本>` tag 触发发布链；不可撤销的 registry 上传排在人工审批之后。
 - CI 的 guard **只**比对 tag 与根包版本（`cargo metadata` 取 `qqflow-server` 一条）；
   `clients/rust` 与 `clients/python` 的版本没有门禁兜着，漏改不会有人拦——手册第 1 步就是干这个的。
@@ -92,7 +92,7 @@ irm https://raw.githubusercontent.com/QQBackup/qq-win-db-key/master/scripts/wind
 .\qqflow-server.exe --help
 ```
 
-命令行参数：`--port`（默认 5032）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；watcher 失效后的自动重连不受此开关影响，固定每 10 秒重试）/ `--media-export-dir`（`media=1` 的媒体导出根目录，默认 `<data-dir>/api-media`）/ `--base-url`（`mediaUrl` 链接的 base URL，默认 `http://<host>:<port>`；绑定 `0.0.0.0`/`::` 时自动回退 `127.0.0.1`，局域网客户端请显式指定）。
+命令行参数：`--port`（默认 5032）/ `--host`（默认 127.0.0.1）/ `--log`（默认 info，error|warn|info|debug）/ `--watch-debounce-ms`（默认 350，文件事件防抖）/ `--watch-fallback-ms`（默认 30000，慢速兜底轮询，0 关闭；**同一个节拍还驱动 watcher 失效后的自动重连**——默认 30000 时重连也是每 30 秒一拍，只有把它设成 0（关闭兜底轮询）时重连才用独立的 10 秒节拍。想让重连快就别把这两个值想成一回事）/ `--media-export-dir`（`media=1` 的媒体导出根目录，默认 `<data-dir>/api-media`）/ `--base-url`（`mediaUrl` 链接的 base URL，默认 `http://<host>:<port>`；绑定 `0.0.0.0`/`::` 时自动回退 `127.0.0.1`，局域网客户端请显式指定）。
 
 **账号为客户端驱动**：启动后服务以空账号状态运行（`/health` 报 `account: "unregistered"`；账号明细走需鉴权的 `GET /api/v1/accounts`）；密钥不由配置提供，由客户端运行时注册（仅内存保存，不持久化）：
 

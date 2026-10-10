@@ -1,7 +1,9 @@
 //! 一致性套件的**执行入口**：造夹具 → 起真实服务 → 跑 `flow-contract` 的 runner。
 //!
 //! 以 `#[ignore]` ＋ `FLOW_CONTRACT_DIR` 门控：日常 `cargo test` 不受影响，CI 里是一个独立
-//! 步骤。没有 `FLOW_CONTRACT_DIR` 时**跳过并通过**，这样没检出契约仓库的开发机上依然全绿。
+//! 步骤。**缺 `FLOW_CONTRACT_DIR` 时是失败，不是跳过并通过**（判据见本文件 `contract_dir()`
+//! 处的 panic）——「没检出契约仓库于是整套跳过、依然全绿」正是最危险的失效方式：一个端点都
+//! 没被验过，报表却好看。开发机上想跳过整套请显式 `cargo test -- --skip conformance`。
 //!
 //! ## 为什么自己构造 `AppState` 而不是跑服务端二进制
 //!
