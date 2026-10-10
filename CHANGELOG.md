@@ -33,6 +33,7 @@
   消息无媒体句柄时的错误也从「合成 404 + 句子塞 url 字段」改为 `UnexpectedBody`/`ShapeError`——
   依赖旧错误形态分类的调用方需要调整。
 
+- **`group-members` 的 `updatedAt` 改为「索引构建/更新完成时刻」（破坏性）**：此前它是**本次响应的生成时刻**——每次请求都拿到「现在」，于是「这份成员表有多旧」恒为 0 秒前，字段不带任何信息。**迁移方式**：按「值不变＝数据未变」判读，需要取用时刻的调用方请用自己的时钟。现在取 store 记录的索引时刻（`index_built_at_ms`）：空转同步（无新行、无名册变化）**不**推进它，真吸收了新数据才前移；与 weflow 的同名字段同语义（本仓此前那条「两仓含义不同」的口径已随之作废）。回归位置：`group_members_updated_at_is_the_index_built_at`（连续两请求不变＋空转 sync 不动＋追加消息并同步后前移）。
 - **MCP `get_messages` 响应新增 `sinceResolved`**：`since` 接受相对串（`7d`/`24h`），续拉发生在
   下一轮对话——重发相对串会把窗口悄悄前移。响应回给本轮解析出的**排他**绝对下界，续拉传
   `nextOffset` + `sinceResolved`；`since` 未提供时为 `null`。
@@ -147,7 +148,7 @@
   请求数与过去相当（仍是每请求 200 项分页），但**跨轮次不再重下**已在盘上的摘要文件、句柄映射从「整会话驻留」
   改为逐页释放，且两趟遍历之间窗口滑动导致的静默丢件整类消失。
 
-  **后续演进（本文件 [未发布] 的按行分派条）**：窗口的定义已从「整页 `(since, nextSince]`」
+  **后续演进（本节上方的按行分派条）**：窗口的定义已从「整页 `(since, nextSince]`」
   收窄为「**缺句柄那些行**的时间戳 `[min, max]`」——拉取面给出 `mediaId` 后，已有句柄的行不再
   参与导出请求，窗口只覆盖真正需要导出的行。
   回归位置：`media_window_follows_the_pull_page`（每个导出请求都带 `start`/`end`、请求条数等于 Pull 页数、两页窗口
@@ -162,9 +163,11 @@
 - **pathsafe：挡掉 Win32 保留设备名**。`safe_segment` 与 `slugify` 都不挡 `CON`／`NUL`／`COM1`…（大小写不敏感、带扩展名也算）。作末分量时 Win32 在触碰文件系统之前就把名字解析成设备：写 `NUL` **静默丢弃字节**、开 `COM1` 可能阻塞。现 `safe_segment` 拒绝、`slugify` 加前导下划线。`slugify` 是本仓随 `export` 一并移植的折叠函数（此前只有校验、没有折叠）。
 - **两个 SDK 的错误族与参数校验归一**：① Python 侧 httpx 异常族此前不被包装 ⇒ `except ClientError` 漏掉网络故障，现新增 `TransportError(ClientError)`；② `_decode` 只把 `>= 400` 当错 ⇒ 3xx 变成 `ShapeError`，现按「非 2xx 即错」；③ 时间界校验 `str.isdigit()` 放行全角数字 ⇒ 漏到服务端吃 400，现改 ASCII-only；④ `group_members` 不校验空 `chatroomId` ⇒ 空名册被读成「这个群没有成员」，现 fail-fast；⑤ Rust 的 `MessageQuery::params()` 把错误 URL 写死为 `/api/v1/messages`，经 `chatlab_messages` 调用时报错指向另一个端点，现由调用方传端点；⑥ `pull_page` 与两处 media 路径直拼 id ⇒ 含 `#`／`?` 时打到别的路径，两侧都加路径段百分号编码。回归位置：`encode_path_segment_escapes_delimiters_but_keeps_real_id_shapes`、`empty_talker_error_names_the_endpoint_that_was_actually_called`、`group_members_rejects_an_empty_chatroom_without_a_request`。
 - **SSE 重放历史改由生产者单点写入**：此前每个订阅端各自编号，会产生发布编号与投递倒序；并堵住订阅与基线发布留下的三个并发缺口（订阅/快照缝隙、发布编号与投递倒序、基线发布越过归零基线）。**索引安装的取消重验移进写锁临界区**，杜绝「已注销的构建复活」。
+- **Rust SDK 的 `watch()` 游标只在帧真正交付后才推进**：此前「收到即推进」⇒ 一帧解码失败或被消费者提前丢弃时，重连带上的 `Last-Event-ID` 会跳过那一条，客户端**静默漏消息**。现在游标悬在未交付的帧上不落；并且**新连接开始时清空上一连接遗留的事件 id**（悬空 id 会被服务端当重放起点，跨连接泄漏＝从别人读到的位置开始读）。解码错误本身归 `Shape`（不再伪装成传输失败去重试）。回归位置：`watch_does_not_advance_the_cursor_past_an_undelivered_frame` 与 `watch_resets_the_pending_id_when_a_new_connection_starts`。
 
 ### 变更（对门禁与工具链，不对接口）
 
+- **接口契约 pin 在本段区间内两次升版：`v0.4.0` → `v0.5.1` → `v0.6.0`**（`conformance.pin` 与测试里的 `CONTRACT_VERSION` 同提交）。两跳内容不同：`v0.5.1` 未动解释记录，只加两枚钉子（游标 `offset+since+id` 组合、注销后重放旧事件 id）并配套改 runner 不变量与 case schema；`v0.6.0` 收拉取面 `mediaId`：钉子里 `pull-message-fields` 加断言 `media_id_shape_in_pull`，`INTERPRETATION.md` **新增第 9 条**（句柄位于消息这一层、「出现即可取」的判据，以及「可取性随时段变化、客户端须容忍句柄缺失」这条已知遗留）。CI 的契约 nails 步骤按 pin 的 tag 克隆钉子仓。
 - **包装脚本不再把调用方首参注入第二遍**：`build.ps1` 此前在 `$args[0]` 恰为子命令时才补 `--features testing`，`build.ps1 --locked test` 这类写法会漏注入（报错是一堆「模块是私有的」），而 `--features=x`／`-F testing` 形式会被重复注入。
 - **`graceful_shutdown` 测试的等待谓词升级为三段式**（端口可连 → token 可读 → 用该 token 打通一次鉴权），并把两种失败分开报错、各给 remedy。纯测试侧，不改产品行为。
 - **验收测试补强区分力**：改查值而非查键名、`--with-media` 断言句柄集合与 `media/` 文件集合相等、404 与 5xx 互为对照；桩 pull 面的 `meta.type` 刻意写成与发现面矛盾的值 ⇒ 群类型断言从此只能靠**推导**通过。

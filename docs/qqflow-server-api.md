@@ -1171,8 +1171,9 @@ GET /api/v1/group-members
 - `chatroomId`
 - `count`
 - `fromCache`（v1 恒为 `false`）
-- `updatedAt`（毫秒时间戳，取值是**本次响应的生成时刻**）。**它不表示索引新鲜度** ——
-  本仓没有记录索引构建时刻；weflow 的同名字段是索引构建完成时刻，两仓含义不同（允许差异）。
+- `updatedAt`（毫秒时间戳）是**索引构建/更新完成时刻**，客户端据此判断这份成员表有多旧：
+  空转同步（没有新行、没有名册变化）不会推进它，有新数据被吸收时才前移。
+  与 weflow 的同名字段同语义。
 - `members[].wxid`（发送者 UID）
 - `members[].displayName`（该群消息内首见昵称；**名册-only 成员回落 UID**，而不是空串）；
   `members[].nickname`（消息里带的昵称）；`members[].groupNickname`（本群群名片（40090）> 备注 > 最新昵称 > 档案昵称 > UID）
