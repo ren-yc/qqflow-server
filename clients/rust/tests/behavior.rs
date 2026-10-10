@@ -1217,7 +1217,7 @@ async fn media_bytes_by_id_fetches_a_single_segment_handle() {
     );
 }
 
-/// ② 302 无 Location ⇒ 跟随不可能发生，响应按非 2xx 归 `Status` —— 绝不 Ok。
+/// ① 首击 302 ＋ Location 指向**存在**的路径 ⇒ 跟随必须拿到目标字节，且跟随是第二次真实请求。
 #[tokio::test]
 async fn media_bytes_by_id_follows_a_first_hit_redirect_to_the_target_bytes() {
     let mock = Mock::default();
@@ -1237,5 +1237,27 @@ async fn media_bytes_by_id_follows_a_first_hit_redirect_to_the_target_bytes() {
         vec!["abc123.png", "abc123.png"],
         "跟随重定向必须是第二次真实请求"
     );
+}
+
+/// ② 首击 302 但 Location 指向**不存在**的路径 ⇒ 跟随得 404，必须归 `Status{404}` 而不是 Ok。
+/// 「重定向被当成成功」是网关/代理改写地址时最坏的失效方式：调用方拿到空字节还以为取到了。
+/// 与 weflow 侧同名测试同构（`media_bytes_by_id_never_treats_a_redirect_without_location_as_success`）。
+/// 构造真正的「无 Location 302」需要绕过 reqwest 的跟随语义；Location 缺失时 reqwest 视
+/// 为不可跟随并原样返回响应 —— 两种实现都把首击 3xx 归错误，这里钉的是可见分支。
+#[tokio::test]
+async fn media_bytes_by_id_never_treats_a_redirect_to_missing_target_as_success() {
+    let mock = Mock::default();
+    // 只设重定向、不设字节：跟随落到媒体面，未导出 ⇒ 404。
+    *mock.media_redirect.lock().unwrap() = Some("/api/v1/media/nowhere.png".to_string());
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+    let err = client
+        .media_bytes_by_id("abc123.png")
+        .await
+        .expect_err("跟随到 404 必须报错，绝不是 Ok");
+    match err {
+        ClientError::Status { status, .. } => assert_eq!(status, 404, "跟随后的 404 必须如实归 Status"),
+        other => panic!("3xx 跟随后的失败必须归 Status，实际 {other:?}"),
+    }
 }
 

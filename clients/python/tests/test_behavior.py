@@ -1113,6 +1113,44 @@ async def test_group_members_decodes_roster_page_and_sends_chatroom_param() -> N
     await client.aclose()
 
 
+async def test_group_members_absent_message_count_is_none_not_zero() -> None:
+    """``messageCount`` is a **conditional key** on this face: absent means
+    "counts were not asked for", and it must decode to `None` — a placeholder
+    `0` would be indistinguishable from a genuinely silent member.
+
+    The Rust side pins this with `Option` (`Some(0)` vs `None`); before this
+    test, every fixture row here carried the key, so the absent branch was
+    never exercised and a flattening regression in the decode layer would
+    have stayed green. `model_fields_set` is pydantic's record of which keys
+    actually arrived — that is the presence signal downstreams rely on.
+    """
+    mock = Mock()
+    mock.group_members_page = {
+        "success": True, "chatroomId": "123@chatroom", "count": 2,
+        "fromCache": False, "updatedAt": 1700000000123,
+        "members": [
+            # first row: no messageCount key at all (the server omits it here)
+            {"alias": "", "avatarUrl": "", "displayName": "潜水者",
+             "groupNickname": "", "isFriend": False, "isOwner": False,
+             "nickname": "", "remark": "", "wxid": "quiet"},
+            # second row: present and legitimately zero — the contrast that
+            # makes None-vs-0 a real distinction, not a coincidence
+            {"alias": "", "avatarUrl": "", "displayName": "张三",
+             "groupNickname": "", "isFriend": True, "isOwner": True,
+             "messageCount": 0, "nickname": "", "remark": "", "wxid": "alice"},
+        ],
+    }
+    client = make_client(mock)
+    page = await client.group_members("123@chatroom")
+    assert page.members[0].message_count is None, (
+        "absent key must stay absent: None, not a placeholder 0")
+    assert "message_count" not in page.members[0].model_fields_set, (
+        "the key itself never arrived; fields_set must not claim it did")
+    assert page.members[1].message_count == 0, "present-and-zero still decodes as 0"
+    assert "message_count" in page.members[1].model_fields_set
+    await client.aclose()
+
+
 async def test_group_members_omits_include_message_counts_when_false() -> None:
     mock = Mock()
     mock.group_members_page = {

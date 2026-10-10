@@ -2372,27 +2372,36 @@ mod golden {
     }
 
     /// 把易变值换成占位符（**掩码值，不删键**——删键会把形状一起丢掉）。
-    fn mask(value: &mut Value) {
+    ///
+    /// `tmp` 是本进程的临时目录根：本文件所有夹具路径（导出根、媒体根、假库）都由
+    /// `std::env::temp_dir()` 派生，因此任何**没被掩码点到**的路径字段都会带着它出现。
+    /// 那条断言是这套快照的关键（与 weflow 侧同名守卫对齐）：漏掩一个易变字段时，测试
+    /// 必须**响亮地失败**，而不是每次跑都生成一份新快照——后者会让人习惯性地点「更新
+    /// 快照」，护栏于是名存实亡。
+    fn mask(value: &mut Value, tmp: &str) {
         match value {
             Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
                     if VOLATILE_KEYS.contains(&key.as_str()) {
                         // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
                         // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
-                        // description 与类型一起从比对里抹掉——字段语义写红也不会红。
+                        // description 与类型一起从比对里抹掉——字段语义写反也不会红。
                         match val {
-                            Value::Object(_) | Value::Array(_) => mask(val),
+                            Value::Object(_) | Value::Array(_) => mask(val, tmp),
                             _ => *val = Value::String("<volatile>".into()),
                         }
                     } else {
-                        mask(val);
+                        mask(val, tmp);
                     }
                 }
             }
             Value::Array(items) => {
                 for it in items.iter_mut() {
-                    mask(it);
+                    mask(it, tmp);
                 }
+            }
+            Value::String(s) => {
+                assert!(!s.contains(tmp), "夹具路径从掩码外漏出：{s}");
             }
             _ => {}
         }
@@ -2591,6 +2600,8 @@ mod golden {
         let app = build_router(state);
         let update = std::env::var("UPDATE_GOLDEN").is_ok();
         std::fs::create_dir_all(golden_dir()).unwrap();
+        // 本文件的夹具路径全都源自这里（导出根、媒体根、假库），所以它就是泄漏判据。
+        let tmp_root = std::env::temp_dir().to_string_lossy().into_owned();
 
         let mut drifted: Vec<String> = Vec::new();
         for (name, method, uri, payload) in endpoints() {
@@ -2598,7 +2609,7 @@ mod golden {
             let keys = key_order(&raw_body);
             let mut snapshot =
                 serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
-            mask(&mut snapshot);
+            mask(&mut snapshot, &tmp_root);
             assert_no_wall_clock(&snapshot, name);
             let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
