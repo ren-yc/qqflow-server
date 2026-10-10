@@ -183,5 +183,5 @@ def test_merged_package_form_does_not_inject_either():
     guard exists to prevent, and the same submission that already handles the
     merged `--features=x` form.
     """
-    assert _run_wrapper(["test", "--package=weflow-client"]) == ["test", "--package=weflow-client"]
-    assert _run_wrapper(["test", "-pweflow-client"]) == ["test", "-pweflow-client"]
+    assert _run_wrapper(["test", "--package=qqflow-client"]) == ["test", "--package=qqflow-client"]
+    assert _run_wrapper(["test", "-pqqflow-client"]) == ["test", "-pqqflow-client"]

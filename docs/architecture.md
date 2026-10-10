@@ -263,7 +263,7 @@ tag，再驱动上面的执行入口。另有一步只跑 `nails-*`（四条数�
 | `GET /chatlab/sessions` | 会话发现面 | 只输出 ChatLab 形状；认 `cursor`（老面只认 `offset`） |
 | `GET /chatlab/messages` | 消息面（原「混合面」的新家） | `talker` 必填；信封**不带 `success`**、`count` 是本页条数、消息**升序**、翻页走 `page`；`media=1` 真正执行导出 |
 | `GET /chatlab/sessions/{id}/messages` | 拉取面（Pull 协议） | 与 `/api/v1/sessions/{id}/messages` 同一 handler、同一形状 |
-| `GET /chatlab/push/messages` | 通知面（SSE） | 只发元信息、不发正文；撤回帧带平台消息号 |
+| `GET /chatlab/push/messages` | 通知面（SSE） | 只发元信息、不发正文；**本仓所有帧都不带 `platformMessageId`**（取不到 ⇒ 整键省略，与 weflow 有意不同） |
 
 **读端点只有 GET**（老面的 `messages`/`sessions`/`contacts`/`group-members`/`media/{id}`/
 `push/messages` 的 POST 都是 405）；`/api/v1/sync` 与 `/health`、`/api/v1/accounts` 仍接受两个

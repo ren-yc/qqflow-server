@@ -66,16 +66,19 @@ bash 或 Python 3 缺失时，钩子**报错并阻止提交**（而非放行）�
 
 ## 发布
 
-版本号以 `Cargo.toml` 为唯一来源，不要在其他文件里再写一遍版本号。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
+版本号以 `Cargo.toml` 为准（根包与 `clients/rust` 两处都要改），不要在其他文件里再写一遍。推送 `v<版本>` tag 后，GitHub Actions（`.github/workflows/release.yml`）
 自动在 Windows / Linux / macOS 三平台构建 release 二进制，校验 tag 与 `Cargo.toml` 版本一致后，
 打包为 `qqflow-server-<版本>-<平台目标>` 归档并附 `SHA256SUMS` 发布到 GitHub Release。
 
-```bash
-cargo install cargo-edit            # 一次性；提供 cargo set-version
-cargo set-version 0.3.0             # 或手动编辑 Cargo.toml 的 version 字段
-git commit -am "chore: release v0.3.0"
-git tag v0.3.0 && git push origin master --tags   # tag 触发自动发布
-```
+发版步骤以 [`docs/release-runbook.md`](docs/release-runbook.md) 为唯一权威（凭据模型、
+首发顺序、人工审批闸门都在那里）。这里不复述流程——复述过就会漂移：被替换掉的那段
+示例里，版本号停在 0.3.0，而仓库已经发到 v0.7.0（第 11 个 tag）。要点三句：
+
+- 版本号在 `Cargo.toml`（根包与 `clients/rust`）与 `clients/python/pyproject.toml` 三处声明，
+  必须同步；tag 与根包版本不一致时 CI 的 guard 直接失败。
+- 推送 `v<版本>` tag 触发发布链；不可撤销的 registry 上传排在人工审批之后。
+- CI 的 guard **只**比对 tag 与根包版本（`cargo metadata` 取 `qqflow-server` 一条）；
+  `clients/rust` 与 `clients/python` 的版本没有门禁兜着，漏改不会有人拦——手册第 1 步就是干这个的。
 
 ## 运行
 

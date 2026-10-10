@@ -68,7 +68,7 @@ impl From<&MediaInfo> for PushMedia {
 /// **事件是提示，不是数据。** 它不保证送达（队列有界、服务会重启），也不保证顺序完整 ——
 /// 收到「有新消息」的正确反应是**去读那一页**，而不是把事件内容当权威。
 pub struct Event {
-    /// 事件名（`message.new` / `message.revoke` / `session.sync` …）。
+    /// 事件名（本仓只产三种：`message.new` / `message.revoke` / `sync`）。
     pub event: String,
     /// 所属会话：群聊是群号，私聊是对方 uid。
     pub session_id: String,
@@ -100,7 +100,7 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// `session.sync` 事件带的水位线：群表已索引到的 rowid。
+    /// `sync` 事件带的水位线：群表已索引到的 rowid。
     pub last_rowid_group: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// 同上，私聊表。

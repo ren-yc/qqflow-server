@@ -114,9 +114,10 @@
   回归位置：`subset_export_refuses_to_clobber_another_sessions_artifact`、
   `intentional_rerun_of_same_session_overwrites_itself`、`unowned_leftover_file_is_not_clobbered`、
   `refusing_a_collision_keeps_the_owner_exportable`（撤掉「带属主进清单」那一步实测变红）。
-- **文档：三个「上限」的口径区分**（无行为变化）：`limit`/`page_size` 的 HTTP 硬上限是 **10000**（两仓相同），
-  MCP 工具层的 `limit` 上限 **200** 是另一个面，`media=1` 的**每请求导出项上限 200** 又是第三个面。
-  三者过去常被混读成「两仓文档口径不一致」，现于「端点」一节列出对照表。
+- **文档：「上限」的口径区分**（无行为变化）：`limit`/`page_size` 的 HTTP 硬上限是 **10000**（两仓相同），
+  MCP 工具层的 `limit` 上限 **200** 是另一个面。此外曾在本文档里出现第三个 200（「`media=1` 每请求
+  导出上限」）—— 那句是**误记**：那是 weflow 服务端的 `jobs.truncate(200)`，本仓 `media=1` 不截断，
+  本仓 CLI 的 200 只是它自设的页大小。已在「端点」一节的对照表里改成如实标注。
 
 ### 新增
 

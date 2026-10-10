@@ -79,7 +79,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的 `media.fileName`
   **限定为确实落盘的那些句柄**。实现是**单遍**的：每取到一页 Pull 行，就用这一页的时间窗（`(since, nextSince]`
   正好对应消息面认的 `start`/`end`，两端都是闭区间的秒级戳；同秒的行必然落在同一页里，所以窗口两端不漏行）
-  调一次 `/chatlab/messages?media=1` 触发导出（该面**每请求最多导出 200 项**，超出部分靠翻页续传）并取字节，
+  调一次 `/chatlab/messages?media=1` 触发导出（每请求的条数由 CLI 自己设成 200，**服务端本仓不设导出条数闸门**）并取字节，
   然后才写这一页的行；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把 `fileName` 回填成可取句柄。
   **`--since` 因此同时下推到导出面**：过去它是两趟独立的全历史遍历，`--since` 只管住写出来的行、媒体照样把
   整个会话导出并重下一遍；而两趟之间若有并发同步推进水位，第一趟没覆盖到的消息会「有行、无句柄」地静默缺件。
@@ -187,12 +187,12 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 > | **10000** | `GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages` | **单个请求返回条数**的硬上限（`limit` 默认 100） |
 > | **5000** | Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages` | 单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同） |
 > | **200**（MCP）| MCP 工具参数 `limit`（见 `docs/mcp.md`）| **工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它是「模型经 MCP 取数据」这一层的自限，与 HTTP 上限不构成矛盾 |
-> | **200**（导出）| `media=1` 的**每请求导出项上限**（见「媒体导出」小节）| 一次请求**最多触发 200 项媒体导出**，不是返回条数上限；超出的项保持未导出，`exported` 不为真 |
+> | **200**（CLI 页大小，非闸门）| `--with-media` 每次调 `/chatlab/messages?media=1` 时自设的 `limit`（源码：`src/cli.rs` 的导出窗口循环）| 它是**调用方**一次请求带多少条的选择，不是服务端上限；**本仓 `media=1` 不截断导出项**（对照：weflow 服务端确有 `jobs.truncate(200)` 这道闸门）|
 >
 > 两点容易踩的坑：① `GET /api/v1/group-members` **没有 `limit`**（整名册一次给全，不参与上面的换算）；
 > ② SDK 形参 `page_size`（`list_all_sessions`）**不是 HTTP 参数名**——它内部发的就是 `limit`，
-> 拿它当「另一个上限」会算错。所以「联系人一次最多能拿多少」＝10000，走 MCP 则被压到 200，
-> 而 `media=1` 的 200 与这两者**无关**。
+> 拿它当「另一个上限」会算错。所以「联系人一次最多能拿多少」＝10000，走 MCP 则被压到 200。
+> 另注：**本仓的 `media=1` 没有导出条数闸门**（weflow 才有），别把那边的那个 200 当跨仓常量。
 > 本仓没有朋友圈面（`/api/v1/sns/*` 是 weflow-only：QQ NT 本地库不含朋友圈数据），因此 weflow 侧那条 500 上限不适用本表。
 
 > v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（§3.2，WeFlow 形状）。
@@ -208,9 +208,9 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 两点使用提示：
 
-- **多形状端点用 `oneOf`**。`/api/v1/sessions`、`/api/v1/messages`、`/api/v1/accounts`（POST）
-  的响应形状由参数或状态决定，描述里列的是若干可能形状的并集 —— 生成客户端时应按 `oneOf`
-  处理，而不是当成「所有字段都可能存在」。
+- **多形状端点用 `oneOf`**。0.7.0 把 ChatLab 形状拆成独立路由后，老面只剩单一形状，
+  现在只有 `POST /api/v1/accounts` 与 `DELETE /api/v1/accounts/{qq}` 还用 `oneOf`（响应由状态
+  决定）—— 生成客户端时应按 `oneOf` 处理它们，而不是当成「所有字段都可能存在」。
 - **描述随 DTO 变**。改 DTO 就会改它；`tests/openapi.rs` 保证描述自身自洽（每个 `$ref` 都能
   解析、operationId 唯一、多形状确实用 `oneOf`），golden 快照保证它的变更有人看过。
 - **字节面与 SSE 面如实标注媒体类型**：媒体路由是 `application/octet-stream`（binary），
@@ -494,9 +494,12 @@ GET /api/v1/push/messages
 「哪张表」编码进**字段名**里，加第三张表就必须再加一个字段，消费方得靠约定去配对。现在它是数据：
 
 ```json
-{"event":"sync","watermarks":[{"table":"group_msg_table","watermark":{"rowid":12345}},
-                                  {"table":"c2c_msg_table","watermark":{"rowid":678}}]}
+{"event":"sync","generation":3,"watermarks":[{"table":"group_msg_table","watermark":{"rowid":12345}},
+                                           {"table":"c2c_msg_table","watermark":{"rowid":678}}]}
 ```
+
+`generation` **恒出现**（注销时递增），键集就是这三样 —— 回归位置 `tests/sse_shape.rs` 里对
+基线帧键集与 `generation` 类型的断言。
 
 - **没有水位的表那一项直接不出现** —— 「还没扫过」与「扫过但没数据」在下游是两件事。
 - **`watermark` 的对象形状与 weflow 不同**：这里是 `{"rowid": N}`，weflow 是
@@ -581,7 +584,10 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
     拿它做展示预估可以，拿它做「群里一共几个人」的断言不行。
   - 「没有名册」与「名册是空的」在下游是两件事 —— 前者不该被读成 `0`，所以是可选键而不是给 0。
 
-排序为最后消息时间降序、`id` 升序 —— 稳定，游标翻页因此不会跳项或重复。
+排序为最后消息时间**降序**、同刻按 `id`（talker）**升序** —— 决定性顺序，游标翻页因此不会跳项或
+重复。次键不是装饰：会话集合的底层容器是 `HashMap`，迭代顺序随进程变，没有次键时同刻的两个会话
+会在不同进程里换位置，`skip/take` 翻页于是会重复拿到一个、同时漏掉另一个（回归位置：
+`same_timestamp_sessions_page_stably_across_rebuilt_stores`）。
 
 ### ChatLab 通知面（GET `/chatlab/push/messages`）
 
@@ -595,7 +601,8 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 | 定位 | WeFlow 兼容面 —— 已有客户端在解析它 | 规范里的通知通道 |
 
 ```json
-{ "event": "message.new", "eventId": "…", "platformMessageId": null, "sessionId": "…", "timestamp": 1700000000 }
+{ "event": "message.new", "eventId": "…", "sessionId": "…", "timestamp": 1700000000 }
+// 没有 platformMessageId 这个键：本面取不到平台消息号 ⇒ 整键省略（撤回帧同样没有）。
 ```
 
 - **为什么不带正文**：规范对这条通道的定位是「仅通知：ChatLab 不假设 SSE 事件可靠送达」——
@@ -855,8 +862,8 @@ GET /api/v1/sessions
 | `keyword` | string | 否   | 匹配 `username` 或 `displayName` |
 | `limit`   | number | 否   | 默认 `100`，范围 `1~10000`       |
 | `offset`  | number | 否   | 分页偏移，默认 `0`               |
-| `cursor`  | string | 否   | 翻页游标：把上一次响应的 `page.nextCursor` 原样传回。解析不了就退回 `offset`；两者做同一件事（本面按偏移翻页），`cursor` 只是免去调用方自己算下一个偏移 |
-| `format`  | string | 否   | `chatlab` 时输出 ChatLab 格式    |
+| `cursor`  | string | **本面忽略** | 只有 `/chatlab/sessions` 认它（`page.nextCursor` 的回传入参）。老面继续接受它不会报错，而是**静默回到第一页** —— 传了却拿回第一页是最难发现的失效方式，需要游标翻页请用 ChatLab 面 |
+| ~~`format`~~ | — | **已删除** | 0.7.0 起不存在：ChatLab 形状改成独立路由，不再靠参数切换。传了会被无视 |
 
 ### 响应字段（按最后消息时间倒序）
 
@@ -1082,7 +1089,7 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | --- | --- | --- |
 | 未请求导出时的 `media.exportPath` | 省略键 | 键恒出现（值是导出根） |
 | SSE `message.new` 的 `groupName` / `media` | 条件键（没有就不出现） | 键恒出现，无值时 `null` |
-| 通知帧 `platformMessageId` | 恒省略 | 键恒出现：`message.new` 为 `null`，`message.revoke` 为平台号 |
+| 通知帧 `platformMessageId` | **所有帧恒省略**（含撤回帧） | 键恒出现：`message.new` 为 `null`，`message.revoke` 为平台号 |
 | 未请求计数时的 `members[].messageCount` | 省略键 | 键恒出现，值为 `0`（见第 6 节） |
 
 ---

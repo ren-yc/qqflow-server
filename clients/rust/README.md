@@ -14,11 +14,20 @@ cargo add qqflow-client
 
 ```rust
 use std::time::Duration;
+use qqflow_client::client::{Client, ClientError};
 
-let client = qqflow_client::Client::new("http://127.0.0.1:5032", "your-token");
-client.wait_ready("<qq>", Duration::from_secs(30)).await?;
-let sessions = client.list_all_sessions(Default::default()).await?;
+#[tokio::main]
+async fn main() -> Result<(), ClientError> {
+    let client = Client::new("http://127.0.0.1:5032", "your-token");
+    client.wait_ready("<qq>", Duration::from_secs(30)).await?;
+    // page_size / keyword are both optional; None keeps the server defaults.
+    let sessions = client.list_all_sessions(None, None).await?;
+    println!("{} sessions", sessions.len());
+    Ok(())
+}
 ```
+
+需要 `tokio`（`rt-multi-thread` ＋ `macros`）作为依赖 —— SDK 自身用 tokio 做超时与重试。
 
 ## Scope
 

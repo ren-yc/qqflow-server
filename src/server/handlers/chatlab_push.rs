@@ -69,7 +69,7 @@ pub async fn handler(
 fn serialize_notification(ev: Event) -> (String, serde_json::Value) {
     use crate::server::dto::NotificationFrame;
     let name = ev.event.clone();
-    // `session.sync` 一类的基线事件没有对应的消息 —— 它只告诉客户端「水位变了，去拉」。
+    // 基线事件（`sync`）没有对应的消息 —— 它只告诉客户端「水位变了，去拉」。
     // 通知面因此把它压成同一形状：有 id 就带，没有就为 null。
     let is_message = name == "message.new" || name == "message.revoke";
     // 基线事件（`sync` 一类的 `session.*`）带代号；消息类不带这个键（见 DTO 的字段说明）。
@@ -80,7 +80,7 @@ fn serialize_notification(ev: Event) -> (String, serde_json::Value) {
     };
     let frame = NotificationFrame {
         event: name.clone(),
-        // 空串**显式映射成 None**：基线事件（如 session.sync）没有会话，而
+        // 空串**显式映射成 None**：基线事件（`sync`）没有会话，而
         // skip_serializing_if 对空串无效 —— 不映射就会下发一个空的 sessionId，
         // 读者无法把它与「真的有一个空 id 的会话」区分开。
         event_id: if is_message { Some(ev.rawid.clone()) } else { None },
