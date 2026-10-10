@@ -328,7 +328,7 @@ POST /api/v1/accounts
 ```
 
 **Token 走请求头** `Authorization: Bearer <TOKEN>`（或查询串 `?access_token=`）。**body 里的
-`access_token`/`token` 会被跳过**（既不鉴权也不覆盖查询串）——把它写进 body 会得到 401。
+`access_token`/`token` 会被跳过**（既不鉴权、也不覆盖查询串里的值）——只把 token 写在 body 里（Header 与查询串都不带）会得到 401。
 
 | 参数 | 类型 | 必填 | 说明 |
 | ---- | ---- | ---- | ---- |
@@ -462,7 +462,7 @@ Authorization: Bearer YOUR_TOKEN
 GET /api/v1/push/messages
 ```
 
-**只有 GET**（POST 一律 405）。SSE 长连接推荐 `?access_token=`（见 §1 的两条通道）。
+**只有 GET**（POST 一律 405）。SSE 长连接推荐 `?access_token=`（两条鉴权通道见上文「鉴权规范」）。
 
 ### 说明
 
@@ -1268,8 +1268,11 @@ POST /api/v1/sync
 ### cURL
 
 ```bash
-# 取 token：存在系统凭据库里，不落文件；用子命令打印（PowerShell 与 bash 都可用）
+# 取 token：它存在系统凭据库里、不落文件，只能用子命令打印。
+# bash / Git-Bash：
 TOKEN=$(qqflow-server token)
+# PowerShell（`VAR=$(…)` 是 bash 语法，PowerShell 里会当成命令名报错、$TOKEN 变空）：
+#   $TOKEN = qqflow-server token
 # 注册账号（客户端驱动启动；密钥仅内存保存）。鉴权走 Header，别把 token 放进 body。
 curl -X POST http://127.0.0.1:5032/api/v1/accounts \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -1379,7 +1382,7 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
   退回任一路由即变红）、`test_published_timeout_budgets_travel_per_request` 与
   `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，
   不是只读常量）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
-- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（`/health` 是唯一免鉴权端点）。
+- 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（免鉴权的只有 `/health`、`/api/v1/health` 与描述面 `/openapi.json`）。
 - 自 0.9.0 起发布到 crates.io（crate `qqflow-client`）；本地开发仍可直接 `cargo build -p qqflow-client`。
 
 - **Python 侧**：`clients/python`（包 `qqflow-sdk`）。模型生成走 `scripts/regen.py`
