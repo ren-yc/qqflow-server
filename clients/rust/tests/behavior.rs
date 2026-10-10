@@ -231,9 +231,10 @@ async fn media_route(
 ) -> Response {
     assert_bearer(&headers);
     mock.media_calls.lock().unwrap().push(id);
-    // 「首击即 3xx」夹具：槽位非空时本请求以 302 应答（Location 指向自身路径），
+    // 「首击即 3xx」夹具：槽位非空时本请求以 302 应答，Location 用**槽位里的值**
+    // （由测试自己填：指向自身路径＝跟随后拿字节，或指向不存在的路径＝跟随后 404），
     // 然后清槽 —— 下一次请求走正常字节路径。reqwest 默认跟随重定向，
-    // 所以「跟随后的语义（拿到目标字节）」与「无 Location 时的错误分类」各有一条断言。
+    // 所以上面两种归类法各有一条断言（follows_a_first_hit_redirect… / never_treats_a_redirect…）。
     if let Some(loc) = mock.media_redirect.lock().unwrap().take() {
         return axum::response::Response::builder()
             .status(StatusCode::FOUND)
@@ -1241,7 +1242,8 @@ async fn media_bytes_by_id_follows_a_first_hit_redirect_to_the_target_bytes() {
 
 /// ② 首击 302 但 Location 指向**不存在**的路径 ⇒ 跟随得 404，必须归 `Status{404}` 而不是 Ok。
 /// 「重定向被当成成功」是网关/代理改写地址时最坏的失效方式：调用方拿到空字节还以为取到了。
-/// 与 weflow 侧同名测试同构（`media_bytes_by_id_never_treats_a_redirect_without_location_as_success`）。
+/// 对应 weflow 侧的 `media_bytes_by_id_never_treats_a_redirect_without_location_as_success`
+/// （函数名不同：weflow 那位的 mock 用「Location 指向不存在的路径」，本仓的名字按本地实况取）。
 /// 构造真正的「无 Location 302」需要绕过 reqwest 的跟随语义；Location 缺失时 reqwest 视
 /// 为不可跟随并原样返回响应 —— 两种实现都把首击 3xx 归错误，这里钉的是可见分支。
 #[tokio::test]

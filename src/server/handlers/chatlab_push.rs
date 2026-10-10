@@ -72,7 +72,7 @@ fn serialize_notification(ev: Event) -> (String, serde_json::Value) {
     // 基线事件（`sync`）没有对应的消息 —— 它只告诉客户端「水位变了，去拉」。
     // 通知面因此把它压成同一形状：有 id 就带，没有就为 null。
     let is_message = name == "message.new" || name == "message.revoke";
-    // 基线事件（`sync` 一类的 `session.*`）带代号；消息类不带这个键（见 DTO 的字段说明）。
+    // 基线事件（只有 `sync` 这一种）带代号；消息类不带这个键（见 DTO 的字段说明）。
     let generation = if is_message {
         None
     } else {
