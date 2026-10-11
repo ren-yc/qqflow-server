@@ -1533,4 +1533,3 @@ async def test_sdk_watch_raises_on_an_unusable_base_url_instead_of_looping_forev
     assert isinstance(exc.value, TransportError), repr(exc.value)
     assert "base_url" in str(exc.value).lower(), str(exc.value)
     await client.aclose()
-

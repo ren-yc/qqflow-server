@@ -132,4 +132,3 @@ pub fn account_entry<'a>(detail: &'a Value, qq: &str) -> &'a Value {
         .find(|a| a["qq"] == qq)
         .unwrap_or_else(|| panic!("account {qq} missing from {detail}"))
 }
-

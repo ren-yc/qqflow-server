@@ -2498,5 +2498,3 @@ fn probe_group_owner_candidates() {
         );
     }
 }
-
-

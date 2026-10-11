@@ -155,4 +155,3 @@ pub fn query_contacts(store: &Store, keyword: Option<&str>, limit: usize, offset
         total,
     )
 }
-

@@ -518,4 +518,3 @@ pub fn open_fake_source(nt_db_dir: &Path, extra: u32) -> (Connection, std::path:
     let main = materialize_source(nt_db_dir);
     (conn, main)
 }
-

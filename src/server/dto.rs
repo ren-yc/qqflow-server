@@ -518,4 +518,3 @@ pub struct WatermarkValue {
     /// SQLite 行号。
     pub rowid: i64,
 }
-
