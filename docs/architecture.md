@@ -99,6 +99,21 @@ QQ 数据目录（nt_db 等）
 | `server/handlers/mod.rs` | **handler 之间的共享件**：参数解析、信封合并 | `merge_body` / `parse_limit` | — |
 | `server/handlers/*` | 各端点的实现（account / session / message / contact / media / push） | — | → `store` / `sync` |
 
+### 目录结构
+
+```text
+src/
+├─ config.rs / logging.rs      # 命令行与数据目录、日志
+├─ keystore/                   # 密钥形状校验；仅内存
+├─ db/                         # SQLCipher 打开/校验、值驱动探测、偏移 VFS
+├─ parser/                     # 消息内容解析（proto / 类型占位符）
+├─ store/                      # 内存索引（会话/联系人/消息/水位）＋查询
+├─ sync/                       # 增量同步引擎（poll + 事件）＋ watch
+└─ server/                     # axum：鉴权、账号注册、端点、SSE、媒体
+tests/                         # 假库夹具、HTTP 契约、e2e、真库探针（#[ignore]）
+clients/                       # 类型化 SDK（rust / python / ts；ts 未发布）
+```
+
 ## 库面与 feature
 
 这个 crate **既是服务、也是库**，两条路径共用同一份实现。
