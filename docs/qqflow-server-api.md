@@ -1420,6 +1420,14 @@ sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, hea
   | `sync_now()` | `POST /api/v1/sync` | **写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中） |
   | `watch()` | SSE `/api/v1/push/messages` | `Last-Event-ID` 重连（游标**只在帧被消费时推进**：只有 `id:` 没有 `data:` 的悬空帧不推进，否则那条事件会从重放窗口消失）、心跳注释帧过滤、`generation` 变化上报；老面 `message.new`/`message.revoke` 载荷由客户端自有类型解码——它们不在描述 schema 里 |
 
+  **Python 同步门面 `SyncClient`**：方法面与 `Client` 一一对应，导出自 `qqflow_sdk`；内部跑一条
+  专属事件循环线程（不占用调用方的 loop，也不要求调用方在协程里），`with SyncClient(...) as c:`
+  即用即关。`watch()` 返回普通迭代器，断连/`Last-Event-ID` 重放语义与 async 版相同；`drain_session`
+  的 `on_page` 在调用方线程执行。回归位置：`test_sync_client_health_and_accounts`、
+  `test_sync_client_drain_session_runs_callbacks_on_the_caller_thread`、
+  `test_sync_client_wait_ready_timeout_names_the_last_state`、
+  `test_sync_client_watch_yields_events_without_an_async_loop`（Python 两侧同名）。
+
   **两个容易读错的地方**：① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/
   `list_messages`/`contacts` 只取一页（后两者那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收
   `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
