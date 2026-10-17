@@ -1,0 +1,24 @@
+{
+  "body": {
+    "progress": {
+      "messages_indexed": 8,
+      "tables_done": 1,
+      "tables_total": 2
+    },
+    "qq": "10001",
+    "state": "in_progress",
+    "status": "indexing",
+    "success": true
+  },
+  "keys": [
+    "progress",
+    "messages_indexed",
+    "tables_done",
+    "tables_total",
+    "qq",
+    "state",
+    "status",
+    "success"
+  ],
+  "status": 200
+}

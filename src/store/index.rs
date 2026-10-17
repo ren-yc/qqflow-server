@@ -15,6 +15,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parser::types::{seq_to_time, ChatType, MediaInfo, MessageRecord, MsgType};
 use crate::parser::{self};
@@ -338,12 +339,67 @@ pub fn reapply_media_registration(store: &mut Store) {
     }
 }
 
+/// 建索引期间**可被无锁读取**的进度计数。
+///
+/// 为什么不是 `Store` 的字段：`build_index` 把构建结果一次性换入，而 HTTP 侧要在这段时间
+/// 回答「现在到哪了」。放进 `Store` 就得先拿写锁，那正是最长的那把锁 —— 所以这里是
+/// `Arc` 包着的原子量，挂在账号状态上。
+///
+/// 口径：分母只数**消息表**（本仓是 `group_msg_table` / `c2c_msg_table` 两张）。
+/// 行数**逐行**推进：只在表末一次性加行数会让大表在整个读取期间停在旧值上，
+/// 客户端看到的进度反而更假。
+#[derive(Debug, Default)]
+pub struct IndexProgress {
+    tables_done: AtomicUsize,
+    tables_total: AtomicUsize,
+    messages_indexed: AtomicUsize,
+}
+
+/// [`IndexProgress`] 的一致性快照（三个数取自同一时刻之后，允许彼此差一两张表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressSnapshot {
+    pub messages_indexed: usize,
+    pub tables_done: usize,
+    pub tables_total: usize,
+}
+
+impl IndexProgress {
+    /// 分母落定，同时把上一轮的两个累计清零。
+    ///
+    /// 复用一个 `Arc` 做第二次全量构建时，进度必须从零开始；继承上一轮的数会让
+    /// `messages_indexed` 超过新分母，读起来像卡住或倒流。
+    pub fn set_tables_total(&self, total: usize) {
+        self.tables_total.store(total, Ordering::Relaxed);
+        self.tables_done.store(0, Ordering::Relaxed);
+        self.messages_indexed.store(0, Ordering::Relaxed);
+    }
+
+    /// 成功读入索引一行：只推进行数，不动表计数。
+    pub fn row_indexed(&self) {
+        self.messages_indexed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 一张消息表读完：只推进表计数（行数已由 [`IndexProgress::row_indexed`] 累计）。
+    pub fn finish_table(&self) {
+        self.tables_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            messages_indexed: self.messages_indexed.load(Ordering::Relaxed),
+            tables_done: self.tables_done.load(Ordering::Relaxed),
+            tables_total: self.tables_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
 fn scan_table(
     conn: &Connection,
     table: &str,
     cols: TableCols,
     chat_type: ChatType,
     store: &mut Store,
+    progress: Option<&IndexProgress>,
 ) -> Result<i64> {
     // `rowid` needs an explicit alias: QQ declares "40001" as INTEGER
     // PRIMARY KEY (the rowid alias), so SQLite names the bare `rowid`
@@ -366,6 +422,9 @@ fn scan_table(
         };
         watermark = watermark.max(d.rowid);
         apply_record(store, row_to_record(chat_type, d));
+        if let Some(progress) = progress {
+            progress.row_indexed();
+        }
     }
     Ok(watermark)
 }
@@ -387,9 +446,10 @@ pub fn build_with(
     conn: &Connection,
     nt_db_dir: &std::path::Path,
     key: &str,
+    progress: Option<&IndexProgress>,
 ) -> anyhow::Result<Store> {
     let media_root = super::media::media_root_of(nt_db_dir);
-    let mut st = build_index(conn, media_root.as_deref())?;
+    let mut st = build_index(conn, media_root.as_deref(), progress)?;
     // uid→备注/QQ、群号→群名 maps（尽力而为 —— schema 变动时为空）。
     st.names = super::names::load_names(
         conn,
@@ -416,7 +476,7 @@ pub fn open_reader_and_build(
     let nt_db_dir = db_path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let st = {
         let conn = reader.acquire()?;
-        build_with(conn, nt_db_dir, key)?
+        build_with(conn, nt_db_dir, key, None)?
     };
     Ok((reader, st))
 }
@@ -434,7 +494,11 @@ pub fn open_and_build(
     let (_reader, st) = open_reader_and_build(db_path, key)?;
     Ok(st)
 }
-pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> Result<Store> {
+pub fn build_index(
+    conn: &Connection,
+    media_root: Option<&std::path::Path>,
+    progress: Option<&IndexProgress>,
+) -> Result<Store> {
     let mut store = Store {
         media_root: media_root.map(std::path::Path::to_path_buf),
         ..Store::default()
@@ -447,10 +511,21 @@ pub fn build_index(conn: &Connection, media_root: Option<&std::path::Path>) -> R
     }
     let g_cols = probe_cols(conn, GROUP_TABLE);
     let c_cols = probe_cols(conn, C2C_TABLE);
-    store.watermark_group = scan_table(conn, GROUP_TABLE, g_cols, ChatType::Group, &mut store)
-        .context("scan group_msg_table")?;
-    store.watermark_c2c = scan_table(conn, C2C_TABLE, c_cols, ChatType::C2c, &mut store)
-        .context("scan c2c_msg_table")?;
+    if let Some(progress) = progress {
+        progress.set_tables_total(2);
+    }
+    store.watermark_group =
+        scan_table(conn, GROUP_TABLE, g_cols, ChatType::Group, &mut store, progress)
+            .context("scan group_msg_table")?;
+    if let Some(progress) = progress {
+        progress.finish_table();
+    }
+    store.watermark_c2c =
+        scan_table(conn, C2C_TABLE, c_cols, ChatType::C2c, &mut store, progress)
+            .context("scan c2c_msg_table")?;
+    if let Some(progress) = progress {
+        progress.finish_table();
+    }
     // Final lazy sort is applied on first query; force now so queries are clean.
     for conv in store.convs.values_mut() {
         conv.ensure_sorted();
@@ -548,7 +623,7 @@ mod tests {
             "INSERT INTO c2c_msg_table VALUES ('', 200, '王五', CAST('没有对端' AS BLOB));",
         )
         .unwrap();
-        let store = build_index(&conn, None).unwrap();
+        let store = build_index(&conn, None, None).unwrap();
         let keys: Vec<&String> = store.convs.keys().collect();
         assert!(
             !keys.iter().any(|k| k.ends_with(':')),
@@ -574,7 +649,7 @@ mod tests {
     #[test]
     fn full_columns_produce_direction_ts_and_card() {
         let conn = make_table(true);
-        let store = build_index(&conn, None).unwrap();
+        let store = build_index(&conn, None, None).unwrap();
         let conv = store.conversation(ChatType::Group, "10001").unwrap();
         assert_eq!(conv.msgs.len(), 1);
         let m = &conv.msgs[0];
@@ -622,7 +697,7 @@ mod tests {
         // map_row must still resolve every row (it used to fail and the
         // whole index silently came up empty on a real QQ db).
         let conn = make_table_int_pk();
-        let store = build_index(&conn, None).unwrap();
+        let store = build_index(&conn, None, None).unwrap();
         assert_eq!(store.convs.len(), 2, "group + c2c conversations indexed");
         assert_eq!(store.watermark_group, 123);
         assert_eq!(store.watermark_c2c, 456);
@@ -643,7 +718,7 @@ mod tests {
     #[test]
     fn missing_columns_degrade() {
         let conn = make_table(false);
-        let store = build_index(&conn, None).unwrap();
+        let store = build_index(&conn, None, None).unwrap();
         let conv = store.conversation(ChatType::Group, "10001").unwrap();
         let m = &conv.msgs[0];
         assert_eq!(m.direction, None, "no 40013 -> None");
@@ -662,5 +737,70 @@ mod tests {
         assert_eq!(records[0].ts, 1234567890);
         assert_eq!(records[0].from_nick, "张三");
         assert_eq!(records[0].card.as_deref(), Some("群名片"));
+    }
+
+    /// 进度计数：分母由枚举设定；行数逐行推进，表完成只推进 done。
+    ///
+    /// 这条守的是「计数器本身」——`indexing` 形状的快照用例守序列化，两者分开，
+    /// 因为一个坏掉的计数器可以被一份同样坏掉的快照固化成「预期值」。
+    #[test]
+    fn progress_counters_advance_per_row_and_table() {
+        let p = IndexProgress::default();
+        assert_eq!(
+            p.snapshot(),
+            ProgressSnapshot {
+                messages_indexed: 0,
+                tables_done: 0,
+                tables_total: 0
+            },
+            "未设分母时三个数都该是零（客户端按「未知」处理）"
+        );
+        p.set_tables_total(2);
+        for _ in 0..8 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        for _ in 0..5 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        let s = p.snapshot();
+        assert_eq!(s.tables_total, 2, "分母只由 set_tables_total 设定");
+        assert_eq!(s.tables_done, 2);
+        assert_eq!(s.messages_indexed, 13, "行数逐行累加，不按表批量加");
+    }
+
+    /// 分母重设同时清零上一轮的累计：同一个 `Arc` 被第二次构建复用时不能继承旧值。
+    #[test]
+    fn set_tables_total_resets_previous_accumulation() {
+        let p = IndexProgress::default();
+        p.set_tables_total(2);
+        for _ in 0..4 {
+            p.row_indexed();
+        }
+        p.finish_table();
+        p.set_tables_total(2);
+        let s = p.snapshot();
+        assert_eq!(s.messages_indexed, 0, "新一轮的行数必须从零开始");
+        assert_eq!(s.tables_done, 0, "新一轮的表数必须从零开始");
+        assert_eq!(s.tables_total, 2);
+    }
+
+    /// 进度不是只在计数器 API 上「自说自话」：真实 `build_index` 路径每解析一行就必须
+    /// 推进同一个 `IndexProgress`。缺了这条，`row_indexed()` 的接线被删掉，计数器单测
+    /// 与 golden 都仍绿。
+    #[test]
+    fn build_index_advances_the_shared_counter() {
+        let conn = make_table(true);
+        let progress = IndexProgress::default();
+        let store = build_index(&conn, None, Some(&progress)).expect("夹具表必须可读");
+        let expected: usize = store.convs.values().map(|c| c.msgs.len()).sum();
+        let s = progress.snapshot();
+        assert_eq!(s.tables_total, 2, "分母是两张消息表");
+        assert_eq!(s.tables_done, 2, "两张表都读完后表计数应到 2");
+        assert_eq!(
+            s.messages_indexed, expected,
+            "计数器必须与真正装进 store 的行数一致"
+        );
     }
 }

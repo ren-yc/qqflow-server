@@ -423,6 +423,14 @@ QQ 数据目录（含 `nt_msg.db`、同族库 `group_info.db`、
 「与标准 / 安装版的已知差异」与「字段无值时怎么表示」两节。改 DTO 之前先读那两节 ——
 那里的每个键都被 golden 快照或 `tests/sse_shape.rs` 的键集断言钉住。
 
+### 建索引进度用 `Arc` 原子计数，不碰 `Store` 的锁
+
+`build_index` 建索引期间把结果一次性换入，而 HTTP 侧要在这段时间回答「现在到哪了」。
+进度因此不放进 `Store`（那要先拿写锁，正好是等得最久的那把），而是 `Arc<IndexProgress>`
+挂在账号状态上：建索引路径逐行/逐表更新原子量，HTTP 侧无锁读快照。分母只数消息表
+（`group_msg_table` / `c2c_msg_table` 两张）；读失败的表不推进 `tables_done`，
+结束时 `tables_done` 比 `tables_total` 少一格，是「确实有一条表没读成」的诚实表达。
+
 ### 明文头偏移：`cipher_plaintext_header_size` 做不到这件事
 
 库文件前 1024 字节是明文头，常规做法是用 SQLCipher 的 `cipher_plaintext_header_size`

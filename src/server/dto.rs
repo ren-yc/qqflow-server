@@ -63,8 +63,29 @@ pub struct AccountView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub message_count: usize,
+    /// `indexing` 态才有；其余态整块省略（条件键，与 `error` 同族）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IndexProgressDto>,
     pub qq: String,
     pub state: crate::server::AccountStatus,
+}
+
+/// 建索引进度（**只在 `indexing` 态出现**）。
+///
+/// 三个键同生同灭：客户端要么一次拿到完整的三个数，要么整块缺失——所以每个承载它的
+/// 响应字段都是 `Option` ＋ `skip_serializing_if`（缺省即没有，不是 `null`）。
+///
+/// 分母口径是**消息表**：本仓为 `group_msg_table` / `c2c_msg_table` 两张。
+/// 行数逐行推进；读失败的行不计入。表失败时 `tables_done` 会比 `tables_total` 少一格 ——
+/// 那正是「有一条表确实没读成」的诚实表达。
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct IndexProgressDto {
+    /// 已成功读入索引的消息行累计值（逐行推进；读失败的行不计）。
+    pub messages_indexed: usize,
+    /// 已扫完的消息表数。
+    pub tables_done: usize,
+    /// 消息表总数（本账号本次构建的枚举结果）。
+    pub tables_total: usize,
 }
 
 /// 注册**受理**（或幂等命中）。
@@ -76,6 +97,9 @@ pub struct AccountView {
 pub struct AccountRegistered {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_path: Option<String>,
+    /// `indexing` 态才有；`ready` 态整块省略——完成度是 100%，再报一遍只是冗余键。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IndexProgressDto>,
     pub qq: String,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +112,9 @@ pub struct AccountRegistered {
 pub struct AccountConflict {
     pub occupied_by: String,
     pub occupied_status: crate::server::AccountStatus,
+    /// 在位账号若正在建索引，把它的进度一起带回来。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IndexProgressDto>,
     pub qq: String,
     pub state: String,
     pub success: bool,

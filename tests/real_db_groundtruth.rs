@@ -157,7 +157,7 @@ fn fake_db_indexes_c2c_rows() {
     let mut reader = LiveReader::new(path, FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None, None).unwrap();
     drop(reader);
 
     println!(
@@ -189,7 +189,7 @@ fn fake_db_names_loaded() {
     let mut reader = LiveReader::new(path, FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let mut store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    let mut store = qqflow_server::store::index::build_index(conn, None, None).unwrap();
     let known = qqflow_server::store::names::KnownKeys::from_store(&store);
     let maps = qqflow_server::store::names::load_names(conn, &nt_db, FAKE_KEY, &known);
     drop(reader);
@@ -303,7 +303,7 @@ async fn fake_db_group_members_is_roster_union_senders() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let mut store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    let mut store = qqflow_server::store::index::build_index(conn, None, None).unwrap();
     drop(reader);
     // 名册与群主住 group_info.db；服务器启动时走的是同一条装载路径（build_with 内部）。
     let meta = qqflow_server::store::group_meta::load_group_meta(&nt_db, FAKE_KEY);
@@ -376,7 +376,7 @@ fn fake_db_index_media_metadata() {
     // Media registration needs the account's nt_data root: `resolve_local_path`
     // contains its result to it, so passing None registers nothing at all.
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
-    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref(), None).unwrap();
     drop(reader);
 
     // Media map: md5 key -> local cache file.
@@ -437,7 +437,7 @@ async fn fake_db_media_endpoint_serves_bytes() {
     // See `fake_db_index_media_metadata`: without the nt_data root the local
     // path is contained out and no media registers, so there is nothing to serve.
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
-    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref(), None).unwrap();
     drop(reader);
     drop(writer);
 
@@ -516,7 +516,7 @@ async fn fake_db_media_fallback_registers_and_serves() {
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
-    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref(), None).unwrap();
     drop(reader);
     drop(writer);
 
@@ -587,7 +587,7 @@ fn fake_db_media_fallback_first_wins_and_no_match() {
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
-    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref(), None).unwrap();
     drop(reader);
     drop(writer);
 
@@ -629,7 +629,7 @@ async fn fake_db_media_export_serves_exported_bytes() {
     // See `fake_db_index_media_metadata`: the export copies FROM the local
     // cache, so it needs the nt_data root that contains those paths.
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
-    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref()).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, media_root.as_deref(), None).unwrap();
     drop(reader);
     drop(writer);
 
@@ -888,6 +888,7 @@ async fn client_registers_account_with_key_and_db_path() {
             state: AccountStatus::AwaitingKey,
             message_count: 0,
             error: None,
+            progress: None,
         }])),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         token: Arc::new("test-token".into()),
@@ -1014,7 +1015,7 @@ fn fake_db_reply_is_stated_only_when_unambiguous() {
     let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
-    let store = qqflow_server::store::index::build_index(conn, None).unwrap();
+    let store = qqflow_server::store::index::build_index(conn, None, None).unwrap();
     drop(reader);
 
     let q = MessageQuery {

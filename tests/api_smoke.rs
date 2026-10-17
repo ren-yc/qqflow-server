@@ -150,6 +150,32 @@ fn test_state() -> Arc<AppState> {
     state_with(store, true)
 }
 
+/// `test_state` 的 `indexing` 态变体：账号还没建完，且计数器有已知值。
+///
+/// 为什么必须是独立计数器：真实构建在这份夹具上是毫秒级，抓不到「构建进行中」这个
+/// 窗口；而进度字段的全部意义就在那个窗口里。这里直接给一份 1/2 张表、8 条消息的
+/// 计数，快照里的三个数才能一眼看出对应关系。
+fn test_state_indexing() -> Arc<AppState> {
+    let state = test_state();
+    let progress = Arc::new(qqflow_server::store::index::IndexProgress::default());
+    progress.set_tables_total(2);
+    for _ in 0..8 {
+        progress.row_indexed();
+    }
+    progress.finish_table();
+    state
+        .accounts
+        .write()
+        .push(qqflow_server::server::AccountState {
+            qq: "10001".into(),
+            state: AccountStatus::Indexing,
+            message_count: 2,
+            error: None,
+            progress: Some(progress),
+        });
+    state
+}
+
 /// Send a GET through `app` and return (status, json).
 async fn call(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let resp = app
@@ -204,6 +230,7 @@ async fn health_discloses_no_account_detail() {
             state: AccountStatus::Ready,
             message_count: 4242,
             error: None,
+            progress: None,
         },
         // A second, scanned-but-unregistered profile: its mere presence used
         // to be observable, which is the disclosure this test forbids.
@@ -212,6 +239,7 @@ async fn health_discloses_no_account_detail() {
             state: AccountStatus::AwaitingKey,
             message_count: 0,
             error: None,
+            progress: None,
         },
     ]);
     state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
@@ -263,6 +291,7 @@ async fn accounts_detail_auth_channels() {
         state: AccountStatus::Indexing,
         message_count: 0,
         error: None,
+        progress: None,
     });
     let app = build_router(state);
     let tok = "test-token-123456";
@@ -1868,6 +1897,7 @@ async fn accounts_idempotent_for_the_bound_account() {
         state: AccountStatus::Ready,
         message_count: 2,
         error: None,
+        progress: None,
     });
     let app = build_router(state);
 
@@ -1894,6 +1924,7 @@ async fn accounts_error_state_echoes_status_on_reject() {
         state: AccountStatus::Error,
         message_count: 0,
         error: Some("解密失败".into()),
+        progress: None,
     });
     state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
         qq: "10003".into(),
@@ -1925,6 +1956,7 @@ async fn accounts_rejects_a_second_account() {
         state: AccountStatus::Ready,
         message_count: 2,
         error: None,
+        progress: None,
     });
     // Resolvable, so a conflict reply cannot be confused with unknown_qq.
     state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
@@ -1953,6 +1985,39 @@ async fn accounts_rejects_a_second_account() {
     assert_eq!(accs[0].message_count, 2);
 }
 
+/// 冲突体里的第四处构造点：在位账号正在 indexing 时，调用方拿到的「还要等多久」
+/// 与 `occupied_by` 同等重要——否则它只能反复重试同一个被拒的注册。
+#[tokio::test]
+async fn accounts_conflict_reports_indexing_progress() {
+    let state = test_state();
+    let progress = Arc::new(qqflow_server::store::index::IndexProgress::default());
+    progress.set_tables_total(2);
+    progress.row_indexed();
+    progress.finish_table();
+    state.accounts.write().push(qqflow_server::server::AccountState {
+        qq: "10001".into(),
+        state: AccountStatus::Indexing,
+        message_count: 0,
+        error: None,
+        progress: Some(progress),
+    });
+    let app = build_router(state);
+
+    let (s, v) = post_json(
+        app,
+        "/api/v1/accounts?access_token=test-token-123456",
+        json!({"qq": "10002", "key": "0123456789abcdef"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["state"], "account_conflict");
+    assert_eq!(v["occupied_by"], "10001");
+    assert_eq!(v["occupied_status"], "indexing");
+    assert_eq!(v["progress"]["messages_indexed"], 1);
+    assert_eq!(v["progress"]["tables_done"], 1);
+    assert_eq!(v["progress"]["tables_total"], 2);
+}
+
 /// An account in `error` still holds the binding: a transient decrypt failure
 /// must not hand the server to a different account behind the operator's back.
 #[tokio::test]
@@ -1963,6 +2028,7 @@ async fn accounts_conflict_survives_error_state() {
         state: AccountStatus::Error,
         message_count: 0,
         error: Some("解密失败".into()),
+        progress: None,
     });
     state.init.accounts_db.lock().push(qqflow_server::db::scan::DbInfo {
         qq: "10002".into(),
@@ -2044,6 +2110,7 @@ async fn deregister_requires_a_token() {
         state: AccountStatus::Ready,
         message_count: 2,
         error: None,
+        progress: None,
     });
     let app = build_router(state.clone());
 
@@ -2097,6 +2164,7 @@ async fn deregister_enforces_the_qq_interlock() {
         state: AccountStatus::Ready,
         message_count: 2,
         error: None,
+        progress: None,
     });
     let app = build_router(state.clone());
 
@@ -2130,6 +2198,7 @@ async fn deregister_returns_the_server_to_its_boot_state() {
         state: AccountStatus::Ready,
         message_count: 2,
         error: None,
+        progress: None,
     });
     // Client-introduced (not in `AccountRegistry::new`), so the entry and its
     // db_path should be forgotten entirely.
@@ -2225,6 +2294,7 @@ async fn deregister_reverts_a_scanned_account_to_awaiting_key() {
         state: AccountStatus::Ready,
         message_count: 9,
         error: None,
+        progress: None,
     });
     let app = build_router(state.clone());
 
@@ -2267,6 +2337,7 @@ async fn deregister_purge_media_stays_inside_the_export_layout() {
         state: AccountStatus::Ready,
         message_count: 2,
         error: None,
+        progress: None,
     });
     // `test_state`'s only conversation has talker "10001".
     let root = state.export_root.clone();
@@ -2309,6 +2380,7 @@ async fn deregister_post_alias_is_gone_and_delete_still_works() {
         state: AccountStatus::Error,
         message_count: 0,
         error: Some("解密失败".into()),
+        progress: None,
     });
     let app = build_router(state.clone());
 
@@ -2589,6 +2661,104 @@ mod golden {
         (status, json, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// 一次快照比对需要的输入。打包成结构体是为了让签名留在 clippy 的阈值内
+    /// （超过 7 个参数时 lint 会红），同时把「一个端点」的四要素放在一起读。
+    struct Case<'a> {
+        name: &'a str,
+        method: &'a str,
+        uri: String,
+        payload: Option<Value>,
+    }
+
+    /// 跑一个端点，比对（或更新）它对应的快照。
+    ///
+    /// 抽出来是因为 `progress` 只在 `indexing` 态出现，而主清单共用同一个 `ready`
+    /// 夹具——换状态必须重造 `AppState`，所以是另一条用例，但快照口径（键序、易变值
+    /// 掩盖、缺失即失败）必须与主清单逐字相同，否则两条用例会各说各话。
+    async fn check_case(
+        app: axum::Router,
+        case: Case<'_>,
+        update: bool,
+        tmp_root: &str,
+        drifted: &mut Vec<String>,
+    ) {
+        let Case {
+            name,
+            method,
+            uri,
+            payload,
+        } = case;
+        let (status, body, raw_body) = fetch(app, method, &uri, payload).await;
+        let keys = key_order(&raw_body);
+        let mut snapshot =
+            serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
+        mask(&mut snapshot, tmp_root);
+        assert_no_wall_clock(&snapshot, name);
+        let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
+
+        let path = golden_dir().join(format!("{name}.json"));
+        if update {
+            std::fs::write(&path, &actual).unwrap();
+            println!("[GOLDEN] 写入 {}", path.display());
+            return;
+        }
+        assert!(
+            path.exists(),
+            "golden 快照缺失：{}（新增端点后必须 UPDATE_GOLDEN=1 生成并提交）",
+            path.display()
+        );
+        if std::fs::read_to_string(&path).unwrap() != actual {
+            drifted.push(name.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn indexing_progress_shapes_match_golden() {
+        let state = test_state_indexing();
+        let app = build_router(state);
+        let update = std::env::var("UPDATE_GOLDEN").is_ok();
+        std::fs::create_dir_all(golden_dir()).unwrap();
+        let tmp_root = std::env::temp_dir().to_string_lossy().into_owned();
+        let token = "test-token-123456";
+
+        let mut drifted: Vec<String> = Vec::new();
+        // 列表项：`AccountView.progress`。
+        check_case(
+            app.clone(),
+            Case {
+                name: "accounts-indexing",
+                method: "GET",
+                uri: format!("/api/v1/accounts?access_token={token}"),
+                payload: None,
+            },
+            update,
+            &tmp_root,
+            &mut drifted,
+        )
+        .await;
+        // 幂等命中（`state: in_progress`）：`AccountRegistered.progress`。
+        check_case(
+            app,
+            Case {
+                name: "accounts-progress",
+                method: "POST",
+                uri: format!("/api/v1/accounts?access_token={token}"),
+                payload: Some(serde_json::json!({
+                    "qq": "10001",
+                    "key": "0123456789abcdef"
+                })),
+            },
+            update,
+            &tmp_root,
+            &mut drifted,
+        )
+        .await;
+        assert!(
+            drifted.is_empty(),
+            "这些端点的响应与快照不一致：{drifted:?}\n\n若改动是有意的，设 UPDATE_GOLDEN=1 重跑后**人工读一遍 diff**。"
+        );
+    }
+
     #[tokio::test]
     async fn responses_match_their_golden_snapshots() {
         // 账号面要有内容才谈得上钉形状。沿用本文件既有做法（直接给注册表放一条）：
@@ -2600,6 +2770,11 @@ mod golden {
             state: AccountStatus::Ready,
             message_count: 2,
             error: None,
+            // Ready 态也挂一份计数器（形状不会输出它）：这样「状态守卫被删」时
+            // 主清单会红，而不是因为夹具恰好没有计数器而漏掉。
+            progress: Some(Arc::new(
+                qqflow_server::store::index::IndexProgress::default(),
+            )),
         });
         let app = build_router(state);
         let update = std::env::var("UPDATE_GOLDEN").is_ok();

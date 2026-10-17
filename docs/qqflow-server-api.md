@@ -338,6 +338,25 @@ Authorization: Bearer YOUR_TOKEN
 
 数组里可能有多条，但**最多一条处于 `indexing` / `ready` / `error`**（即"绑定"）。其余条目是启动扫描发现、但从未注册密钥的账号，恒为 `awaiting_key`；它们不参与就绪判定，也不构成绑定（见 §10）。
 
+### accounts 响应的可选 `progress`
+
+账号处于 `indexing` 时，列表项、受理/幂等命中响应，以及在位账号正在构建时的冲突体，
+额外带一个**可选对象** `progress`：
+
+```json
+"progress": { "tables_done": 1, "tables_total": 2, "messages_indexed": 184321 }
+```
+
+- 只在 `indexing` 态出现；`ready` / `awaiting_key` / `error` 等其余状态**整块省略**
+  （不给 `null`，也不给全零对象）。
+- `tables_total` 只数消息表（本仓为 `group_msg_table` / `c2c_msg_table` 两张）；
+  为 `0` 表示分母尚未确定（扫描还没开始），不是「零张表」。
+- `messages_indexed` 是已成功读入索引的消息行累计值，逐行推进；读失败的行不计入。
+- 三个数不是同一瞬间的一致快照，仅用于观察；能否服务看 `state`，不要只看 `progress`。
+- 契约仓库的 `INTERPRETATION.md` 已把该键登记为 additive 可选对象，不读它的客户端零感知。
+  回归位置：`tests/api_smoke.rs::indexing_progress_shapes_match_golden` 与
+  `tests/golden/accounts-indexing.json` / `accounts-progress.json`。
+
 ---
 
 ## 1.1 注册账号（POST /api/v1/accounts）
@@ -383,6 +402,7 @@ POST /api/v1/accounts
 | ---- | ---- |
 | `state` | **本次注册请求的结果**（见下表） |
 | `status` | **账号当前状态机值** ∈ `awaiting_key \| indexing \| ready \| error`，与 `GET /api/v1/accounts` 的 `accounts[].state` 同一枚举；账号此前从未出现过时省略 |
+| `progress` | `status` 为 `indexing` 时附进度对象（形状与省略规则见 §1.2 的「accounts 响应的可选 `progress`」） |
 | `db_path` | 服务端**实际解析到的** `nt_msg.db` 路径；无法解析时省略 |
 
 | `state` | 说明 | 伴随的 `status` |
@@ -408,6 +428,8 @@ POST /api/v1/accounts
   "occupied_status": "ready"
 }
 ```
+
+在位账号正在 `indexing` 时，冲突体也会带它的 `progress`（形状与省略规则见 §1.2）。
 
 **重复注册不再覆写。** 内存索引没有账号维度，第二个账号写进来会污染第一个账号的数据，所以换账号必须先调用 §1.3 注销。`error` 状态**不释放绑定**——一次瞬时解密失败不应把服务交给另一个账号；同一个 qq 可以直接重试注册来恢复。
 

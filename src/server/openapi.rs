@@ -43,6 +43,7 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::GroupMember,
     crate::server::dto::GroupMembers,
     crate::server::dto::Health,
+    crate::server::dto::IndexProgressDto,
     crate::server::dto::ChatlabMessages,
     crate::server::dto::MediaBrief,
     crate::server::dto::MediaEnvelope,

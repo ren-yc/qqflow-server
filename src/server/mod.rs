@@ -55,6 +55,12 @@ pub struct AccountState {
     pub message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 建索引期间的共享计数；`indexing` 之外没有观察意义。
+    ///
+    /// `#[serde(skip)]`：它不是响应形状的一部分——响应由 `AccountView` 投影，
+    /// 计数只在这里存放一份，供 `begin_indexing` 创建、`init_account` 复用同一 `Arc`。
+    #[serde(skip)]
+    pub progress: Option<std::sync::Arc<crate::store::index::IndexProgress>>,
 }
 
 /// What `/health` may disclose about the bound account — deliberately NOT
@@ -327,7 +333,32 @@ fn write_account_state(
             state: status,
             message_count: count,
             error,
+            progress: None,
         }),
+    }
+}
+
+/// `indexing` 态才给进度，其余态整块省略。
+///
+/// 读的是账号状态里那个 `Arc` 的原子量，不碰建索引路径的锁——否则「问一句到哪了」
+/// 会一直等到建完。
+pub(crate) fn indexing_progress(
+    a: &AccountState,
+) -> Option<crate::server::dto::IndexProgressDto> {
+    if a.state == AccountStatus::Indexing {
+        a.progress.as_ref().map(|p| progress_dto(p.snapshot()))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn progress_dto(
+    s: crate::store::index::ProgressSnapshot,
+) -> crate::server::dto::IndexProgressDto {
+    crate::server::dto::IndexProgressDto {
+        messages_indexed: s.messages_indexed,
+        tables_done: s.tables_done,
+        tables_total: s.tables_total,
     }
 }
 
@@ -389,12 +420,18 @@ pub fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
             a.state = AccountStatus::Indexing;
             a.message_count = 0;
             a.error = None;
+            a.progress = Some(std::sync::Arc::new(
+                crate::store::index::IndexProgress::default(),
+            ));
         }
         None => accs.push(AccountState {
             qq: qq.to_string(),
             state: AccountStatus::Indexing,
             message_count: 0,
             error: None,
+            progress: Some(std::sync::Arc::new(
+                crate::store::index::IndexProgress::default(),
+            )),
         }),
     }
     BindOutcome::Bound
@@ -620,6 +657,14 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
 /// to `indexing` synchronously so /health shows it immediately.
 pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
     let qq = info.qq.clone();
+    // 与 `begin_indexing` 创建的是同一份计数：从账号状态里取回 `Arc`，不要另起一份，
+    // 否则 HTTP 侧永远读到零。
+    let progress = state
+        .accounts
+        .read()
+        .iter()
+        .find(|a| a.qq == qq)
+        .and_then(|a| a.progress.clone());
     // Deregistration bumps this. Checked again at both points where the build
     // would become visible, so a registration that is cancelled mid-flight
     // cannot resurrect itself: the decrypt + index of a large account takes
@@ -649,7 +694,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         // 与嵌入者走**同一段**：建索引 + 载群名映射的次序有讲究，抄一份就会漂移。
-        let st = index::build_with(conn, nt_db_dir, &key_for_build)?;
+        let st = index::build_with(conn, nt_db_dir, &key_for_build, progress.as_deref())?;
         let count: usize = st.convs.values().map(|c| c.msgs.len()).sum();
         // Cancelled during the build (decrypt + index is the slow part) —
         // drop the freshly built index instead of installing it. The check
@@ -834,6 +879,7 @@ pub async fn run_with_shutdown(
                 state: AccountStatus::AwaitingKey,
                 message_count: 0,
                 error: None,
+                progress: None,
             })
             .collect::<Vec<_>>(),
     ));
@@ -974,6 +1020,7 @@ mod tests {
                         state: *state,
                         message_count: 0,
                         error: None,
+                        progress: None,
                     })
                     .collect(),
             )),
@@ -1270,6 +1317,7 @@ mod tests {
                 state: AccountStatus::Ready,
                 message_count: 9,
                 error: None,
+                progress: None,
             }])),
             ready: Arc::new(AtomicBool::new(true)),
             token: Arc::new("t".into()),

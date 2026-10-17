@@ -86,10 +86,12 @@ pub async fn list_handler(
                 .init
                 .find_db(&a.qq)
                 .map(|info| info.path.to_string_lossy().into_owned());
+            let progress = crate::server::indexing_progress(&a);
             AccountView {
                 db_path,
                 error: a.error,
                 message_count: a.message_count,
+                progress,
                 qq: a.qq,
                 state: a.state,
             }
@@ -138,10 +140,14 @@ pub async fn handler(
     // db_path is loose (file, Tencent Files-style root, or omitted → the
     // startup scan), so the resolved path is what tells the client which
     // database is in play. Both are omitted when unknown.
-    let reply = |state_name: &str, status: Option<AccountStatus>, db_path: Option<&Path>| {
+    let reply = |state_name: &str,
+                 status: Option<AccountStatus>,
+                 db_path: Option<&Path>,
+                 progress: Option<crate::server::dto::IndexProgressDto>| {
         Json(
             serde_json::to_value(AccountRegistered {
                 db_path: db_path.map(|p| p.to_string_lossy().into_owned()),
+                progress,
                 qq: qq.to_string(),
                 state: state_name.to_string(),
                 status,
@@ -156,11 +162,14 @@ pub async fn handler(
     // so a misconfigured client does not make the server stat paths on every
     // retry. `occupied_by` names the incumbent so the client can log which
     // account it is actually talking to instead of retrying forever.
-    let conflict = |qq_in_use: &str, status: AccountStatus| {
+    let conflict = |qq_in_use: &str,
+                    status: AccountStatus,
+                    progress: Option<crate::server::dto::IndexProgressDto>| {
         Json(
             serde_json::to_value(AccountConflict {
                 occupied_by: qq_in_use.to_string(),
                 occupied_status: status,
+                progress,
                 qq: qq.to_string(),
                 state: "account_conflict".to_string(),
                 success: true,
@@ -175,21 +184,49 @@ pub async fn handler(
     let current = {
         let accs = state.accounts.read();
         if let Some(b) = bound_account(&accs).filter(|b| b.qq != qq) {
-            return Ok(conflict(&b.qq, b.state));
+            return Ok(conflict(
+                &b.qq,
+                b.state,
+                crate::server::indexing_progress(b),
+            ));
         }
-        accs.iter().find(|a| a.qq == qq).map(|a| a.state)
+        accs.iter()
+            .find(|a| a.qq == qq)
+            .map(|a| (a.state, crate::server::indexing_progress(a)))
+    };
+    let (current_state, current_progress) = match current {
+        Some((state, progress)) => (Some(state), progress),
+        None => (None, None),
+    };
+    let progress_of = |target: &str| {
+        state
+            .accounts
+            .read()
+            .iter()
+            .find(|a| a.qq == target)
+            .and_then(crate::server::indexing_progress)
     };
     // For the idempotent replies the registry path is the one the running
     // account was built from — NOT the (ignored) db_path of this request.
     let registered = || state.init.find_db(qq).map(|i| i.path);
-    match current {
+    match current_state {
         Some(AccountStatus::Ready) => {
-            return Ok(reply("already_ready", current, registered().as_deref()))
+            return Ok(reply(
+                "already_ready",
+                current_state,
+                registered().as_deref(),
+                None,
+            ))
         }
         Some(AccountStatus::Indexing) => {
-            return Ok(reply("in_progress", current, registered().as_deref()))
+            return Ok(reply(
+                "in_progress",
+                current_state,
+                registered().as_deref(),
+                current_progress.clone(),
+            ))
         }
-        _ => {} // awaiting_key / error / unknown -> accept
+        _ => {}
     }
 
     let Some(info) = resolve_db_path(&state, qq, params.db_path.as_deref()) else {
@@ -200,13 +237,23 @@ pub async fn handler(
         } else {
             "unknown_qq"
         };
-        return Ok(reply(state_name, current, None));
+        return Ok(reply(
+            state_name,
+            current_state,
+            None,
+            current_progress.clone(),
+        ));
     };
 
     if validate_key(key).is_err() {
         // Rejected before any state change: the path resolved, the status is
         // still awaiting_key / error / unknown.
-        return Ok(reply("invalid_key", current, Some(&info.path)));
+        return Ok(reply(
+            "invalid_key",
+            current_state,
+            Some(&info.path),
+            current_progress.clone(),
+        ));
     }
 
     // Claim the binding atomically with the guard: concurrent registrations
@@ -215,12 +262,24 @@ pub async fn handler(
     // instead of overwriting the winner's index.
     match begin_indexing(&state, qq) {
         BindOutcome::SameQq(AccountStatus::Ready) => {
-            return Ok(reply("already_ready", Some(AccountStatus::Ready), registered().as_deref()))
+            return Ok(reply(
+                "already_ready",
+                Some(AccountStatus::Ready),
+                registered().as_deref(),
+                None,
+            ))
         }
         BindOutcome::SameQq(status) => {
-            return Ok(reply("in_progress", Some(status), registered().as_deref()))
+            return Ok(reply(
+                "in_progress",
+                Some(status),
+                registered().as_deref(),
+                progress_of(qq),
+            ))
         }
-        BindOutcome::Occupied { qq: in_use, status } => return Ok(conflict(&in_use, status)),
+        BindOutcome::Occupied { qq: in_use, status } => {
+            return Ok(conflict(&in_use, status, progress_of(&in_use)))
+        }
         BindOutcome::Bound => {}
     }
 
@@ -230,7 +289,12 @@ pub async fn handler(
     // does NOT mean the key is correct — only its format was checked here;
     // the real decrypt verification happens in `init_account`, so a client
     // still has to watch /health for ready.
-    let out = reply("accepted", Some(AccountStatus::Indexing), Some(&info.path));
+    let out = reply(
+        "accepted",
+        Some(AccountStatus::Indexing),
+        Some(&info.path),
+        progress_of(qq),
+    );
 
     // Kick off the background build.
     let state_for_init = state.clone();

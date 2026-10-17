@@ -1,0 +1,29 @@
+{
+  "body": {
+    "accounts": [
+      {
+        "message_count": 2,
+        "progress": {
+          "messages_indexed": 8,
+          "tables_done": 1,
+          "tables_total": 2
+        },
+        "qq": "10001",
+        "state": "indexing"
+      }
+    ],
+    "success": true
+  },
+  "keys": [
+    "accounts",
+    "message_count",
+    "progress",
+    "messages_indexed",
+    "tables_done",
+    "tables_total",
+    "qq",
+    "state",
+    "success"
+  ],
+  "status": 200
+}
