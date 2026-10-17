@@ -760,7 +760,8 @@ pub async fn serve() -> Result<()> {
             None => anyhow::bail!("尚未生成 API token（先启动一次服务以生成）"),
         };
     }
-    crate::logging::init(&cfg.log);
+    // serve 形态：输出 stdout（`cli` 关掉时的老路，判据同 weflow 侧 serve_logs_stay_on_stdout）。
+    let _ = crate::logging::init_for_serve(&cfg.log, &cfg.log_format);
     run_with(cfg).await
 }
 

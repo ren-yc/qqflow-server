@@ -126,7 +126,9 @@ fn run_config(cfg: config::Config) -> anyhow::Result<()> {
             None => anyhow::bail!("尚未生成 API token（先启动一次服务以生成）"),
         };
     }
-    logging::init(&cfg.log);
+    // serve 走老解析器：级别与格式来自 Config；输出**维持 stdout**（既有 `> 日志文件`
+    // 部署的重定向习惯，理由见 logging 模块头「输出去向」）。
+    let _ = logging::init_for_serve(&cfg.log, &cfg.log_format);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(server::run_with(cfg))
 }

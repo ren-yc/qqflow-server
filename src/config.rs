@@ -19,6 +19,9 @@ pub struct Config {
     pub host: String,
     /// Log level: error | warn | info | debug.
     pub log: String,
+    /// Log format: text | json（json = 逐行一个 JSON 对象，含 level/target/fields；
+    /// 输出去向随入口：serve 走 stdout、子命令走 stderr）。
+    pub log_format: String,
     /// File-watch debounce (ms): how long the watcher waits for an event
     /// burst to quiet down before triggering a sync (WeFlow-aligned; with
     /// batch mode the worst-case delay is about 2x this value).
@@ -64,6 +67,7 @@ impl Default for Config {
             port: 5032,
             host: "127.0.0.1".into(),
             log: "info".into(),
+            log_format: "text".into(),
             watch_debounce_ms: 350,
             watch_fallback_ms: 30_000,
             media_export_dir: None,
@@ -83,6 +87,7 @@ fn help() -> String {
        --port <u16>              监听端口（默认 5032）\n\
        --host <ip>               绑定地址（默认 127.0.0.1）\n\
        --log <level>             日志级别: error|warn|info|debug（默认 info）\n\
+        --log-format <fmt>        日志格式: text|json（默认 text；json 为逐行 JSON，serve 下在 stdout）\n\
        --watch-debounce-ms <ms>  文件事件防抖（默认 350）\n\
        --watch-fallback-ms <ms>  慢速兜底轮询，0 关闭（默认 30000）\n\
        --media-export-dir <dir>  媒体导出根目录（默认 <data-dir>/api-media）\n\
@@ -172,6 +177,12 @@ pub fn parse_args(args: Vec<String>) -> Result<Option<Config>> {
                     bail!("--log 需为 error|warn|info|debug: {value}");
                 }
                 cfg.log = value;
+            }
+            "--log-format" => {
+                if !matches!(value.as_str(), "text" | "json") {
+                    bail!("--log-format 需为 text|json: {value}");
+                }
+                cfg.log_format = value;
             }
             "--watch-debounce-ms" => {
                 cfg.watch_debounce_ms = value
