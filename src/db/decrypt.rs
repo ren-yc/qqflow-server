@@ -23,6 +23,14 @@ use super::vfs;
 pub const QQ_PAGE_SIZE: i64 = 4096;
 pub const QQ_KDF_ITER: i64 = 4000;
 
+/// 密钥轮换/参数过期的统一诊断文案。
+///
+/// 注册受理后的后台解密失败会把它带进账号 `error` 状态与 `warn!` 日志；运维不必在
+/// 「解密失败」与「密钥可能过期」之间猜。本仓没有独立的图片键（与 weflow 的差异），
+/// 所以提示只要求核对库密钥与 `db_path`。
+pub const KEY_RECOVERY_HINT: &str =
+    "疑似密钥已轮换、参数过期或密钥缺失：请重新注册并核对 db_path 与库密钥";
+
 fn escape_key(key: &str) -> String {
     key.replace('\'', "''")
 }
@@ -39,9 +47,37 @@ fn pragma_suite(key: &str, hmac: &str) -> String {
     )
 }
 
+/// `sqlite_master` 读取失败时，哪些文本仍属「密钥不匹配」家族。
+///
+/// SQLCipher 对错钥最常见的报错就是 `file is not a database`；把它当 I/O 错误会让真正的
+/// 密钥失配少了恢复提示。反过来，权限/磁盘错误不能被误诊成密钥问题。
+fn is_key_like_open_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    ["not a database", "hmac", "encrypted", "cipher"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// 打开失败的诊断句：密钥失配与非密钥（I/O/权限/损坏）必须分开，否则会把排查方向带偏。
+fn open_failure_message(key_mismatch: bool, last_error: Option<&str>) -> String {
+    if key_mismatch {
+        return format!(
+            "数据库解密失败：{KEY_RECOVERY_HINT}（16 字节 ASCII，可先用 qq-win-db-key 重新提取）"
+        );
+    }
+    if let Some(e) = last_error {
+        return format!(
+            "数据库打开/校验失败：读取 sqlite_master 失败（{e}）；这通常是文件权限、损坏或并发占用，不是密钥不匹配"
+        );
+    }
+    format!("数据库解密失败：{KEY_RECOVERY_HINT}（16 字节 ASCII，可先用 qq-win-db-key 重新提取）")
+}
+
 /// Shared open core: PRAGMA suite with HMAC-SHA1 → HMAC-SHA512 retry and
 /// sqlite_master verification.
 fn open_checked(path: &Path, key: &str, flags: OpenFlags, vfs_name: Option<&str>) -> Result<Connection> {
+    let mut key_mismatch = false;
+    let mut last_error: Option<String> = None;
     for hmac in ["HMAC_SHA1", "HMAC_SHA512"] {
         let conn = match vfs_name {
             Some(name) => Connection::open_with_flags_and_vfs(path, flags, name),
@@ -50,21 +86,29 @@ fn open_checked(path: &Path, key: &str, flags: OpenFlags, vfs_name: Option<&str>
         .with_context(|| format!("open {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_millis(3000))?;
         if let Err(e) = conn.execute_batch(&pragma_suite(key, hmac)) {
+            last_error = Some(format!("pragma suite ({hmac}): {e}"));
             tracing::debug!("pragma suite ({hmac}) failed: {e}");
             continue;
         }
         match verify(&conn) {
             Ok(true) => return Ok(conn),
             Ok(false) => {
+                key_mismatch = true;
                 tracing::debug!("key verification failed (hmac={hmac})");
             }
             Err(e) => {
+                if is_key_like_open_error(&format!("{e}")) {
+                    key_mismatch = true;
+                } else {
+                    last_error = Some(format!("sqlite_master ({hmac}): {e}"));
+                }
                 tracing::debug!("sqlite_master query failed (hmac={hmac}): {e}");
             }
         }
     }
     anyhow::bail!(
-        "数据库解密失败：请确认密钥正确（16 字节 ASCII，可先用 qq-win-db-key 重新提取）"
+        "{}",
+        open_failure_message(key_mismatch, last_error.as_deref())
     )
 }
 
@@ -180,6 +224,23 @@ mod tests {
         std::fs::write(&junk, vec![0xAAu8; 8192]).unwrap();
         let err = open_decrypted(&junk, "0123456789abcdef").unwrap_err();
         assert!(format!("{err:#}").contains("密钥"), "got: {err:#}");
+        assert!(
+            format!("{err:#}").contains("疑似密钥已轮换"),
+            "错误要给出恢复动作，而不只是「解密失败」: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("重新注册"), "got: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_failure_message_distinguishes_io_from_key_mismatch() {
+        let io = open_failure_message(false, Some("disk I/O error"));
+        assert!(io.contains("不是密钥不匹配"), "I/O 失败不能被误诊: {io}");
+        assert!(!io.contains("疑似密钥已轮换"), "I/O 失败不能提密钥轮换: {io}");
+        let key = open_failure_message(true, None);
+        assert!(key.contains("疑似密钥已轮换"), "密钥失配要给恢复动作: {key}");
+        assert!(is_key_like_open_error("file is not a database"));
+        assert!(!is_key_like_open_error("disk I/O error"));
+        assert!(!is_key_like_open_error("permission denied"));
     }
 }

@@ -431,6 +431,16 @@ QQ 数据目录（含 `nt_msg.db`、同族库 `group_info.db`、
 （`group_msg_table` / `c2c_msg_table` 两张）；读失败的表不推进 `tables_done`，
 结束时 `tables_done` 比 `tables_total` 少一格，是「确实有一条表没读成」的诚实表达。
 
+### 密钥轮换的症状面：后台解密失败 + 周期性重试
+
+本仓的库密钥**只有一把**（`api::open(db_path, key)`，没有 weflow 那种独立图片键）。
+密钥格式正确但内容过期时，注册受理后的后台解密会失败：账号进入 `error`，`error` 字段
+与 `warn!` 日志都带同一句恢复提示（重新注册并核对 `db_path` 与库密钥）。
+
+与密钥相关的失败还有一类**不显式报错**的形态：`message_resource.db` 的 HMAC 失配会在
+同步路径上周期性重试，表现是资源/媒体长期缺件。遇到这种症状不要只查解析器，先按
+「密钥已轮换、参数过期或密钥缺失」复验。
+
 ### 明文头偏移：`cipher_plaintext_header_size` 做不到这件事
 
 库文件前 1024 字节是明文头，常规做法是用 SQLCipher 的 `cipher_plaintext_header_size`

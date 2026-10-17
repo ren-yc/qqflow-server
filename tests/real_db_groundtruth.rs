@@ -935,6 +935,10 @@ async fn client_registers_account_with_key_and_db_path() {
     let err = common::account_entry(&v, FAKE_QQ)["error"].as_str().unwrap().to_string();
     println!("[GT] expected init failure: {err}");
     assert!(err.contains("解密") || err.contains("密钥"), "error must explain: {err}");
+    assert!(
+        err.contains("疑似密钥已轮换") || err.contains("重新注册"),
+        "error must name the recovery action: {err}"
+    );
     // The reason is behind the token; /health only admits the phase.
     let (_, h) = common::get_json(app.clone(), "/health", &[]).await;
     assert_eq!(h["account"], "error");

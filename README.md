@@ -17,6 +17,13 @@
 > **MCP（agent 客户端）**：`qqflow-server mcp` 在 stdio 上暴露只读查询工具，见
 > [docs/mcp.md](docs/mcp.md)。**工具输出会进入模型上下文 —— 也就是对话内容离开本机。**
 
+## 重启后恢复账号
+
+密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。用
+[`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或
+[`.sh`](scripts/examples/register-accounts.sh)）从你自备的本地配置读 key 后重新注册；完整配方
+见 [docs/quickstart.md](docs/quickstart.md#重启后恢复账号)。脚本只读配置、不代存密钥。
+
 ## 范围
 
 - ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头；直读实时源库（QQ 运行中可读，无镜像）
