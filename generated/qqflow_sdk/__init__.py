@@ -48,6 +48,7 @@ __all__ = [
     "GroupMember",
     "GroupMembers",
     "Health",
+    "IndexProgressDto",
     "MediaBrief",
     "MediaEnvelope",
     "MediaInfo",
@@ -104,6 +105,7 @@ from qqflow_sdk.generated.qqflow_sdk.models.delete_api_v1_accounts_qq200_respons
 from qqflow_sdk.generated.qqflow_sdk.models.group_member import GroupMember as GroupMember
 from qqflow_sdk.generated.qqflow_sdk.models.group_members import GroupMembers as GroupMembers
 from qqflow_sdk.generated.qqflow_sdk.models.health import Health as Health
+from qqflow_sdk.generated.qqflow_sdk.models.index_progress_dto import IndexProgressDto as IndexProgressDto
 from qqflow_sdk.generated.qqflow_sdk.models.media_brief import MediaBrief as MediaBrief
 from qqflow_sdk.generated.qqflow_sdk.models.media_envelope import MediaEnvelope as MediaEnvelope
 from qqflow_sdk.generated.qqflow_sdk.models.media_info import MediaInfo as MediaInfo
