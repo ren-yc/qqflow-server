@@ -25,6 +25,16 @@
 - **Python SDK 的同步门面文档补齐**：`clients/python/README.md` 增 `SyncClient` 示例与专属
   事件循环线程说明——0.9.1 上架时 PyPI 页面只呈现 async 用法，同步入口（随 0.9.1 发布）
   在其最大分发渠道上不可见。回归位置：`test_sync_client_health_and_accounts`。
+- **校验报错不再回显库密钥值**：`keystore::validate_key` 的两条失败报错此前用 Debug 格式
+  把收到的键值原样写进错误串。当前调用方只取 `is_err()`、尚未把该文案透出去，但它一旦
+  随 `{e:#}` 进日志或响应，脱敏红线就被错误链绕过。现改为只报长度与类别，与 weflow-server
+  的 `parse_db_key` 同语态。**行为变化**：若未来有客户端解析过这条报错文案，其形态已变
+  （更短、不含输入回显）。判据：`keystore::tests::validation_errors_never_echo_the_key`。
+- **CI 增加隐私形态层扫描**：`check.yml` 新步「Privacy shape scan」以 `PRIVACY_SHAPE_ONLY=1`
+  只跑机器无关的 64-hex 层（本机钩子仍跑全量三层）——CI 上没有本地配置文件，且 runner 的
+  用户名 `runner` 是合法跟踪文本的子串（`ubuntu-latest`），精确值与用户名层在 CI 上只会
+  假红。本仓的 64-hex 层罩 API token 形状（`config::new_token` 输出 64 hex 字符）；16 字节
+  库密钥不是 hex、无法按形状扫描，仍由精确值层兜住。weflow-server 同批同款。
 
 ## [0.9.1] - 2026-10-18
 

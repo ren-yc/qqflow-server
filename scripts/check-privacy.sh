@@ -8,20 +8,34 @@
 # local config are out of scope by construction):
 #   1. exact real values from the gitignored qqflow-server.json — qq, key and
 #      db_path (skipped when the file is absent, e.g. CI)
-#   2. the local username, the user-profile path (C:\Users\<name>) and this
+#   2. generic 64-hex literals (the API-token shape) outside the fixture
+#      allowlist — machine-independent, so this is the ONLY layer a CI runner
+#      can usefully run (see PRIVACY_SHAPE_ONLY below)
+#   3. the local username, the user-profile path (C:\Users\<name>) and this
 #      machine's data root — the latter is DERIVED from the local config at run
 #      time, never stored here as a literal (an earlier revision hardcoded the
 #      author's real root in this tracked, published file, which is itself a
 #      leak the self-exclusion below could never catch).
 #
+# PRIVACY_SHAPE_ONLY=1 runs ONLY layer 2 and skips layers 1 and 3. This is what
+# CI uses: there is no local config there (layer 1 is moot) and the runner's own
+# username is `runner`, which appears as a substring inside wholly legitimate
+# tracked text (`.github/workflows/*.yml`, CHANGELOG, architecture) — a username
+# scan on CI would false-red on that. Layer 2 needs neither and is the real
+# machine-independent net, so CI runs just that.
+#
 # Exits non-zero (and lists every hit) when anything leaks, which aborts the
 # commit; findings go to stderr, which git shows verbatim. Values are NEVER
 # echoed — only labels and the files they were found in.
 #
-# Deliberately NOT scanned: a generic 64-hex shape (weflow-server uses one).
-# QQ keys are 16 printable-ASCII bytes, NOT hex (see keystore::validate_key),
-# so a hex-shape scan could never catch a leaked key — the exact-value layer
-# above is the only check that can. A 64-hex scan would be noise here.
+# The 16-byte database key is deliberately NOT scanned as a *shape*: QQ keys are
+# printable-ASCII bytes, not hex (see keystore::validate_key), so a generic
+# literal scan could never distinguish a leaked key from ordinary text — the
+# exact-value layer above is the only check that can catch one. The 64-hex shape
+# IS scanned: that is the API token's shape (config::new_token emits 32 random
+# bytes as 64 hex chars), which the exact-value layer cannot see because the
+# token is generated per machine and never stored in the config. Mirrors
+# weflow-server's generic 64-hex layer, which there covers the db-key shape.
 
 set -u
 
@@ -30,10 +44,23 @@ cd "$ROOT"
 
 CONFIG="qqflow-server.json"
 
+# CI runs the machine-independent shape layer only (see header): there is no
+# local config and the runner's username `runner` appears inside legitimate
+# tracked text, so layers 1 and 3 would false-red without catching anything.
+SHAPE_ONLY="${PRIVACY_SHAPE_ONLY:-0}"
+
 # Paths excluded from every scan:
 #   *.lock        — Cargo.lock carries ~200 crate checksums in 64-hex shape
 #   this script   — it contains the pattern strings below
 PATHSPEC=(':!*.lock' ':!scripts/check-privacy.sh')
+
+# Fixture 64-hex values allowed in tracked files (full literals, never marker
+# words — allowlisting by nearby words lets a real key slide through any file
+# that happens to say "example"). Currently empty: this repo has no legitimate
+# 64-hex literal in tracked files (verified by scan), and unlike weflow-server
+# its fixtures use 16-byte ASCII keys, not hex. If a future fixture needs the
+# token shape, add the exact string here and nothing else.
+FIXTURE_HEX=()
 
 hits=0
 
@@ -119,7 +146,7 @@ PY
 }
 
 # ---- 1. Real values from the gitignored local config -----------------------
-if [ -f "$CONFIG" ]; then
+if [ "$SHAPE_ONLY" != "1" ] && [ -f "$CONFIG" ]; then
   if ! CONFIG_VALUES="$(read_config_values)" || [ -z "$CONFIG_VALUES" ]; then
     # A machine holding qqflow-server.json must actually run the most
     # sensitive checks. Failing silently (no python, the Windows Store stub,
@@ -145,7 +172,27 @@ if [ -f "$CONFIG" ]; then
   done <<< "$CONFIG_VALUES"
 fi
 
-# ---- 2. Machine-specific paths / usernames --------------------------------
+# ---- 2. Generic 64-hex literals outside the fixture allowlist --------------
+# The API-token shape. Machine-independent, so it runs in every mode including
+# CI's shape-only pass. Reported by shape, never by value.
+while IFS= read -r found_hex; do
+  found_hex="${found_hex%$'\r'}"
+  [ -n "$found_hex" ] || continue
+  allowed=0
+  # `+` 守卫形式：空数组在 `set -u` 下展开为**零个元素**——既兼容 bash 3.2（macOS
+  # 自带旧版，直接 `"${A[@]}"` 会报 unbound variable），也不留 `:-` 那种「多迭代一次
+  # 空串」的读解陷阱。qqflow-server 与 weflow-server 的同段逐字一致，两仓保持对称。
+  for fixture in ${FIXTURE_HEX[@]+"${FIXTURE_HEX[@]}"}; do
+    if [ "$found_hex" = "$fixture" ]; then
+      allowed=1
+      break
+    fi
+  done
+  [ "$allowed" -eq 1 ] && continue
+  report "疑似 API token（64 位 hex 字面量，不在 fixture 白名单中）" "$found_hex"
+done < <(git grep -ohE '[0-9a-fA-F]{64}' -- "${PATHSPEC[@]}" 2>/dev/null | sort -u)
+
+# ---- 3. Machine-specific paths / usernames --------------------------------
 # MSYS bash's `whoami` prints the bare username (`alice`); Windows'
 # `whoami.exe` prints `HOSTNAME\user` (`laptop-abc123\alice`), and the UPN
 # form is `user@domain`. Normalize to the bare name: `C:\Users\$USER_NAME`
@@ -154,10 +201,14 @@ fi
 # The scan is case-SENSITIVE (`grep -F`, no -i) on purpose: a short lowercase
 # username can appear as a case-different substring inside CamelCase Windows
 # API names (e.g. ReadDirectoryChangesW), which is not a leak.
+# Skipped under SHAPE_ONLY: on CI the name is `runner`, a substring of
+# legitimate tracked text (`ubuntu-latest`, `runs-on`), so it only false-reds.
+if [ "$SHAPE_ONLY" != "1" ]; then
 USER_NAME="$(whoami 2>/dev/null | sed 's/.*[\\/@]//' || true)"
 if [ -n "$USER_NAME" ]; then
   report "本机用户名" "$USER_NAME"
   report "用户目录绝对路径 C:\\Users\\<用户名>" "C:\\Users\\$USER_NAME"
+fi
 fi
 # The data-root check lives in the config-driven layer above: deriving it from
 # db_path keeps this file free of any real machine path. Hardcoding an example
