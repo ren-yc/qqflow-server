@@ -19,12 +19,31 @@ qqflow-server --port 5032 --host 127.0.0.1 --log info
 ```
 
 - token 首次启动生成并存入系统凭据库（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service）；
-  `qqflow-server token` 打印。CLI 的 token 来源链是 `QQFLOW_TOKEN` → 本机凭据库。
+  `qqflow-server token` 打印。CLI 的 token 来源链是 `QQFLOW_TOKEN` → 本机凭据库。凭据库不可用时
+  token 只在启动日志打印一次（会话级），详见 quickstart 配方五。
 - 数据目录：Windows `%LOCALAPPDATA%\qqflow-server`。
 - 停服务：前台 `Ctrl-C`。
-- **零账号启动**：先注册再查询；注册前业务端点返回 503（`/health` 仍是 `starting`）。
-- **不做密钥提取**：密钥由独立工具提供（如 QQBackup/qq-win-db-key），运行期经
-  `POST /api/v1/accounts` 注册；细节见 [api 文档](docs/qqflow-server-api.md)。
+
+## 注册账号（第一次查询之前）
+
+服务是**零账号启动**的：`/health` 免鉴权、可先看阶段，而业务端点在账号 `ready` 之前一律返回
+503。启动时它会扫描本机 QQ 目录，但**不会自己去读密钥**——库密钥（16 字节 ASCII）要你用独立
+工具提取（如 QQBackup / qq-win-db-key，本仓库不做密钥提取）。注册就一次 POST：
+
+```bash
+curl -X POST -H "Authorization: Bearer $QQFLOW_TOKEN" -H "Content-Type: application/json" \
+  -d '{"qq":"<QQ 号>","key":"<16 字节库密钥>","db_path":"<nt_msg.db 或其所在目录>"}' \
+  http://127.0.0.1:5032/api/v1/accounts
+```
+
+受理返回 `state: "accepted"`，后台开始建索引；轮询到 `ready` 即可查询：
+
+```bash
+curl -H "Authorization: Bearer $QQFLOW_TOKEN" http://127.0.0.1:5032/api/v1/accounts
+```
+
+`db_path` 允许松散（给库文件或其上级目录都可），字段全谱与重启恢复见
+[quickstart 配方五](docs/quickstart.md#配方五重启后恢复账号)与 api 文档的注册端点小节。
 
 ## 第一个请求
 

@@ -1126,8 +1126,8 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | --- | --- | --- | --- |
 | `GET /api/v1/messages` | `messages[].media`、`mediaId`、`mediaFileName`、`mediaUrl`、`mediaLocalPath`、`replyToMessageId` | 无值时**省略键** | 本仓消息面没有「键恒出现、值为 `null`」的字段 |
 | `GET /api/v1/messages` | `media.exportPath` | **只在真正执行了导出时出现** | 未请求 `media=1` 时省略该键——「没导出」与「导出到空路径」是两件事（回归见 `messages_without_media_param_omits_export_path`） |
-| `GET /api/v1/accounts` | `accounts[].dbPath`、`accounts[].error` | 无值时**省略键** | |
-| `POST /api/v1/accounts` | `dbPath`、`status` | 无值时**省略键** | 注册的三个分支键集不同，见该端点小节 |
+| `GET /api/v1/accounts` | `accounts[].db_path`、`accounts[].error` | 无值时**省略键** | |
+| `POST /api/v1/accounts` | `db_path`、`status` | 无值时**省略键** | 注册的三个分支键集不同，见该端点小节 |
 | `GET /chatlab/sessions` | `sessions[].memberCount` | 不掌握名册时**省略键** | 可选字段，断言不得写成必填 |
 | `GET /chatlab/sessions`、`GET /chatlab/messages` | `page.nextCursor` | 键恒出现，已排空时 `null` | 与「整个 `page` 块不存在」（＝完整单页）是两件事 |
 | `GET /chatlab/messages` | `messages[].media`、`replyToMessageId` | 无值时**省略键** | `media.md5` 取不到摘要时也省略 |
