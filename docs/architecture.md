@@ -74,7 +74,7 @@ QQ 数据目录（nt_db 等）
 | `main.rs` | 进程入口：解析配置、装日志、起服务 | — | → `server` / `config` |
 | `lib.rs` | 库入口：承诺面 `api` ＋ 实现面（默认 `pub(crate)`，见「库面与 feature」） | `api` | — |
 | `config.rs` | 命令行与数据目录解析（含平台差异）、token 凭据库读写 | `Config` | ← 无 |
-| `logging.rs` | 日志初始化 | `init()` | ← 无 |
+| `logging.rs` | 日志初始化 | `init_with_format`（子命令→stderr）/ `init_for_serve`（serve→stdout） | ← 无 |
 | `cli.rs` | **命令行子命令面**（`cli` feature）：子命令分流、退出码、HTTP 查询复用 SDK | `dispatch` / `Entry` | → `config` / SDK |
 | `export.rs` | **批量导出**（`cli` feature）：ChatLab Format 落盘，**不碰网络**（取数按页回调） | `run` / `Options` | ← `pathsafe` / `server::chatlab` |
 | `mcp.rs` | **MCP 工具面**（`mcp` feature）：stdio 上的只读工具、字段投影与 ≈32 KB 截断预算 | `run` / 工具集 | → SDK |
@@ -95,7 +95,7 @@ QQ 数据目录（nt_db 等）
 | `sync/mod.rs` | 增量轮询、水位线、事件构造 | `AccountSync` | → `store` |
 | `sync/events.rs` | **事件类型的唯一出处**（SSE 载荷与总线共用） | `Event` | ← 无 |
 | `sync/watch.rs` | 文件指纹轮询（**决定何时再轮询**，不解析内容） | `WatchConfig` | → 文件系统 |
-| `server/mod.rs` | 路由装配、鉴权、SSE 总线 | `serve_with_shutdown` | → 全部 |
+| `server/mod.rs` | 路由装配、鉴权、SSE 总线 | `build_router`（serve 入口 `run_cli`／`server::serve` 在 `lib.rs`） | → 全部 |
 | `server/handlers/mod.rs` | **handler 之间的共享件**：参数解析、信封合并 | `merge_body` / `parse_limit` | — |
 | `server/handlers/*` | 各端点的实现（account / session / message / contact / media / push） | — | → `store` / `sync` |
 
@@ -146,7 +146,10 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 而不是以为编译器只放出了 `api`。
 
 `testing` 只改**可见性**，不改功能：开它则实现面转 `pub`（集成测试在独立 crate 里，只能看见
-`pub`）。它同时是**给嵌入者的造库工具**面 —— 写自己的测试时同样要造库、造密钥。
+`pub`）。它同时是**给嵌入者的造库工具**面 —— 写自己的测试时同样要造库、造密钥。同一
+feature 还开放 `QQFLOW_TOKEN_SERVICE`：集成测试可把 API token 的凭据库服务名指到专用的
+空服务，避免并行用例互踩真实凭据库——默认构建（`default = ["server","cli","mcp"]`）
+编译掉该覆盖，用户进程永远读的是内置服务名。
 
 ### feature 矩阵
 
@@ -328,7 +331,7 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
 - **输出去向按入口分叉**：**子命令**日志走 **stderr**——`fmt()` 的默认 writer 是 stdout，而子命令
   的 stdout 是命令输出本身（`--json` 形状），日志混进去会毁掉管道消费。**serve** 日志维持
   **stdout**——既有部署在用 `qqflow-server > 日志文件` 收服务日志，改通道会让那些脚本静默拿到空
-  文件，属破坏性变更、不在本批。判据两条：`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
+  文件，属破坏性变更、不随 0.9.1 落地。判据两条：`tests/cli_e2e.rs::log_json_format_emits_parseable_lines`
   （stderr 逐行可解析**且 stdout 无日志行**）与 `tests/cli.rs::serve_logs_stay_on_stdout`
   （启动行在 stdout、不在 stderr）。已知代价（如实登记）：同一次运行里 `[fatal]` 在 stderr、
   serve 普通日志在 stdout，「只看 `2>` 收错误」拿不到 `[init]` 上下文；合并成一条通道要等一个
@@ -340,7 +343,7 @@ OpenSSL，后者的 perl `Configure` 会直接调 `cl.exe` / `link.exe`，**绕�
 - **子命令日志不带 ANSI 颜色码**：`tracing-subscriber` 不做 TTY 检测，重定向时照样写转义序列；
   stderr 是脚本与采集器的消费面（`2> 文件`、按行解析），所以子命令那支显式 `with_ansi(false)`。
   靠环境变量 `NO_COLOR` 不行——开发机设了它、CI 没设，判据就变成「本地绿 CI 红」（实测踩中）。
-  serve 支保持库默认观感，本批不动。判据：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`
+  serve 支保持库默认观感，0.9.1 不动。判据：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr`
   里的「stderr 不得含 ESC 字节」断言（测试基座同时清掉子进程的 `NO_COLOR`，否则本机测不出）。
 - **语言口径与脱敏红线**：见 `src/logging.rs` 模块头（用户句中文、模块级诊断英文；日志禁入完整
   密钥／完整 token／消息正文，例外只有 serve 路径那两条「不打印就拿不到」的 token 行——首次生成
@@ -420,7 +423,8 @@ QQ 数据目录（含 `nt_msg.db`、同族库 `group_info.db`、
 ### 一致性套件
 
 `tests/conformance_runner.rs` 起真服务、造夹具，跑契约仓库（版本记在 `conformance.pin`）里的
-36 条用例（`v0.6.0`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
+36 条用例（`v0.6.2`：auth 1／cursor 13／discovery 3／envelope 6／lifecycle 8／nails 5——v0.6.1 与
+v0.6.2 都是纯文档 tag，用例集未增删；换 pin 时这里要跟着改，它没有机器判据）。两条硬规矩：**带 `--fail-on-skip`**（有用例被跳过即失败，避免「夹具少声明一个端点」
 让用例静默变成不跑），**缺 `FLOW_CONTRACT_DIR` 即失败**（不是跳过）。夹具里的
 `contractVersion` 与 pin 由 `pinned_contract_version_matches_the_fixture` 钉在一起。
 

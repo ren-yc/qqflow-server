@@ -6,7 +6,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 ## 启用方式
 
-**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
+**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--log-format`（text）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
 
 - 默认监听地址：`127.0.0.1`
 - 默认端口：`5032`
@@ -40,6 +40,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 | `accounts` | SDK `accounts` | **只有 HTTP 形态**：这一面问的是「服务端此刻实际绑定了什么」|
 | `sync` | SDK `sync_now` | **写动作**：立刻跑一次增量同步；没有 `--embedded` |
 | `export` | SDK `list_all_sessions` ＋ `pull_page` ＋ `chatlab_messages` | **只走 HTTP**：批量导出到 ChatLab Format 文件；`--with-media` 时用同一页的时间窗调 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节 |
+| `mcp` | 经 SDK 打 HTTP 面 | stdio 上的 MCP 服务端：进程不碰数据库密钥，token 走同一来源链；**必须先起服务端**。工具清单与安全提示见 [docs/mcp.md](mcp.md) |
 
 环境变量：`QQFLOW_BASE_URL`（默认 `http://127.0.0.1:5032`）、`QQFLOW_TOKEN`（API token）。
 **token 来源链**：`QQFLOW_TOKEN`（非空）→ 本机凭据库（与 `qqflow-server token` 同一份）。
@@ -82,7 +83,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
   测试基座里一律 `env_remove` 它，避免级别随环境漂移。
 - 子命令日志**不带 ANSI 颜色码**（`--log-format json` 与 text 同）：stderr 是脚本与采集器的消费面，
   `2> 日志文件` 里出现 `\x1b[33m` 会毁掉按行解析。这条是产品保证、不依赖 `NO_COLOR` 环境变量。
-  serve 的输出维持库默认（本批不动它的观感）。
+  serve 的输出维持库默认（0.9.1 不动它的观感）。
 
 ## 批量导出（`export`）
 
