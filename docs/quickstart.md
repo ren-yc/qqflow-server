@@ -52,12 +52,16 @@ curl -H "Authorization: Bearer $QQFLOW_TOKEN" \
 
 `since` 缺省等于全量；`limit` 分页时响应**必须**带 `sync` 块。去重按 `platformMessageId`。
 
+深入：api 文档「4.1 拉取会话消息（ChatLab Pull）」；翻页与条数数字看「接口列表」后的上限表。
+
 ## 配方二：只要增量（watcher / SSE）
 
 1. 注册账号并等到 `GET /api/v1/accounts` 的 `state == "ready"`。
 2. 连 `GET /api/v1/push/messages?access_token=<token>`；零账号时也会先收到 `ready` 基线帧。
 3. 之后服务端的文件 watcher（防抖与慢速兜底见架构文档）会把变更作为 SSE 事件推出。
 4. 断线重连带 `Last-Event-ID` 续放；推送端点**无就绪门控**，换账号不会静默断开订阅者。
+
+深入：api 文档「2. 主动推送（SSE）」；事件形状与重放缓冲见「10. 注意事项」与架构文档的同步机制节。
 
 ## 配方三：导出全部消息（含媒体）
 
@@ -70,6 +74,8 @@ qqflow-server export --out ./export --format jsonl --with-media
 - 只导出个别会话用 `--session <id>`（可重复）；只要某时间之后用 `--since`。
 - 媒体可取性以**客户端落地**为准：新图在客户端全图落地前（数十秒到分钟级）可能仍无句柄；
   缺句柄时退回消息面的按需导出，不要当错误。
+
+深入：api 文档「批量导出（`export`）」（产物形状、`index.json`、失败跳过语义都在那里）。
 
 ## 配方四：让 agent 接入（MCP）
 

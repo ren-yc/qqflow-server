@@ -19,6 +19,20 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
   [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 - 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
 
+## 最小必读路径
+
+本文近百 KB，是端点参考而不是教程；按目标挑一条最短路径走：
+
+| 目标 | 先读这里 | 再读 |
+|---|---|---|
+| 第一次跑通（获取→起服务→注册→查询） | [quickstart](quickstart.md) | 本文「鉴权规范」「8. 错误响应」 |
+| 接 ChatLab 前端 | quickstart 配方一 | 「4.1 拉取会话消息（ChatLab Pull）」＋「接口列表」里的上限表 |
+| 程序化取数 / 翻页 | 本文「接口列表」→ 对应编号节 | 「类型化客户端（SDK）」「9. 使用示例」 |
+| 只要增量（watcher/SSE） | quickstart 配方二 | 「2. 主动推送（SSE）」 |
+| 批量导出（含媒体） | quickstart 配方三 | 「批量导出（`export`）」＋「3.2 媒体导出」 |
+| 让 agent 接入（MCP） | [mcp.md](mcp.md) | 「命令行子命令（`cli`）」 |
+| 账号卡住 / 排障 | 「8. 错误响应」＋账号明细节（§1.2）的 `progress` 段 | 「10. 注意事项」与 quickstart 配方五 |
+
 ## 命令行子命令（`cli`）
 
 裸跑仍是「起服务」；既有旗标（`--port`／`--help`／`--show-token` …）**逐字不变**。新增的子命令面与退出码：
@@ -308,64 +322,6 @@ GET /api/v1/health
 
 ---
 
-## 1.2 账号明细（GET /api/v1/accounts）
-
-`/health` 不再披露的账号明细。Token 保护（两条通道，但 GET 建议走 Header——查询串会进代理日志与 shell 历史）；**不受就绪门控**，因为客户端正是在账号还在 `indexing`（即服务尚未就绪）时轮询它。
-
-**请求**
-
-```http
-GET /api/v1/accounts
-Authorization: Bearer YOUR_TOKEN
-```
-
-**响应**
-
-```json
-{
-  "success": true,
-  "accounts": [
-    {
-      "qq": "1234567890",
-      "state": "ready",
-      "message_count": 28314,
-      "db_path": "C:\\Users\\<用户名>\\Documents\\Tencent Files\\1234567890\\nt_qq\\nt_db\\nt_msg.db"
-    }
-  ]
-}
-```
-
-| 字段 | 说明 |
-| ---- | ---- |
-| `accounts[].qq` | 账号 |
-| `accounts[].state` | `awaiting_key` / `indexing` / `ready` / `error`（完整状态机，不折叠） |
-| `accounts[].message_count` | 已索引消息数（仅 ready 后有效） |
-| `accounts[].error` | 出错时的错误信息（仅 `error` 状态；否则该键省略） |
-| `accounts[].db_path` | 服务端解析到的 `nt_msg.db` 路径；未知时该键省略 |
-
-数组里可能有多条，但**最多一条处于 `indexing` / `ready` / `error`**（即"绑定"）。其余条目是启动扫描发现、但从未注册密钥的账号，恒为 `awaiting_key`；它们不参与就绪判定，也不构成绑定（见 §10）。
-
-### accounts 响应的可选 `progress`
-
-账号处于 `indexing` 时，列表项、受理/幂等命中响应，以及在位账号正在构建时的冲突体，
-额外带一个**可选对象** `progress`：
-
-```json
-"progress": { "tables_done": 1, "tables_total": 2, "messages_indexed": 184321 }
-```
-
-- 只在 `indexing` 态出现；`ready` / `awaiting_key` / `error` 等其余状态**整块省略**
-  （不给 `null`，也不给全零对象）。
-- `tables_total` 只数消息表（本仓为 `group_msg_table` / `c2c_msg_table` 两张）；
-  为 `0` 表示分母尚未确定（扫描还没开始），不是「零张表」。
-- `messages_indexed` 是已成功读入索引的消息行累计值，逐行推进；读失败的行不计入。
-- 三个数不是同一瞬间的一致快照，仅用于观察；能否服务看 `state`，不要只看 `progress`。
-- 契约仓库的 `INTERPRETATION.md` 已把该键登记为 additive 可选对象，不读它的客户端零感知。
-  回归位置：`tests/api_smoke.rs::indexing_progress_shapes_match_golden` 与
-  `tests/golden/accounts-indexing.json` / `accounts-progress.json`。
-
----
-
 ## 1.1 注册账号（POST /api/v1/accounts）
 
 客户端驱动启动：下游客户端传入账号（`qq`）、数据库密钥（`key`）与可选数据库路径（`db_path`），服务在后台以只读长连接直连活库完成解密 + 索引构建，账号进入 `ready`。仅 POST；Token 保护（两条通道）；**不受就绪门控**。
@@ -447,6 +403,64 @@ POST /api/v1/accounts
 `db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
 
 密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`GET /api/v1/accounts` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
+
+---
+
+## 1.2 账号明细（GET /api/v1/accounts）
+
+`/health` 不再披露的账号明细。Token 保护（两条通道，但 GET 建议走 Header——查询串会进代理日志与 shell 历史）；**不受就绪门控**，因为客户端正是在账号还在 `indexing`（即服务尚未就绪）时轮询它。
+
+**请求**
+
+```http
+GET /api/v1/accounts
+Authorization: Bearer YOUR_TOKEN
+```
+
+**响应**
+
+```json
+{
+  "success": true,
+  "accounts": [
+    {
+      "qq": "1234567890",
+      "state": "ready",
+      "message_count": 28314,
+      "db_path": "C:\\Users\\<用户名>\\Documents\\Tencent Files\\1234567890\\nt_qq\\nt_db\\nt_msg.db"
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `accounts[].qq` | 账号 |
+| `accounts[].state` | `awaiting_key` / `indexing` / `ready` / `error`（完整状态机，不折叠） |
+| `accounts[].message_count` | 已索引消息数（仅 ready 后有效） |
+| `accounts[].error` | 出错时的错误信息（仅 `error` 状态；否则该键省略） |
+| `accounts[].db_path` | 服务端解析到的 `nt_msg.db` 路径；未知时该键省略 |
+
+数组里可能有多条，但**最多一条处于 `indexing` / `ready` / `error`**（即"绑定"）。其余条目是启动扫描发现、但从未注册密钥的账号，恒为 `awaiting_key`；它们不参与就绪判定，也不构成绑定（见 §10）。
+
+### accounts 响应的可选 `progress`
+
+账号处于 `indexing` 时，列表项、受理/幂等命中响应，以及在位账号正在构建时的冲突体，
+额外带一个**可选对象** `progress`：
+
+```json
+"progress": { "tables_done": 1, "tables_total": 2, "messages_indexed": 184321 }
+```
+
+- 只在 `indexing` 态出现；`ready` / `awaiting_key` / `error` 等其余状态**整块省略**
+  （不给 `null`，也不给全零对象）。
+- `tables_total` 只数消息表（本仓为 `group_msg_table` / `c2c_msg_table` 两张）；
+  为 `0` 表示分母尚未确定（扫描还没开始），不是「零张表」。
+- `messages_indexed` 是已成功读入索引的消息行累计值，逐行推进；读失败的行不计入。
+- 三个数不是同一瞬间的一致快照，仅用于观察；能否服务看 `state`，不要只看 `progress`。
+- 契约仓库的 `INTERPRETATION.md` 已把该键登记为 additive 可选对象，不读它的客户端零感知。
+  回归位置：`tests/api_smoke.rs::indexing_progress_shapes_match_golden` 与
+  `tests/golden/accounts-indexing.json` / `accounts-progress.json`。
 
 ---
 
