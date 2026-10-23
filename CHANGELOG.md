@@ -3,7 +3,7 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.9.2] - 2026-10-23
 
 ### 补记
 

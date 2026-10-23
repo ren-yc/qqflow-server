@@ -1,6 +1,6 @@
 {
   "name": "qqflow-server-ts-example",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "private": true,
   "description": "TypeScript example client for qqflow-server (example only, not published to npm)",
   "type": "module",
