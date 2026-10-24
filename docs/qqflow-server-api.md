@@ -14,7 +14,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台以只读直连方式打开源库（偏移 VFS 虚拟剥离自定义头）、解密并构建索引（见 §1.1）
 - API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到系统凭据库（`--show-token` 获取）。两种情形启动日志**会打印 token 值**：凭据库为空首次生成时（info 级），凭据库不可用而降级为会话级 token 时（warn 级）——后者的 token 重启即变
 - 索引就绪前（账号处于 `indexing` / `error` 时），业务接口返回 `503`（见 §8 错误）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts`（含明细、注销）不检查就绪状态，可随时调用
-- 与 weflow-server 的**有意差异**（SNS 仅 weflow、`messageCount` 条件键、`meta.type` 推导面、
+- 与 weflow-server 的**有意差异**（SNS 仅 weflow、`messageCount` 群成员面条件键、`meta.type` 推导面、
   默认端口、SDK/ts 状态）见
   [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
 - 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
@@ -1333,6 +1333,8 @@ POST /api/v1/sync
 | `500` | 内部错误 |
 
 > 说明：非 JSON 的 POST Body 会被忽略（仅记录日志），请求沿用 Query 参数，不会报 400；`start`/`end` 无法解析时该过滤条件被忽略。
+>
+> 上表 `405` 与未知路径 `404` 的实际文案是中文「方法不允许」与「未知路径」，随统一信封返回——按语言匹配提示的脚本不要假设 `message` 恒为中文业务描述。回归位置：快照 `error-method-not-allowed`／`error-unknown-path`。
 >
 > Query 数值参数类型错误（如 `limit=abc`）返回 **400 统一信封**。框架默认给的是**纯文本空响应体**，于是客户端只能靠状态码特判——而「参数错了」恰恰是它能自己修的那一类，不该与「传输返回了无法解析的东西」长得一样。适用于 `/api/v1/messages`、`/api/v1/sessions`、`/api/v1/contacts`。**例外是 ChatLab 拉取** `/api/v1/sessions/{id}/messages`：该接口的 `limit` / `offset` 为容错解析，非法值退化为默认值而不报错（见 §4.1），因为 WeFlow 的 Pull 契约对分页参数没有 400 语义。
 
