@@ -3,6 +3,22 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.0] - 2026-10-24
+
+### 破坏性变更
+
+- **serve 日志通道从 stdout 迁到 stderr**：迁移方式——`qqflow-server > 日志文件` 类部署改用
+  `2>` 收日志（此前 `[fatal]` 走 stderr、普通日志走 stdout，`2>` 采集拿不到启动上下文；
+  合并后 `2>` 一处收齐）。子命令支原本就在 stderr，不受影响。回归位置：
+  `serve_logs_go_to_stderr`（由 `serve_logs_stay_on_stdout` 反转更名）。
+
+### 变更
+
+- **接口契约 pin 由 `v0.6.4` 升 `v0.6.6`**：`v0.6.5` 登记两节适配差异——「不存在与存在但没有
+  内容」按面定型（本仓未知 talker 200 空列表为长期保留差异：会话条目只由消息记录建立）与
+  群成员面参数写法；`v0.6.6` 为第 7 节补落地版本的前置条件句。api 文档「跨仓的允许差异」
+  表补两行指针。
+
 ## [0.9.3] - 2026-10-24
 
 ### 修复

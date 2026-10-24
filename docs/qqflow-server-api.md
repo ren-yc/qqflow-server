@@ -76,7 +76,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 | 旗标 | 取值 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `--log` | `error\|warn\|info\|debug` | 子命令 **warn**；serve **info** | 日志详细度。子命令默认只播失败原因，正常路径不刷屏 |
-| `--log-format` | `text\|json` | `text` | `json` 为**逐行一个对象**（含 `level`/`target`/`fields`），给日志采集器消费；去向随入口（子命令 stderr、serve stdout） |
+| `--log-format` | `text\|json` | `text` | `json` 为**逐行一个对象**（含 `level`/`target`/`fields`），给日志采集器消费；两入口日志统一走 stderr |
 
 关键口径（回归位置：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 与
 `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`、`tests/cli.rs::invalid_log_flags_are_usage_errors_exit_2`）：
@@ -88,16 +88,17 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
   与一行「跳过」，原因永远看不到）。
 - **`serve` 的 `--log` 仍走老解析器**：`serve --log debug` 与裸跑 `--log debug` 逐字等价，info 默认也不被子命令
   预装的 warn 劫走（dispatch 在构造 clap 之前就短路进 legacy；回归位置：`tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。
-- **输出去向按入口分叉**：子命令的日志走 **stderr**（stdout 留给命令输出），serve 的日志维持 **stdout**
-  （既有 `qqflow-server > 日志文件` 部署的重定向习惯，改通道属破坏性变更）。回归位置：
-  `tests/cli.rs::serve_logs_stay_on_stdout`。两入口分叉的理由与已知代价写在 `docs/architecture.md`
+- **输出去向统一 stderr**（0.10.0 破坏性变更）：子命令的日志走 stderr（stdout 留给命令输出），
+  **serve 的日志也走 stderr**——`2>` 一处收齐服务日志与 `[init]`/`[fatal]`；此前 serve 走 stdout
+  的 `qqflow-server > 日志文件` 类部署会拿到空 stdout，**迁移方式：改用 `2>` 收日志**。回归位置：
+  `tests/cli.rs::serve_logs_go_to_stderr`。理由与历史代价写在 `docs/architecture.md`
   的「日志：装在哪、写去哪、说什么话」。
 - 非法取值（`--log verbose`、`--log-format yaml`）是**用法错误（退出码 2）**，与 `--since` 同一契约。
 - 环境变量 `RUST_LOG` **优先于 `--log`**（EnvFilter 的既有语义）：设了它时命令行旗标被忽略。脚本与
   测试基座里一律 `env_remove` 它，避免级别随环境漂移。
 - 子命令日志**不带 ANSI 颜色码**（`--log-format json` 与 text 同）：stderr 是脚本与采集器的消费面，
   `2> 日志文件` 里出现 `\x1b[33m` 会毁掉按行解析。这条是产品保证、不依赖 `NO_COLOR` 环境变量。
-  serve 的输出维持库默认（0.9.1 不动它的观感）。
+  serve 自 0.10.0 起并入同一通道，观感一致（同为无颜色码的行）。
 
 ## 批量导出（`export`）
 
@@ -1167,6 +1168,8 @@ REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 
 | SSE `message.new` 的 `groupName` / `media` | 条件键（没有就不出现） | 键恒出现，无值时 `null` |
 | 通知帧 `platformMessageId` | **所有帧恒省略**（含撤回帧） | 键恒出现：`message.new` 为 `null`，`message.revoke` 为平台号 |
 | 未请求计数时的 `members[].messageCount` | 省略键 | 键恒出现，值为 `0`（见第 6 节） |
+| 未知会话／未知群的状态码 | 见 flow-contract `ADAPTATION.md` 的「不存在与存在但没有内容」一节 | 消息面方向相反（weflow 未知会话 404，长期保留）；群成员面两仓一致 404 |
+| 群成员面的会话标识键名与布尔取值 | 见 flow-contract `ADAPTATION.md` 的「同一个查询参数在两仓写法不同」一节 | weflow 双名（`chatroomId`／`talker`）＋布尔认 `1/true/yes/on`；本仓只认 `chatroomId`＋`1/true` |
 
 ---
 
