@@ -25,6 +25,7 @@ from qqflow_sdk import (
     ShapeError,
     SyncClient,
     TransportError,
+    UnknownAccount,
 )
 from qqflow_sdk import client as sdkmod
 from qqflow_sdk.generated.qqflow_sdk import models as gen
@@ -1648,3 +1649,89 @@ def test_sync_client_watch_yields_events_without_an_async_loop(monkeypatch) -> N
     finally:
         events.close()
         client.close()
+
+
+async def test_wait_ready_unknown_account_fails_fast_with_registered_ids() -> None:
+    """A listing that came through without the id is a verdict, not a wait.
+
+    The usual wrong input is a session username (or any non-registered qq),
+    which used to surface as a full-timeout NotReady("last state:
+    not-registered") - pointing the caller at the registration step when the
+    real problem is which identifier was passed. One successful listing
+    proves waiting cannot help.
+    """
+    mock = Mock()
+    mock.states = ["ready"]  # the listing answers; the id simply is not in it
+    client = make_client(mock)
+    with pytest.raises(UnknownAccount) as exc:
+        await client.wait_ready("session_username_by_mistake", timeout=30)
+    assert exc.value.account == "session_username_by_mistake"
+    assert exc.value.registered == ["qq_mock"]
+    assert "qq_mock" in str(exc.value), "the error names who IS registered"
+    assert mock.get_accounts_calls == 1, "fail fast: exactly one poll, no burn"
+    await client.aclose()
+
+
+def test_sync_client_wait_ready_unknown_account_fails_fast_with_registered_ids(
+    monkeypatch,
+) -> None:
+    mock = Mock()
+    mock.states = ["ready"]
+    client = make_sync_client(mock, monkeypatch)
+    try:
+        with pytest.raises(UnknownAccount) as exc:
+            client.wait_ready("session_username_by_mistake", timeout=30)
+    finally:
+        client.close()
+    assert exc.value.registered == ["qq_mock"]
+    assert mock.get_accounts_calls == 1
+
+
+async def test_watch_close_is_silent_even_when_the_stream_errors_during_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Abandoning a watch mid-stream must not log a bogus "reconnecting".
+
+    Closing the generator while the server response is still open makes the
+    response teardown raise a transport error *inside the generator's
+    cleanup*, with an empty message and a GeneratorExit context - which used
+    to be logged verbatim as "SSE stream error, reconnecting: " and read
+    like a real disconnect.
+    """
+    frame = _sdk_raw([_sdk_sse_frame("message.new", _sdk_new_payload("9", "hi"), 7)])
+
+    class _CloseErrorsTransport(httpx.AsyncBaseTransport):
+        """Serve one event, then raise a chained transport error on close."""
+
+        def __init__(self) -> None:
+            self.connections = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.connections += 1
+
+            async def body():
+                yield frame
+                try:
+                    yield b""
+                except GeneratorExit:
+                    # Closing the response mid-stream is exactly where an
+                    # abandoned generator surfaces its teardown error: empty
+                    # message, GeneratorExit as the __context__.
+                    raise httpx.ReadError("")
+
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=body()
+            )
+
+    transport = _CloseErrorsTransport()
+    client = Client("http://mock", TOKEN)
+    client._http = httpx.AsyncClient(transport=transport, base_url="http://mock")
+    stream = client.watch()
+    got = await asyncio.wait_for(stream.__anext__(), timeout=5)
+    assert isinstance(got, MessageEvent)
+    with caplog.at_level(logging.WARNING, logger="qqflow_sdk.client"):
+        await stream.aclose()
+    warned = [r.getMessage() for r in caplog.records]
+    assert transport.connections == 1, "teardown must not reconnect"
+    assert not warned, f"teardown must stay silent: {warned}"
+    await client.aclose()

@@ -3,6 +3,24 @@
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.3] - 2026-10-24
+
+### 修复
+
+- **SDK `wait_ready` 区分「账号不在清单」**：传会话 username 等错误标识时此前伪装成
+  超时未注册；现在一次成功的账号清单里没有该账号即立刻报 `UnknownAccount` 并附已注册
+  账号清单（Python/Rust 两 SDK 同批；传输失败与 5xx 仍按等待语义处理）。回归位置：
+  `test_wait_ready_unknown_account_fails_fast_with_registered_ids`／
+  `wait_ready_unknown_account_names_the_registered_ids`。
+- **SDK `watch` 被放弃时不再误报断线**：生成器关闭触发的清理错误此前打一条空原因的
+  「SSE stream error, reconnecting」；现识别关闭路径保持静默，真实断线日志补异常类型名。
+  回归位置：`test_watch_close_is_silent_even_when_the_stream_errors_during_cleanup`。
+
+### 文档
+
+- quickstart「第一个请求」补零账号 503 指引与 token 赋值步骤；错误响应节补 405 与未知
+  路径 404 的中文实际文案与回归快照名；头部差异摘要句点明 messageCount 条件键属群成员面。
+
 ## [0.9.2] - 2026-10-23
 
 ### 补记
