@@ -2,6 +2,13 @@
 
 无头 HTTP API + SSE 服务：读取本地 QQ NT 版聊天记录（SQLCipher 解密 `nt_msg.db`）。独立实现，接口形态参考 **WeFlow HTTP API**。
 
+## 家族术语
+
+- **WeFlow** —— 安装版 HTTP API（默认端口 :5031）；三仓文档中的「WeFlow 形状 / 与 WeFlow 的差异」均以它为基线。
+- **weflow-server** —— 本家族的微信 4.x 只读服务（默认端口 :5033），纯 Rust 实现，接口契约对齐 WeFlow HTTP API。
+- **qqflow-server** —— 本家族的 QQ NT 只读服务（默认端口 :5032），与 weflow-server 同构。
+- **WeFlow Legacy** —— briefdesk 里的旧采集插件，走安装版 WeFlow 的 HTTP 面取数。
+
 ## 获取
 
 - **Release 二进制** — 入口：GitHub Releases 的最新 tag（三平台归档 ＋ `SHA256SUMS`）；说明：免工具链；校验后再运行
