@@ -26,7 +26,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 | 目标 | 先读这里 | 再读 |
 |---|---|---|
 | 第一次跑通（获取→起服务→注册→查询） | [quickstart](quickstart.md) | 本文「鉴权规范」「错误响应」 |
-| 接 ChatLab 前端 | quickstart 配方一 | 「拉取会话消息（ChatLab Pull）」＋「接口列表」里的上限表 |
+| 接 ChatLab 前端 | quickstart 配方一 | 「拉取会话消息（ChatLab Pull）」＋「接口列表」里的上限列表 |
 | 程序化取数 / 翻页 | 本文「接口列表」→ 对应小节 | 「类型化客户端（SDK）」「使用示例」 |
 | 只要增量（watcher/SSE） | quickstart 配方二 | 「主动推送（SSE）」 |
 | 批量导出（含媒体） | quickstart 配方三 | 「批量导出（`export`）」＋「媒体导出」 |
@@ -146,16 +146,14 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 
 > **读端点只有 GET**：`/api/v1/` 下的 `messages`、`sessions`、`sessions/{id}/messages`、`contacts`、`group-members`、`media/{id}`、`push/messages`，以及 `/chatlab/` 下的 `sessions`、`messages`、`sessions/{id}/messages`、`push/messages`，以及描述面 `/openapi.json`——这些的 POST 一律 **405**（逐条见 `routes.rs` 的 `GET_ONLY`）。例外是**动作端点**（`POST /api/v1/accounts` 注册、`/api/v1/sync`）与免鉴权的 `/health`、`/api/v1/health`：它们保留两个方法。
 
-> **「上限」分属四个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下表按源码实测逐端点列出）：
+> **「上限」分属四个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下方列表按源码实测逐端点列出）：
 >
-> | 数字 | 属于哪个面 | 含义（源码位置：各 handler 的 `parse_limit`／`clamp`） |
-> |---|---|---|
-> | **10000** | `GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages` | **单个请求返回条数**的硬上限（`limit` 默认 100） |
-> | **5000** | Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages` | 单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同） |
-> | **200**（MCP）| MCP 工具参数 `limit`（见 `docs/mcp.md`）| **工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它是「模型经 MCP 取数据」这一层的自限，与 HTTP 上限不构成矛盾 |
-> | **200**（CLI 页大小，非闸门）| `--with-media` 每次调 `/chatlab/messages?media=1` 时自设的 `limit`（源码：`src/cli.rs` 的导出窗口循环）| 它是**调用方**一次请求带多少条的选择，不是服务端上限；**本仓 `media=1` 不截断导出项**（对照：weflow 服务端确有 `jobs.truncate(200)` 这道闸门）|
+> - **10000** — 属于哪个面：`GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：**单个请求返回条数**的硬上限（`limit` 默认 100）
+> - **5000** — 属于哪个面：Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同）
+> - **200**（MCP） — 属于哪个面：MCP 工具参数 `limit`（见 `docs/mcp.md`）；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：**工具层**对一次取页的默认 50／上限 200，比 HTTP 更严；它是「模型经 MCP 取数据」这一层的自限，与 HTTP 上限不构成矛盾
+> - **200**（CLI 页大小，非闸门） — 属于哪个面：`--with-media` 每次调 `/chatlab/messages?media=1` 时自设的 `limit`（源码：`src/cli.rs` 的导出窗口循环）；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：它是**调用方**一次请求带多少条的选择，不是服务端上限；**本仓 `media=1` 不截断导出项**（对照：weflow 服务端确有 `jobs.truncate(200)` 这道闸门）
 >
-> 两点容易踩的坑：① `GET /api/v1/group-members` **没有 `limit`**（整名册一次给全，不参与上面的换算）；② SDK 形参 `page_size`（`list_all_sessions`）**不是 HTTP 参数名**——它内部发的就是 `limit`，拿它当「另一个上限」会算错。所以「联系人一次最多能拿多少」＝10000，走 MCP 则被压到 200。另注：**本仓的 `media=1` 没有导出条数闸门**（weflow 才有），别把那边的那个 200 当跨仓常量。本仓没有朋友圈面（`/api/v1/sns/*` 是 weflow-only：QQ NT 本地库不含朋友圈数据），因此 weflow 侧那条 500 上限不适用本表。
+> 两点容易踩的坑：① `GET /api/v1/group-members` **没有 `limit`**（整名册一次给全，不参与上面的换算）；② SDK 形参 `page_size`（`list_all_sessions`）**不是 HTTP 参数名**——它内部发的就是 `limit`，拿它当「另一个上限」会算错。所以「联系人一次最多能拿多少」＝10000，走 MCP 则被压到 200。另注：**本仓的 `media=1` 没有导出条数闸门**（weflow 才有），别把那边的那个 200 当跨仓常量。本仓没有朋友圈面（`/api/v1/sns/*` 是 weflow-only：QQ NT 本地库不含朋友圈数据），因此 weflow 侧那条 500 上限不适用本列表。
 
 > v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（「媒体导出」，WeFlow 形状）。
 

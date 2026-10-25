@@ -49,7 +49,7 @@ curl -H "Authorization: Bearer $QQFLOW_TOKEN" \
 
 `since` 缺省等于全量；`limit` 分页时响应**必须**带 `sync` 块。去重按 `platformMessageId`。
 
-深入：api 文档「4.1 拉取会话消息（ChatLab Pull）」；翻页与条数数字看「接口列表」后的上限表。
+深入：api 文档「4.1 拉取会话消息（ChatLab Pull）」；翻页与条数数字看「接口列表」后的上限列表。
 
 ## 配方二：只要增量（watcher / SSE）
 
