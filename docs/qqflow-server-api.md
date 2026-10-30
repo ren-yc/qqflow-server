@@ -782,7 +782,7 @@ GET /chatlab/messages
 
 **请求**
 
-```
+```http
 GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 ```
 
