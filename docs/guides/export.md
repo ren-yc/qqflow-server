@@ -33,6 +33,6 @@
 
    回归位置：`export::tests::resume_rewrites_an_incomplete_artifact`、`export::tests::failed_rerun_keeps_the_previous_complete_artifact`、`cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
 
-内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄映射现在**只活在这一页**（O(本页不同媒体数)，不随会话长度增长），因此媒体侧不再破坏这条承诺。同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），那一项仍在承诺之外。大语料的实测口径与造库工具（隐藏的 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
+内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄映射现在**只活在这一页**（O(本页不同媒体数)，不随会话长度增长），因此媒体侧不再破坏这条承诺。同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），那一项仍在承诺之外。大语料的实测口径与造库工具（隐藏的 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 [架构文档](../architecture.md) 的「测试与夹具」；导出流程本身以本页为准。
 
 回归位置：`export::tests::*`（行形状、slug、`--resume`、令牌熔断、`--with-media` 的句柄契约）与 `tests/cli.rs` 的 `export_help_does_not_advertise_the_rows_param`／`export_requires_out_dir_as_usage_error`。
