@@ -1,6 +1,8 @@
 # qqflow-server HTTP API / Push 文档
 
-qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于外部脚本或工具读取 QQ NT 本地聊天记录（会话、消息、联系人、群成员）；也支持通过固定 SSE 地址推送新消息事件。接口形态参考 WeFlow HTTP API，字段与语义以本文档为准（v1 实现差异见各节"说明"）。
+qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于外部脚本或工具读取 QQ NT 本地聊天记录（会话、消息、联系人、群成员）；也支持通过固定 SSE 地址推送新消息事件。
+
+接口形态参考 WeFlow HTTP API，字段与语义以本文档为准（v1 实现差异见各节"说明"）。
 
 > **术语**：**本文中 "WeFlow" 一律指安装版 WeFlow HTTP API（默认端口 5031）**，不是同族的 weflow-server（默认 5033，另有独立 API 文档）——下文所有「与 WeFlow 的差异」均以前者为基线。
 >
@@ -150,7 +152,9 @@ GET /api/v1/health
 | `ready` | 索引就绪，业务接口可用 |
 | `error` | 初始化失败（如密钥错误）；账号仍占用绑定 |
 
-**本接口刻意不列出账号。** 它免鉴权，而启动扫描会为本机每个 QQ 目录建立一条记录，因此把账号数组（乃至它的长度）放在这里，等于向任何未鉴权的调用方泄露本机存在哪些账号、各自进行到哪一步。账号号码、消息数、数据库路径、错误详情改由需鉴权的 `GET /api/v1/accounts`（「账号明细」）提供。
+**本接口刻意不列出账号。** 它免鉴权，而启动扫描会为本机每个 QQ 目录建立一条记录，因此把账号数组（乃至它的长度）放在这里，等于向任何未鉴权的调用方泄露本机存在哪些账号、各自进行到哪一步。
+
+账号号码、消息数、数据库路径、错误详情改由需鉴权的 `GET /api/v1/accounts`（「账号明细」）提供。
 
 同理，`awaiting_key` 不会出现在这里：账号进入该状态的唯一途径就是启动扫描发现了它，所以对外一律折叠为 `unregistered`。
 
@@ -176,7 +180,9 @@ POST /api/v1/accounts
 }
 ```
 
-**Token 走请求头** `Authorization: Bearer <TOKEN>`（或查询串 `?access_token=`）。**body 里的 `access_token`/`token` 会被跳过**（既不鉴权、也不覆盖查询串里的值）——只把 token 写在 body 里（Header 与查询串都不带）会得到 401。
+**Token 走请求头** `Authorization: Bearer <TOKEN>`（或查询串 `?access_token=`）。
+
+**body 里的 `access_token`/`token` 会被跳过**（既不鉴权、也不覆盖查询串里的值）——只把 token 写在 body 里（Header 与查询串都不带）会得到 401。
 
 **参数**
 
@@ -234,11 +240,15 @@ POST /api/v1/accounts
 
 **重复注册不再覆写。** 内存索引没有账号维度，第二个账号写进来会污染第一个账号的数据，所以换账号必须先调用「注销账号」。`error` 状态**不释放绑定**——一次瞬时解密失败不应把服务交给另一个账号；同一个 qq 可以直接重试注册来恢复。
 
-`status` 的用途是免去注册后立刻再打一次 `GET /api/v1/accounts`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**——例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
+`status` 的用途是免去注册后立刻再打一次 `GET /api/v1/accounts`：拒绝类响应（`invalid_key` / `invalid_db_path` / `unknown_qq`）不改变账号状态，`status` 因此告诉客户端账号**此刻仍处于什么状态**。
+
+例如密钥填错重注册一个此前失败的账号，会得到 `state=invalid_key` + `status=error`，即"这次被拒且账号仍然坏着"。
 
 **`status: "indexing"` 不代表密钥正确**：本接口在账号/路径解析通过后只校验密钥格式，真正的解密验证在后台初始化中完成（失败 → `error`）。客户端仍需轮询 `/health`（或「账号明细」）等到 `ready`。
 
-`db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
+`db_path` 回显的是解析结果而非请求原值：请求里的 `db_path` 可以是文件、可以是 Tencent Files 风格根目录、也可以省略（走启动扫描），回显让客户端确认服务端最终读的是哪个库。
+
+幂等分支（`already_ready` / `in_progress`）回显的是**运行中账号当初使用的路径**，本次请求携带的 `db_path` 在这些分支下被忽略。
 
 密钥仅保存在内存中，**不持久化**；进程退出后需重新注册。密钥错误时账号进入 `error` 状态（`GET /api/v1/accounts` 的 `accounts[].error` 给出原因），重新调用本接口传入正确参数即可恢复。
 
@@ -348,7 +358,11 @@ Authorization: Bearer YOUR_TOKEN
 
 **路径里的 `qq` 是联锁而不是选择器**：绑定全局只有一个，所以传错账号说明客户端状态和服务端不一致，值得报 `qq_mismatch` 让它发现，而不是顺手把当前绑定的那个注销掉。
 
-**`purge_media` 默认 false，且只删已知布局。** 导出媒体是派生数据，客户端可能还在用自己的缓存对外提供服务，而删文件不可撤销，所以必须显式索取。开启后也只删 `<exportPath>/<talker>/<kind>`（`kind` ∈ `images` / `voices` / `videos` / `emojis`，即服务自己写的四类），talker 目录本身仅在变空后以"非空即拒"的方式移除；`--media-export-dir` 可能指向操作员另有他用的目录，因此**递归删除导出根目录从来不是选项**，根目录自身永不删除。
+**`purge_media` 默认 false，且只删已知布局。** 导出媒体是派生数据，客户端可能还在用自己的缓存对外提供服务，而删文件不可撤销，所以必须显式索取。
+
+开启后也只删 `<exportPath>/<talker>/<kind>`（`kind` ∈ `images` / `voices` / `videos` / `emojis`，即服务自己写的四类），talker 目录本身仅在变空后以"非空即拒"的方式移除。
+
+`--media-export-dir` 可能指向操作员另有他用的目录，因此**递归删除导出根目录从来不是选项**，根目录自身永不删除。
 
 **索引中途注销是允许的。** 不必等 `ready`：注销会作废进行中的初始化（`indexing` 的构建完成后不会把索引装回来，账号也不会"复活"）。
 
@@ -378,7 +392,9 @@ GET /api/v1/push/messages
 
 - 响应类型为 `text/event-stream`
 - 连接建立后**先收到一个 `ready` 事件**（`{"status":"ok"}`，表示流已就绪，对齐 WeFlow 契约），随后重放断线期间错过的事件（见下），再收到 `sync` 事件（qqflow-server 扩展，携带当前 rowid 水位线），之后是 `message.new` / `message.revoke`
-- **断线续传（Last-Event-ID 重放）**：每个 `message.new` / `message.revoke` 帧都带 `id:`（服务端单调递增序号）。客户端重连时携带 `Last-Event-ID: <序号>` 请求头（或 `?last_event_id=<序号>` 查询参数——浏览器 `EventSource` 无法设置自定义头），服务端重放序号之后、10 分钟 TTL 窗口内的历史事件；窗口外/无序号则从当前水位线重新开始。事件缓冲上限 1000 条
+- **断线续传（Last-Event-ID 重放）**：每个 `message.new` / `message.revoke` 帧都带 `id:`（服务端单调递增序号）。
+  - 客户端重连时携带 `Last-Event-ID: <序号>` 请求头，或 `?last_event_id=<序号>` 查询参数（浏览器 `EventSource` 无法设置自定义头）。
+  - 服务端重放序号之后、10 分钟 TTL 窗口内的历史事件；窗口外/无序号则从当前水位线重新开始。事件缓冲上限 1000 条
 - KeepAlive 每 25 秒发送 `ping` **注释帧**（线上字节为 `:ping`，非 `data:` 帧）保活——只解析 `data:` 行的客户端收不到它，事件分派无需处理 `ping` 类型
 - 订阅端落后于广播缓冲（1024 条）时会重新收到 `sync` 事件对齐
 - 进程收到退出信号（Ctrl+C）时，服务端主动结束所有 SSE 流——客户端看到连接正常关闭，不会等到 3 秒宽限期超时
@@ -441,7 +457,9 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 - **③ 增量** — 请求：`GET …/messages?since={lastPullAt}`；实测：返回 `since` 之后的增量（实测 321 条）
 - **④ 通知** — 请求：`GET /chatlab/push/messages`（SSE，可选）；实测：立刻收到 `ready` 基线帧
 
-**服务是零账号启动的**（客户端驱动）：先 `POST /api/v1/accounts` 传入 `{qq, key, db_path}`，再轮询 `GET /api/v1/accounts` 到 `state == "ready"`。在此之前业务端点返回 `503`（`/health` 返回 `starting`），这是**有意的** —— 索引没建完确实查不了。
+**服务是零账号启动的**（客户端驱动）：先 `POST /api/v1/accounts` 传入 `{qq, key, db_path}`，再轮询 `GET /api/v1/accounts` 到 `state == "ready"`。
+
+在此之前业务端点返回 `503`（`/health` 返回 `starting`），这是**有意的** —— 索引没建完确实查不了。
 
 **分页语义**（阶段二的关键）：
 
@@ -453,7 +471,9 @@ data: {"event":"message.new","sessionId":"10001","sessionType":"group","groupNam
 
 ### GET `/chatlab/sessions` — ChatLab 发现面
 
-规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的会话发现入口。与 `/api/v1/sessions` **共用同一份实现**，差别只在**形状与分页参数**：老面只输出原生形状、只认 `offset`；新面**天生就是** ChatLab 形状，并接受 `cursor`（`page.nextCursor` 的回传入参）。
+规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的会话发现入口。
+
+与 `/api/v1/sessions` **共用同一份实现**，差别只在**形状与分页参数**：老面只输出原生形状、只认 `offset`；新面**天生就是** ChatLab 形状，并接受 `cursor`（`page.nextCursor` 的回传入参）。
 
 **请求**
 
@@ -488,7 +508,11 @@ GET /chatlab/sessions
   - 它是「**我们知道的**成员数」，**不是「群的确切人数」**：来源是本地缓存，可能少于真实值。拿它做展示预估可以，拿它做「群里一共几个人」的断言不行。
   - 「没有名册」与「名册是空的」在下游是两件事 —— 前者不该被读成 `0`，所以是可选键而不是给 0。
 
-排序为最后消息时间**降序**、同刻按 `id`（talker）**升序** —— 决定性顺序，游标翻页因此不会跳项或重复。次键不是装饰：会话集合的底层容器是 `HashMap`，迭代顺序随进程变，没有次键时同刻的两个会话会在不同进程里换位置，`skip/take` 翻页于是会重复拿到一个、同时漏掉另一个（回归位置：`same_timestamp_sessions_page_stably_across_rebuilt_stores`）。
+排序为最后消息时间**降序**、同刻按 `id`（talker）**升序** —— 决定性顺序，游标翻页因此不会跳项或重复。
+
+次键不是装饰：会话集合的底层容器是 `HashMap`，迭代顺序随进程变。
+
+没有次键时同刻的两个会话会在不同进程里换位置，`skip/take` 翻页于是会重复拿到一个、同时漏掉另一个（回归位置：`same_timestamp_sessions_page_stably_across_rebuilt_stores`）。
 
 ### GET `/chatlab/push/messages` — ChatLab 通知面（SSE，只发元信息）
 
@@ -570,7 +594,10 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 - **`createTime`**：秒级 Unix 时间戳（优先 `40050` 列，缺列时回退 seq 高位）
 - **`isSend`**：方向：`1`=本人发送，`0`=他人/系统（来自 `40013` 列；QQ 版本缺列或值非 1/2 时恒 `0`）
 - **`senderUsername`**：发送者 UID（稳定标识，客户端据此去重）
-- **`senderName`**：发送者显示名，按**本会话**解析：群聊为本群群名片（`40090`）> 备注（`20009`）> 最新昵称（`40093`）> 档案昵称（`20002`）> UID；私聊无群名片，从备注起算。同一 UID 在不同会话可得不同显示名（群名片只在本群生效，不会外泄到私聊或联系人列表）。回退链末端是 UID 本身，故 `senderUsername` 非空时该字段必非空；系统消息等无发送者的行 `senderUsername` 为空，此字段同为空串（真实账号抽样 2568 条中 369 条属此类）。**有此字段后，客户端无需为显示名再调用 `/api/v1/contacts` 与 `/api/v1/group-members`**
+- **`senderName`**：发送者显示名，按**本会话**解析：群聊为本群群名片（`40090`）> 备注（`20009`）> 最新昵称（`40093`）> 档案昵称（`20002`）> UID；私聊无群名片，从备注起算。
+  - 同一 UID 在不同会话可得不同显示名（群名片只在本群生效，不会外泄到私聊或联系人列表）。
+  - 回退链末端是 UID 本身，故 `senderUsername` 非空时该字段必非空；系统消息等无发送者的行 `senderUsername` 为空，此字段同为空串（真实账号抽样 2568 条中 369 条属此类）。
+  - **有此字段后，客户端无需为显示名再调用 `/api/v1/contacts` 与 `/api/v1/group-members`**
 - **`content` / `rawContent` / `parsedContent`**：v1 三者相同，为解析后文本
 - **`type`**：仅图片/语音/视频消息：`image` / `voice` / `video`（该键曾叫 `mediaType`，与媒体对象内部的名字空间无关）
 - **`media`**：仅媒体消息：元数据对象（`uuid`/`md5`/`fileName`/`size`/`width`/`height`/`localPath`/`urls`，均为可选字段，缺失即省略）
@@ -694,7 +721,9 @@ GET /chatlab/messages
 
 `meta.type` 按标准只有 `group`/`private` 两个取值，公众号/订阅号等会归入 `private`。需要更细的会话分类请用「获取会话列表」 `/api/v1/sessions` 的 `type`。
 
-不输出的可选字段（`meta.groupAvatar`、`members[].aliases`、`messages[].mediaPath`）与本面同样适用，清单见「拉取会话消息」"与标准 / 安装版的已知差异"。`messages[].replyToMessageId` 在 **原生面、消息面、拉取面三个面上同规**：无引用时**省略该键**（不是给 `null`）。
+不输出的可选字段（`meta.groupAvatar`、`members[].aliases`、`messages[].mediaPath`）与本面同样适用，清单见「拉取会话消息」"与标准 / 安装版的已知差异"。
+
+`messages[].replyToMessageId` 在 **原生面、消息面、拉取面三个面上同规**：无引用时**省略该键**（不是给 `null`）。
 
 ---
 
@@ -713,14 +742,19 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 | `id` | string | 是 | **store 键**（消息里的 `mediaId`，md5 hex 或 uuid）或**导出文件名**（`media=1` 写进导出根的名字） |
 | `access_token` | string | 是 | 鉴权（或 `Authorization: Bearer`） |
 
-**响应**：媒体文件字节流，`content-type` 按扩展名（`image/jpeg` / `image/png` / `image/gif` / `image/webp` / `video/mp4` / `audio/wav` / `audio/amr` / `audio/silk` 等），携带 `content-length`。
+**响应**：媒体文件字节流。
+
+- `content-type` 按扩展名（`image/jpeg` / `image/png` / `image/gif` / `image/webp` / `video/mp4` / `audio/wav` / `audio/amr` / `audio/silk` 等）。
+- 携带 `content-length`。
 
 **说明**：`id` 有**两个来源**，按顺序解析：
 
 1. **store 键**：索引登记过的本地缓存路径（消息 `media.localPath`，即 `45812` 字段）。命中即服务，这是 `mediaId` 承诺「出现即可取」的落点；键命中但文件已被 QQ 清理 ⇒ `404`。
 2. **导出文件名**：在导出根下按名解析，布局 `<exportPath>/<talker>/<images|voices|videos|emojis>/<file>`。只有这四个类型目录参与解析（别的目录里就算躺着同名文件也不服务）；路径段按统一规则拒绝尾点、尾空格与冒号，规范化后必须仍落在导出根内。
 
-**同名多命中**（规则与 weflow-server 一致）：候选**内容一致** ⇒ 取排序后的第一个；**不一致** ⇒ `404`（同名内容冲突）。比较先比 size 短路，只有 size 相同才逐字节读整份文件 ——读放大 ＝ 候选数 × 文件大小，是线性成本。这条规则是「出现即可取」的前提：按名解析是**跨会话**的，别的会话里可能躺着同名但内容不同的文件。
+**同名多命中**（规则与 weflow-server 一致）：候选**内容一致** ⇒ 取排序后的第一个；**不一致** ⇒ `404`（同名内容冲突）。比较先比 size 短路，只有 size 相同才逐字节读整份文件 ——读放大 ＝ 候选数 × 文件大小，是线性成本。
+
+这条规则是「出现即可取」的前提：按名解析是**跨会话**的，别的会话里可能躺着同名但内容不同的文件。
 
 **未命中的措辞统一为「媒体不存在」**（含缓存被清理的情形）——「文件被清理」与「没这个名字」对调用方是同一种失败，两种措辞只会让它多写一条分支。
 
@@ -728,7 +762,9 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 
 #### 媒体导出（WeFlow 形状，`media=1`）
 
-`GET /api/v1/messages?media=1`（`/chatlab/messages` 同样支持）把**本页**媒体导出到导出根目录（`--media-export-dir`，默认 `<data-dir>/api-media`），布局 `<exportPath>/<talker>/<images|voices|videos>/<file>`，并：
+`GET /api/v1/messages?media=1`（`/chatlab/messages` 同样支持）把**本页**媒体导出到导出根目录（`--media-export-dir`，默认 `<data-dir>/api-media`）。
+
+布局 `<exportPath>/<talker>/<images|voices|videos>/<file>`，并：
 
 - 每条**确实写出本地副本**的媒体消息填充 `mediaFileName` / `mediaUrl`（**根相对路径** `/api/v1/media/{导出文件名}`，不含 token）/ `mediaLocalPath`（绝对路径）
 - envelope 多出 `"exportPath": "<导出根>"`（未请求导出时该键**省略**，不是空串），`count` 是本次成功导出的条数
@@ -736,7 +772,9 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 - 导出在阻塞线程池执行（`spawn_blocking`），不阻塞 HTTP worker（并发导出/SSE 互不影响）
 - 幂等：目标已存在且同尺寸即跳过（不重写、mtime 保留）——目标文件名由内容键（md5 hex / uuid，小写）派生，同键必同内容，不会出现"同名不同字节"互相覆盖/错指
 
-**获取导出文件**：`GET /api/v1/media/{导出文件名}?access_token=YOUR_TOKEN`（见「获取媒体文件」的按名解析规则：只有四个类型目录参与、同名异内容 404、路径穿越拒绝）。注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
+**获取导出文件**：`GET /api/v1/media/{导出文件名}?access_token=YOUR_TOKEN`（见「获取媒体文件」的按名解析规则：只有四个类型目录参与、同名异内容 404、路径穿越拒绝）。
+
+注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
 
 > **句柄只对「内容摘要派生」的名字给出**：导出名是 `<内容键>.<扩展名>`（md5 hex / uuid）时它同时是 ChatLab 面 `media.fileName` 的可用句柄；平台给的原文件名回落**只作元数据**，因为按名解析是跨会话的、同名可能是别的文件。
 
@@ -820,7 +858,9 @@ GET /chatlab/sessions
 
 `platform` 固定 `"qq"`；`messageCount` 是**索引里的真实条数**。`count` 是**本页条数**。老面**不再识别** `cursor`：继续传不会报错，而是静默回到第一页。
 
-**`page` 块是必需的。** ChatLab 把「没有 `page` 块」的响应读作「这就是完整一页」，所以不带 `page` 的截断会被下游当成全量——默认 `limit` 是 100，普通账号就能撞上，表现是「第 101 个会话凭空消失」且不报错。`hasMore` 为假时 `nextCursor` 为 `null`；把 `nextCursor` 原样回传即可继续翻页。
+**`page` 块是必需的。** ChatLab 把「没有 `page` 块」的响应读作「这就是完整一页」，所以不带 `page` 的截断会被下游当成全量——默认 `limit` 是 100，普通账号就能撞上，表现是「第 101 个会话凭空消失」且不报错。
+
+`hasMore` 为假时 `nextCursor` 为 `null`；把 `nextCursor` 原样回传即可继续翻页。
 
 ---
 
@@ -850,7 +890,9 @@ GET /api/v1/sessions/{id}/messages
 
 **响应**
 
-**名字是两个字段，不是一个。** `accountName` = 账号自己的名字（备注 `20009` > 昵称 > UID），`groupNickname` = 本群群名片（`40090`），群聊无名片或私聊时为空串。二者不同源、可以不同值，客户端要显示"群里的称呼"取 `groupNickname` 并回落到 `accountName`。
+**名字是两个字段，不是一个。** `accountName` = 账号自己的名字（备注 `20009` > 昵称 > UID），`groupNickname` = 本群群名片（`40090`），群聊无名片或私聊时为空串。
+
+二者不同源、可以不同值，客户端要显示"群里的称呼"取 `groupNickname` 并回落到 `accountName`。
 
 「获取消息」 `/api/v1/messages` 的 `senderName` 是**另一回事**：它是两者的合并值（群聊名片优先），下游已依赖，不随本节改变。
 
@@ -902,9 +944,14 @@ GET /api/v1/sessions/{id}/messages
 
 **`6` 在标准中未分配，任何情况下都不会出现。**
 
-**本项目实际只产出 `0` / `1` / `2` / `3` / `80` / `81` / `99` 七个码。** 上表是标准全集，其余码位（`4` FILE、`5` EMOJI、`7` LINK、`8` LOCATION、`24` SHARE、`25` REPLY、`27` CONTACT）在 QQ 侧没有对应的**类型码**解析：没有名片 / 位置 / 链接的细分识别，这些消息统一落到 `99` OTHER。（**引用关系本身是抽得出的**——见「拉取会话消息」末的 `replyToMessageId`；类型码与引用关系是两件事，不要因为其中一个没做就以为另一个也没有。）
+**本项目实际只产出 `0` / `1` / `2` / `3` / `80` / `81` / `99` 七个码。**
 
-⚠️ **与 weflow-server 的覆盖面不对等。** weflow-server 能输出 `0/1/2/3/4/5/7/8/24/25/27/80/81/99`。同一个逻辑消息在两个平台上可能一边是 `25` REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 `99` 兜底，不要假设两个上游的枚举分布一致。
+- 上表是标准全集，其余码位（`4` FILE、`5` EMOJI、`7` LINK、`8` LOCATION、`24` SHARE、`25` REPLY、`27` CONTACT）在 QQ 侧没有对应的**类型码**解析：没有名片 / 位置 / 链接的细分识别，这些消息统一落到 `99` OTHER。
+- **引用关系本身是抽得出的**——见「拉取会话消息」末的 `replyToMessageId`；类型码与引用关系是两件事，不要因为其中一个没做就以为另一个也没有。
+
+⚠️ **与 weflow-server 的覆盖面不对等。** weflow-server 能输出 `0/1/2/3/4/5/7/8/24/25/27/80/81/99`。
+
+同一个逻辑消息在两个平台上可能一边是 `25` REPLY、另一边是 `99` OTHER。下游做类型分支时应把未覆盖码按 `99` 兜底，不要假设两个上游的枚举分布一致。
 
 ⚠️ 这与「获取消息」 `/api/v1/messages` 的 `localType` 是**两套独立编码**：同一张图片在本节是 `type: 1`，在「获取消息」是 `localType: 3`。`localType` 是平台原生码、下游已按它分支，两者不可互换使用。
 
@@ -917,7 +964,9 @@ GET /api/v1/sessions/{id}/messages
 | `nextOffset` | 正常恒为 `0`，仅在时间戳无法推进的退化场景下才为累计偏移 |
 | `watermark`  | 本次拉取的时间上界（未传 `end` 时为当前时间） |
 
-`nextOffset` **有意不同于 WeFlow（安装版）文档里的 `5000`**：`nextSince` 是排他上界且分页永不切断同一秒，客户端把两个游标原样回传时，`nextSince` 已经过滤掉本页所有行、下一条未读行正好落在 offset 0。此时再叠加一个累计 offset 会二次跳过同样的行（double-skip）。两个游标照文档原样回传即可，不需要客户端做特殊处理。
+`nextOffset` **有意不同于 WeFlow（安装版）文档里的 `5000`**：`nextSince` 是排他上界且分页永不切断同一秒，客户端把两个游标原样回传时，`nextSince` 已经过滤掉本页所有行、下一条未读行正好落在 offset 0。
+
+此时再叠加一个累计 offset 会二次跳过同样的行（double-skip）。两个游标照文档原样回传即可，不需要客户端做特殊处理。
 
 #### 与标准 / 安装版的已知差异
 
@@ -928,18 +977,25 @@ GET /api/v1/sessions/{id}/messages
 - **`members[].aliases`** — 标准：可选，`string[]`；安装版：未列出；本项目：**不输出**；原因：多来源名字已收敛进 `accountName`（备注 > `uid_names` > 昵称 > UID）
 - **`members[].avatar`** — 标准：可选；**CN 的「头像格式说明」明确接受网络 URL**，EN 字段表只写 Data URL；安装版：真实 URL；本项目：**恒为空串**；原因：QQ 侧没有可用的头像来源；字段保留以满足形状。空串而非省略键，是为了让 `members[]` 的键集恒定
 - **`messages[].mediaPath`** — 标准：**规范里没有这个字段**（EN / CN 字段表都没有）；安装版：字段清单里有；本项目：**两个面都不输出**；原因：媒体字节请走「获取消息」 `/api/v1/messages` 的媒体导出
-- **`members[].roles`** — 标准：可选，`[{id}]`（CN 表列出，EN 表未列）；安装版：未列出；本项目：**不输出**；原因：**有意不做**，不是遗漏：它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出（源 `group_info.db::group_detail_info_ver1.[60002]`）；且两者受同一个限制——群主不在本页时都无从判断
+- **`members[].roles`** — 本项目**不输出**。
+  - 标准：可选，`[{id}]`（CN 表列出，EN 表未列）；安装版：未列出。
+  - 原因：**有意不做**，不是遗漏——它与 `members[].isOwner` 是同一件事的两种表达，而 `isOwner` 已经在输出（源 `group_info.db::group_detail_info_ver1.[60002]`）。
+  - 且两者受同一个限制：群主不在本页时都无从判断。
 - **`messages[].replyToMessageId`** — 标准：不在标准（WeFlow 私有扩展）；安装版：仅 ChatLab 面有；本项目：**目标唯一时输出；否则省略该键**（原生面、消息面、拉取面**同规**）；原因：键名与语义对齐 WeFlow；判据见下
 
 **`replyToMessageId` 的判据（为什么有时不给）**：它取自表列 `40850`（被回复消息的**会话内序号**），再在同一会话里找 `40003` 等于它的那一行，输出**那一行的 `40001`**（也就是 `platformMessageId`）。
 
-问题在于 `(会话, 40003)` **并不唯一**——实测某真实库 31,820 行群消息里重复了 **1371 组**，而文档只说了「可跨群复用」，漏了「**群内也复用**」。直接查会随机命中一行，于是客户端把引用挂到 **错的消息**上，而它无法分辨。因此实现只在**恰好一个候选**（同一 `40003` 且不晚于本条的时间）时输出，否则**省略该键**：实测覆盖 **1522/1616 = 94.2%** 的回复，其余 5.8% 的表现是「看不到引用」，而不是「看到错的引用」。
+问题在于 `(会话, 40003)` **并不唯一**——实测某真实库 31,820 行群消息里重复了 **1371 组**，而文档只说了「可跨群复用」，漏了「**群内也复用**」。直接查会随机命中一行，于是客户端把引用挂到 **错的消息**上，而它无法分辨。
+
+因此实现只在**恰好一个候选**（同一 `40003` 且不晚于本条的时间）时输出，否则**省略该键**：实测覆盖 **1522/1616 = 94.2%** 的回复，其余 5.8% 的表现是「看不到引用」，而不是「看到错的引用」。
 
 > 列 `40900`（引用场景的消息快照）经实测**不含**目标身份——四种编码 × 两列 × 发送者维度都试过，不能用来消歧。上游文档在这一点上与本库形态不同，**以本库实测为准**。
 
 #### 字段无值时怎么表示：省略键 / `null` / 空串
 
-同一个响应里会出现三种「没有值」，它们是**三种不同的契约**：**省略键**＝这个对象不存在或本次没请求；**`null`**＝有这个概念、此刻没有值；**空串**＝类型上恒为字符串的字段没有内容。本仓的可选字段 **一律省略键**，唯一的 `null` 是分页游标（那里「已排空」本身是有意义的状态）。
+同一个响应里会出现三种「没有值」，它们是**三种不同的契约**：**省略键**＝这个对象不存在或本次没请求；**`null`**＝有这个概念、此刻没有值；**空串**＝类型上恒为字符串的字段没有内容。
+
+本仓的可选字段 **一律省略键**，唯一的 `null` 是分页游标（那里「已排空」本身是有意义的状态）。
 
 - **`GET /api/v1/messages`** — 字段：`messages[].media`、`mediaId`、`mediaFileName`、`mediaUrl`、`mediaLocalPath`、`replyToMessageId`；表示：无值时**省略键**；说明：本仓消息面没有「键恒出现、值为 `null`」的字段
 - **`GET /api/v1/messages`** — 字段：`media.exportPath`；表示：**只在真正执行了导出时出现**；说明：未请求 `media=1` 时省略该键——「没导出」与「导出到空路径」是两件事（回归见 `messages_without_media_param_omits_export_path`）
@@ -953,12 +1009,19 @@ GET /api/v1/sessions/{id}/messages
 - **拉取面** — 字段：`page`；表示：**不出现在响应里**；说明：进度走 `sync` 块（`hasMore` / `nextSince` / `nextOffset` / `watermark`），四个键恒出现
 - **`GET /api/v1/group-members`** — 字段：`members[].messageCount`；表示：**只在 `includeMessageCounts=1` 时出现**；说明：未请求计数时省略，而不是给 `0`（见「获取群成员列表」）
 - **`GET /api/v1/group-members`** — 字段：`members[].isOwner`；表示：键**恒保留**（值为 `false` 时也出现）；说明：与 `messageCount` 相反：它表达的是「判定过，不是群主」
-- **SSE `message.new`** — 字段：`groupName`、`avatarUrl`、`sourceName`、`media`、`mediaId`；表示：都是**条件键**：没有就不出现；说明：不是给 `null`（回归见 `message_new_text_payload_keys_are_pinned`、`message_new_media_payload_carries_no_local_path`）。其中 `avatarUrl` 目前**恒不出现**：QQ 侧没有头像来源，构造点一律传 `None`；它留在类型里，是为了将来源可用时不必改形状
+- **SSE `message.new`** — 字段：`groupName`、`avatarUrl`、`sourceName`、`media`、`mediaId`。
+  - 表示：都是**条件键**，没有就不出现。
+  - 说明：不是给 `null`（回归见 `message_new_text_payload_keys_are_pinned`、`message_new_media_payload_carries_no_local_path`）。
+  - 其中 `avatarUrl` 目前**恒不出现**：QQ 侧没有头像来源，构造点一律传 `None`；它留在类型里，是为了将来源可用时不必改形状。
 - **SSE `message.revoke`** — 字段：`groupName`、`avatarUrl`、`sourceName`；表示：条件键（`avatarUrl` 同上，恒不出现）；说明：撤销事件**没有** `media`（回归见 `message_revoke_payload_has_no_media`）
 - **SSE `sync`** — 字段：`event`、`generation`、`watermarks`；表示：三个键恒出现；说明：某张表没有水位时，是**数组里少一项**，而不是给 `null` 或 `0`（回归见 `sync_omits_tables_without_a_watermark`）
-- **通知面 `/chatlab/push/messages`** — 字段：`eventId`、`sessionId`、`platformMessageId`、`generation`；表示：都是**条件键**；说明：基线事件（`sync`）带 `generation`、不带 `eventId` / `sessionId`；消息事件反之。`sessionId` 为空串时**显式映射成省略**——空串与「没有会话」在下游是两件事
+- **通知面 `/chatlab/push/messages`** — 字段：`eventId`、`sessionId`、`platformMessageId`、`generation`。
+  - 表示：都是**条件键**。
+  - 说明：基线事件（`sync`）带 `generation`、不带 `eventId` / `sessionId`；消息事件反之。`sessionId` 为空串时**显式映射成省略**——空串与「没有会话」在下游是两件事。
 
-**空串是另一套约定**：`group-members` 的 `alias` / `avatarUrl`（v1 恒为空串）、`remark`（未设置时为空串），以及 ChatLab `members[].avatar`（恒为空串），在没有该值时给空串而不是 `null`；名册-only 成员的 `displayName` 回落 UID 而不是空串。判据是这些字段在类型上恒为字符串。
+**空串是另一套约定**：`group-members` 的 `alias` / `avatarUrl`（v1 恒为空串）、`remark`（未设置时为空串），以及 ChatLab `members[].avatar`（恒为空串），在没有该值时给空串而不是 `null`。
+
+名册-only 成员的 `displayName` 回落 UID 而不是空串。判据是这些字段在类型上恒为字符串。
 
 **跨仓的允许差异**（两仓都成立，但取值不同，按一端写判空逻辑会出错）：
 
@@ -975,7 +1038,12 @@ GET /api/v1/sessions/{id}/messages
 
 > **只接受 GET**（POST 一律 405），参数走查询串。
 
-v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。昵称来自联系人档案（`profile_info.db` 的 `20002`，经 ground-truth 探针确认），QQ 号来自 `nt_msg.db` 的 `nt_uid_mapping_table` + 档案（版本相关，列结构按值探测，缺表/缺列时退化为消息昵称列表）。备注（remark）：来自 `profile_info.db` 的 `20009` 列（QQDecrypt 字段 id，真库 ground-truth 确认——本账号实测 17 个联系人设置备注）；分类按字段 id `20009` 直接识别（绕过 CJK 门槛，兼容拉丁备注），列名/字段 id 提示（`remark`/`20003`/`60026`）保留作兜底。
+v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。
+
+- **昵称**：来自联系人档案（`profile_info.db` 的 `20002`，经 ground-truth 探针确认）。
+- **QQ 号**：来自 `nt_msg.db` 的 `nt_uid_mapping_table` + 档案（版本相关，列结构按值探测，缺表/缺列时退化为消息昵称列表）。
+- **备注（remark）**：来自 `profile_info.db` 的 `20009` 列（QQDecrypt 字段 id，真库 ground-truth 确认——本账号实测 17 个联系人设置备注）。
+- **分类**：按字段 id `20009` 直接识别（绕过 CJK 门槛，兼容拉丁备注），列名/字段 id 提示（`remark`/`20003`/`60026`）保留作兜底。
 
 **请求**
 
@@ -1017,7 +1085,9 @@ GET /api/v1/contacts
 
 ### GET `/api/v1/group-members` — 群成员列表
 
-v1 成员来源：**名册 ∪ 发言人** —— `group_info.db::group_member3` 的群名册与索引里该群的发言者取并集。只列发言人会让「群里有谁」的答案取决于谁最近说过话，潜水成员永远不出现，而他们恰恰是「这个群还有谁」的主要部分。代价是出现 `messageCount` 为 0 的成员，这是接受的。
+v1 成员来源：**名册 ∪ 发言人** —— `group_info.db::group_member3` 的群名册与索引里该群的发言者取并集。
+
+只列发言人会让「群里有谁」的答案取决于谁最近说过话，潜水成员永远不出现，而他们恰恰是「这个群还有谁」的主要部分。代价是出现 `messageCount` 为 0 的成员，这是接受的。
 
 > 同「获取联系人列表」：只为显示发送者名字不必调用本接口，「获取消息」每条消息的 `senderName` 已是同一条解析链路（含本群群名片）。本接口留给需要成员名单本身的场景（发言数统计等）。
 
@@ -1036,7 +1106,9 @@ GET /api/v1/group-members
 
 > **迁移**：`talker` 与 `withCounts` 别名、`forceRefresh` 占位参数都已删除；它们被**静默忽略**（未知参数不报错）。同步统一走 `POST /api/v1/sync`。
 
-**群不存在时返回 404**；名册有而消息无时**返回成员**（不再 404 —— 那时名册恰好是唯一能回答「群里有谁」的来源）。成员按 `messageCount` 降序、`wxid` 升序**稳定排序**：只按计数排时，一大批计数为 0 的潜水成员顺序会随哈希遍历顺序抖动，下游按它做 diff 会看到满屏假变化。
+**群不存在时返回 404**；名册有而消息无时**返回成员**（不再 404 —— 那时名册恰好是唯一能回答「群里有谁」的来源）。
+
+成员按 `messageCount` 降序、`wxid` 升序**稳定排序**：只按计数排时，一大批计数为 0 的潜水成员顺序会随哈希遍历顺序抖动，下游按它做 diff 会看到满屏假变化。
 
 **响应**
 
@@ -1130,12 +1202,15 @@ POST /api/v1/sync
 
 ## 类型化客户端（SDK）
 
-本仓库提供两种语言的同构客户端：`clients/rust`（Rust）与 `clients/python`（Python，`qqflow-sdk`）。两者分层一致：生成类型 + 手写行为层，行为方法的语义（503 是等待、游标原样回传、`Last-Event-ID` 重连、404 后先导出再取）在两侧保持相同。
+本仓库提供两种语言的同构客户端：`clients/rust`（Rust）与 `clients/python`（Python，`qqflow-sdk`）。
+
+两者分层一致：生成类型 + 手写行为层，行为方法的语义（503 是等待、游标原样回传、`Last-Event-ID` 重连、404 后先导出再取）在两侧保持相同。
 
 本仓库自带类型化 Rust 客户端：`clients/rust`（crate 名 `qqflow-client`，workspace 成员）。
 
 - **类型与操作客户端是生成的**：出处是 `/openapi.json` 的描述（生成工具 `clients/regen`，`cargo run -p qqflow-regen` 重新生成；生成物入库，CI 断言「重生成无 diff」）。**不要手改** `clients/rust/src/generated/` 下的任何文件。
-- **行为层是手写的**（`clients/rust/src/client.rs`）：下面这张表就是**公共面**——每个方法都有具名测试（Rust 在 `clients/rust/tests/behavior.rs`，Python 在 `clients/python/tests/test_behavior.py`），没有测试的能力不进这张表。注册载荷是 `qq`/`key`/`db_path`。
+- **行为层是手写的**（`clients/rust/src/client.rs`）：下面这张表就是**公共面**——每个方法都有具名测试（Rust 在 `clients/rust/tests/behavior.rs`，Python 在 `clients/python/tests/test_behavior.py`），没有测试的能力不进这张表。
+  - 注册载荷是 `qq`/`key`/`db_path`。
 
 - **`health()`** — 打哪个面：`GET /health`；语义要点：**免鉴权**，只给标量阶段与版本；客户端不带凭据（有测试钉住）
 - **`accounts()`** — 打哪个面：`GET /api/v1/accounts`；语义要点：账号明细；`error` 与 `messageCount` 只在这里
@@ -1152,14 +1227,44 @@ POST /api/v1/sync
 - **`media_bytes_by_id(id)`** — 打哪个面：`GET /api/v1/media/{id}`；语义要点：按**单段句柄**取（原生面的 `mediaId`，或 `mediaUrl` 末段）；不触发导出
 - **`group_members(chatroom, include_message_counts)`** — 打哪个面：`GET /api/v1/group-members`；语义要点：成员集合＝**名册 ∪ 发言人**；`messageCount` 是**条件键**（只在要求计数时出现，不是占位 0）；计数开关关闭时不发参数；**空群号本地拒绝**（空名册会被读成「这个群没有成员」）
 - **`sync_now()`** — 打哪个面：`POST /api/v1/sync`；语义要点：**写动作**（推进水位、可能导出媒体）：刻意不进入任何轮询路径，只有显式调用才触发（有测试钉住读路径零命中）
-- **`watch()`** — 打哪个面：SSE `/api/v1/push/messages`；语义要点：`Last-Event-ID` 重连（游标**只在帧被消费时推进**：只有 `id:` 没有 `data:` 的悬空帧不推进，否则那条事件会从重放窗口消失）、心跳注释帧过滤、`generation` 变化上报；老面 `message.new`/`message.revoke` 载荷由客户端自有类型解码——它们不在描述 schema 里
+- **`watch()`** — 打哪个面：SSE `/api/v1/push/messages`。
+  - 语义要点：`Last-Event-ID` 重连（游标**只在帧被消费时推进**：只有 `id:` 没有 `data:` 的悬空帧不推进，否则那条事件会从重放窗口消失）、心跳注释帧过滤、`generation` 变化上报。
+  - 老面 `message.new`/`message.revoke` 载荷由客户端自有类型解码——它们不在描述 schema 里。
 
-  **Python 同步门面 `SyncClient`**：方法面与 `Client` 一一对应，导出自 `qqflow_sdk`；内部跑一条专属事件循环线程（不占用调用方的 loop，也不要求调用方在协程里），`with SyncClient(...) as c:` 即用即关。`watch()` 返回普通迭代器，断连/`Last-Event-ID` 重放语义与 async 版相同；`drain_session` 的 `on_page` 在调用方线程执行。回归位置：`test_sync_client_health_and_accounts`、`test_sync_client_drain_session_runs_callbacks_on_the_caller_thread`、`test_sync_client_wait_ready_timeout_names_the_last_state`、`test_sync_client_watch_yields_events_without_an_async_loop`（Python 两侧同名）。
+  **Python 同步门面 `SyncClient`**：方法面与 `Client` 一一对应，导出自 `qqflow_sdk`；内部跑一条专属事件循环线程（不占用调用方的 loop，也不要求调用方在协程里），`with SyncClient(...) as c:` 即用即关。
 
-  **两个容易读错的地方**：① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/`list_messages`/`contacts` 只取一页（后两者那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；② 时间界收 `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
-- **错误按性质分派变体**：HTTP 非 2xx → `Status`；连接/超时/重置/**URL 解析不出来** → `Transport`；响应是合法 JSON 但不合承诺形状 → `Shape`。解码是**先取字节再单独解析**的：`resp.json::<T>()` 会把解码失败也包成传输错误，于是「服务端答错了」与「网络断了」混成一类 —— 而调用方正是按变体分流的（重试传输故障合理，重试形状错误不合理）。`Status.url` **恒等于请求 URL**，不掺描述文字（按 url 归因的调用方会静默错分类），拒绝态的 `state` 另走 `detail` 字段。
-- **超时默认（Rust 与 Python 一致；TS 仅示例，不在承诺面内）**：三个公开常量，且**每一个都按单次操作计时、有进展即复位——没有一个是总时限**（reqwest 的 `timeout()` 是总时限，所以这里刻意用 `read_timeout`，与 httpx 同语义）：连接 `CONNECT_TIMEOUT` **5s**（服务端不在时要立刻失败）；普通 JSON 请求 `READ_TIMEOUT` **30s**；成本由数据量或后台工作决定的一族——`group_members(..., include_message_counts=True)`（整名册计数＝全会话扫描）、`media_bytes`／`media_bytes_by_id`（体积由发送方决定）、`sync_now()`（索引＋可能导出媒体）、`watch()`（长连接）——用 `STALL_TIMEOUT` **90s**。判据两面：把 30s 套到这些面上会把「这个群很大」变成客户端错误（慢不等于坏）；而**完全不设上界**又会让黑洞连接（对端被 kill 且没有 FIN、NAT 映射过期、笔记本唤醒后）永不被发现——对 SSE 尤其致命：重连分支根本不可达，表现为一条既不产出也不报错的流。90s ≈ 服务端 25s keep-alive 间隔的四倍，丢一次心跳加一次调度抖动仍算健康，黑洞则会被抓到。自定义走 Python 的 `timeout=`／`stall_timeout=`，或 Rust 的 `Client::with_timeouts(base_url, token, connect, read, stall)`。回归位置：`each_request_family_uses_its_own_time_budget`（Rust：驱动一个 600ms 才回响应头的真实服务端，两个上界各自生效，退回任一路由即变红）、`test_published_timeout_budgets_travel_per_request` 与 `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，不是只读常量）、`published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
+  `watch()` 返回普通迭代器，断连/`Last-Event-ID` 重放语义与 async 版相同；`drain_session` 的 `on_page` 在调用方线程执行。
+
+  回归位置（Python 两侧同名）：
+  - `test_sync_client_health_and_accounts`
+  - `test_sync_client_drain_session_runs_callbacks_on_the_caller_thread`
+  - `test_sync_client_wait_ready_timeout_names_the_last_state`
+  - `test_sync_client_watch_yields_events_without_an_async_loop`
+
+  **两个容易读错的地方**：
+  - ① `list_all_sessions` 与 `drain_session` 是取尽，而 `pull_page`/`list_messages`/`contacts` 只取一页（后两者那个面没有 `hasMore`，翻页由调用方按 `offset` 推进）；
+  - ② 时间界收 `YYYYMMDD` **或** unix 秒，`end` 作为上界时裸日期覆盖**整天**。
+- **错误按性质分派变体**：HTTP 非 2xx → `Status`；连接/超时/重置/**URL 解析不出来** → `Transport`；响应是合法 JSON 但不合承诺形状 → `Shape`。
+  - 解码是**先取字节再单独解析**的：`resp.json::<T>()` 会把解码失败也包成传输错误，于是「服务端答错了」与「网络断了」混成一类 —— 而调用方正是按变体分流的（重试传输故障合理，重试形状错误不合理）。
+  - `Status.url` **恒等于请求 URL**，不掺描述文字（按 url 归因的调用方会静默错分类），拒绝态的 `state` 另走 `detail` 字段。
+- **超时默认（Rust 与 Python 一致；TS 仅示例，不在承诺面内）**：三个公开常量，且**每一个都按单次操作计时、有进展即复位——没有一个是总时限**（reqwest 的 `timeout()` 是总时限，所以这里刻意用 `read_timeout`，与 httpx 同语义）。
+  - 连接 `CONNECT_TIMEOUT` **5s**（服务端不在时要立刻失败）；普通 JSON 请求 `READ_TIMEOUT` **30s**。
+  - 成本由数据量或后台工作决定的一族，用 `STALL_TIMEOUT` **90s**：
+    - `group_members(..., include_message_counts=True)`（整名册计数＝全会话扫描）
+    - `media_bytes`／`media_bytes_by_id`（体积由发送方决定）
+    - `sync_now()`（索引＋可能导出媒体）
+    - `watch()`（长连接）
+  - 判据两面：把 30s 套到这些面上会把「这个群很大」变成客户端错误（慢不等于坏）；而**完全不设上界**又会让黑洞连接（对端被 kill 且没有 FIN、NAT 映射过期、笔记本唤醒后）永不被发现——对 SSE 尤其致命：重连分支根本不可达，表现为一条既不产出也不报错的流。
+  - 90s ≈ 服务端 25s keep-alive 间隔的四倍，丢一次心跳加一次调度抖动仍算健康，黑洞则会被抓到。
+  - 自定义走 Python 的 `timeout=`／`stall_timeout=`，或 Rust 的 `Client::with_timeouts(base_url, token, connect, read, stall)`。
+  - 回归位置：`each_request_family_uses_its_own_time_budget`（Rust：驱动一个 600ms 才回响应头的真实服务端，两个上界各自生效，退回任一路由即变红）。
+  - `test_published_timeout_budgets_travel_per_request` 与 `test_watch_stream_is_not_bounded_by_the_json_read_timeout`（Python：断言 transport 实际收到的 per-request 值，不是只读常量）。
+  - `published_timeouts_match_the_documented_budgets`（三个常量的数值与大小关系）。
 - 鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL（免鉴权的只有 `/health`、`/api/v1/health` 与描述面 `/openapi.json`）。
 - 自 0.9.0 起发布到 crates.io（crate `qqflow-client`）；本地开发仍可直接 `cargo build -p qqflow-client`。
 
-- **Python 侧**：`clients/python`（包 `qqflow-sdk`）。模型生成走 `scripts/regen.py`（spec 经 Rust 生成工具的 `--dump-spec` 取得，绕开 golden 的占位掩码）；行为层是 `httpx.AsyncClient` 异步实现，`from qqflow_sdk import Client` 即用；老面 SSE 事件由客户端自有 `MessageEvent` 模型解码（camelCase 载荷），`sync` 帧用生成的 `SyncFrame`。测试对进程内 ASGI mock 跑：`clients/python/.venv/Scripts/python -m pytest tests/`。自 0.9.0 起发布到 PyPI（包 `qqflow-sdk`）；本地开发仍可用 `pip install -e clients/python`。
+- **Python 侧**：`clients/python`（包 `qqflow-sdk`）。
+  - 模型生成走 `scripts/regen.py`（spec 经 Rust 生成工具的 `--dump-spec` 取得，绕开 golden 的占位掩码）。
+  - 行为层是 `httpx.AsyncClient` 异步实现，`from qqflow_sdk import Client` 即用；老面 SSE 事件由客户端自有 `MessageEvent` 模型解码（camelCase 载荷），`sync` 帧用生成的 `SyncFrame`。
+  - 测试对进程内 ASGI mock 跑：`clients/python/.venv/Scripts/python -m pytest tests/`。
+  - 自 0.9.0 起发布到 PyPI（包 `qqflow-sdk`）；本地开发仍可用 `pip install -e clients/python`。
