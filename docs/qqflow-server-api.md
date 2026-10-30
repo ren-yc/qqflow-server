@@ -41,7 +41,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 1. **HTTP Header (推荐)**: `Authorization: Bearer <您的Token>`
 2. **Query 参数**: `?access_token=<您的Token>`（SSE 长连接推荐此方式）
 
-> **迁移**：`X-Api-Key`、`?token=` 与 POST body 里的凭据键**已删除**。每多一条通道就多一处凭据会被复制到的地方（请求体、代理日志、客户端抓包），而它们鉴权的是同一个东西。body 里的 `access_token`/`token` 现在会被**跳过**（既不鉴权、也不覆盖查询串里的值）。
+> [!NOTE] **迁移**：`X-Api-Key`、`?token=` 与 POST body 里的凭据键**已删除**。每多一条通道就多一处凭据会被复制到的地方（请求体、代理日志、客户端抓包），而它们鉴权的是同一个东西。body 里的 `access_token`/`token` 现在会被**跳过**（既不鉴权、也不覆盖查询串里的值）。
 
 ## 接口列表
 
@@ -63,12 +63,12 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 - `GET /chatlab/sessions/{id}/messages`（ChatLab Pull）
 - `GET /chatlab/push/messages`（SSE 通知面，只发元信息）
 
-> **拉取面的 `messages[].mediaId`**：出现时**按它取字节必须成功**（承诺，不是尽力而为）。它在**消息这一层**而不是 `media` 对象里 —— `media` 的键集由一致性套件钉成 `{type, fileName, md5}` 并拒绝多余键（`media_shape_in_pull`），而含义本就不同：`fileName` 说「这条媒体叫什么」，`mediaId` 说「这份字节现在取得到」。不可取时**整个键省略**（不是 `null`）：给一个必 404 的句柄比不给更坏 —— 调用方拿到 404 只会以为服务坏了，而它无从区分这两种情况。契约侧的钉子是 `media_id_shape_in_pull`（句柄必须是非空字符串，且 `media` 键必须同时存在）。**与 weflow 的关键差别**：本仓的句柄来自**QQ 本地缓存的登记路径**，不需要先执行导出；所以 `--with-media` 在拉取面已经给得出句柄的那些行上**一发导出请求都不发**（快路径）。
+> [!WARNING] **拉取面的 `messages[].mediaId`**：出现时**按它取字节必须成功**（承诺，不是尽力而为）。它在**消息这一层**而不是 `media` 对象里 —— `media` 的键集由一致性套件钉成 `{type, fileName, md5}` 并拒绝多余键（`media_shape_in_pull`），而含义本就不同：`fileName` 说「这条媒体叫什么」，`mediaId` 说「这份字节现在取得到」。不可取时**整个键省略**（不是 `null`）：给一个必 404 的句柄比不给更坏 —— 调用方拿到 404 只会以为服务坏了，而它无从区分这两种情况。契约侧的钉子是 `media_id_shape_in_pull`（句柄必须是非空字符串，且 `media` 键必须同时存在）。**与 weflow 的关键差别**：本仓的句柄来自**QQ 本地缓存的登记路径**，不需要先执行导出；所以 `--with-media` 在拉取面已经给得出句柄的那些行上**一发导出请求都不发**（快路径）。
 - `GET /openapi.json`（接口描述，**免鉴权**，见「接口描述」）
 
-> **读端点只有 GET**：`/api/v1/` 下的 `messages`、`sessions`、`sessions/{id}/messages`、`contacts`、`group-members`、`media/{id}`、`push/messages`，以及 `/chatlab/` 下的 `sessions`、`messages`、`sessions/{id}/messages`、`push/messages`，以及描述面 `/openapi.json`——这些的 POST 一律 **405**（逐条见 `routes.rs` 的 `GET_ONLY`）。例外是**动作端点**（`POST /api/v1/accounts` 注册、`/api/v1/sync`）与免鉴权的 `/health`、`/api/v1/health`：它们保留两个方法。
+> [!NOTE] **读端点只有 GET**：`/api/v1/` 下的 `messages`、`sessions`、`sessions/{id}/messages`、`contacts`、`group-members`、`media/{id}`、`push/messages`，以及 `/chatlab/` 下的 `sessions`、`messages`、`sessions/{id}/messages`、`push/messages`，以及描述面 `/openapi.json`——这些的 POST 一律 **405**（逐条见 `routes.rs` 的 `GET_ONLY`）。例外是**动作端点**（`POST /api/v1/accounts` 注册、`/api/v1/sync`）与免鉴权的 `/health`、`/api/v1/health`：它们保留两个方法。
 
-> **「上限」分属四个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下方列表按源码实测逐端点列出）：
+> [!NOTE] **「上限」分属四个不同的面，别互相换算**（文档里 200／500／5000／10000 都出现过，混读会得出「两仓口径不一致」的错误结论；下方列表按源码实测逐端点列出）：
 >
 > - **10000** — 属于哪个面：`GET /api/v1/sessions`、`/api/v1/contacts`、`/api/v1/messages`、`/chatlab/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：**单个请求返回条数**的硬上限（`limit` 默认 100）
 > - **5000** — 属于哪个面：Pull 面 `GET /api/v1/sessions/{id}/messages` 与 `/chatlab/sessions/{id}/messages`；含义（源码位置：各 handler 的 `parse_limit`／`clamp`）：单页上限 5000，且**默认也是 5000**（与上面那几个面的默认 100 不同）
@@ -77,7 +77,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 >
 > 两点容易踩的坑：① `GET /api/v1/group-members` **没有 `limit`**（整名册一次给全，不参与上面的换算）；② SDK 形参 `page_size`（`list_all_sessions`）**不是 HTTP 参数名**——它内部发的就是 `limit`，拿它当「另一个上限」会算错。所以「联系人一次最多能拿多少」＝10000，走 MCP 则被压到 200。另注：**本仓的 `media=1` 没有导出条数闸门**（weflow 才有），别把那边的那个 200 当跨仓常量。本仓没有朋友圈面（`/api/v1/sns/*` 是 weflow-only：QQ NT 本地库不含朋友圈数据），因此 weflow 侧那条 500 上限不适用本列表。
 
-> v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（「媒体导出」，WeFlow 形状）。
+> [!NOTE] v1 未实现：`/api/v1/sns/*`（朋友圈）——QQ NT 本地库不含朋友圈数据。媒体双通道：`/api/v1/media/{id}` 直接服务 QQ 本地缓存里的媒体文件（常开）；`media=1` 按需导出到 `exportPath`（「媒体导出」，WeFlow 形状）。
 
 ---
 
@@ -158,7 +158,7 @@ GET /api/v1/health
 
 同理，`awaiting_key` 不会出现在这里：账号进入该状态的唯一途径就是启动扫描发现了它，所以对外一律折叠为 `unregistered`。
 
-> 说明：`error` 表示初始化失败（如密钥错误），客户端重新调用 `POST /api/v1/accounts` 传入正确参数即可恢复，进程不会退出。
+> [!NOTE] 说明：`error` 表示初始化失败（如密钥错误），客户端重新调用 `POST /api/v1/accounts` 传入正确参数即可恢复，进程不会退出。
 
 ---
 
@@ -318,7 +318,7 @@ DELETE /api/v1/accounts/1234567890?purge_media=1
 Authorization: Bearer YOUR_TOKEN
 ```
 
-> **迁移**：`POST /api/v1/accounts/{qq}/deregister` 别名**已删除**（现在返回 404）。注销只有 `DELETE` 一条路 —— 两条路做同一件事时，其中一条迟早漏掉一次改动。
+> [!NOTE] **迁移**：`POST /api/v1/accounts/{qq}/deregister` 别名**已删除**（现在返回 404）。注销只有 `DELETE` 一条路 —— 两条路做同一件事时，其中一条迟早漏掉一次改动。
 
 **参数**
 
@@ -544,7 +544,7 @@ GET /chatlab/push/messages
 
 ### GET `/api/v1/messages` — 消息查询（原生/富数据形状）
 
-> **只接受 GET**（POST 一律 405）。参数走查询串，鉴权走 Header 或 `?access_token=`。
+> [!NOTE] **只接受 GET**（POST 一律 405）。参数走查询串，鉴权走 Header 或 `?access_token=`。
 
 读取指定会话的消息，支持原始 JSON 和 ChatLab 格式。
 
@@ -567,7 +567,7 @@ GET /api/v1/messages
 | `media` | string | 否 | `1`/`true` 触发该页媒体导出，填充 `mediaFileName`/`mediaUrl`/`mediaLocalPath`，并让 `media.exportPath` **出现**；不带它时 `exportPath` **省略**（不是空串），媒体元数据仍随消息返回 |
 | `image / voice / video / emoji` | string | 否 | 媒体导出子开关，默认开启，`0`/`false` 关闭 |
 
-> **迁移**（三个旧参数行为已删除）：
+> [!NOTE] **迁移**（三个旧参数行为已删除）：
 > - `chatlab=1` 与 `format=chatlab`：老面**不再输出** ChatLab 形状，改用 `GET /chatlab/messages`；
 > - 拼音别名 `meiti` / `tupian` / `vioce`：**静默忽略**（未知参数不报错，所以它们不再有任何作用）；
 > - POST：读端点只留 GET，POST 一律 **405**（body 既不是参数通道，也不是鉴权通道）。
@@ -582,7 +582,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 
 **响应**
 
-> v1 说明：`talker` 对应的会话不存在时不报错，返回 `success=true`、`messages=[]`、`count=0`（与「拉取会话消息」的 404 行为不同）。
+> [!NOTE] v1 说明：`talker` 对应的会话不存在时不报错，返回 `success=true`、`messages=[]`、`count=0`（与「拉取会话消息」的 404 行为不同）。
 
 顶层字段：`success`、`talker`、`count`、`hasMore`、`media.enabled`、`media.count`、`messages`，以及**仅在 `media=1` 时出现**的 `media.exportPath`。
 
@@ -616,7 +616,7 @@ curl "http://127.0.0.1:5032/api/v1/messages?talker=u_abc123&start=20260101&end=2
 | 撤回 | 6 |
 | 系统 | 7 |
 
-> v1 差异：有 `replyToMessageId`（**仅在目标唯一时输出**，见「拉取会话消息」末的判据），无 `quote` 字段；媒体通过 `media` 对象 + `mediaId` 提供，字节经 `GET /api/v1/media/{id}` 获取。
+> [!NOTE] v1 差异：有 `replyToMessageId`（**仅在目标唯一时输出**，见「拉取会话消息」末的判据），无 `quote` 字段；媒体通过 `media` 对象 + `mediaId` 提供，字节经 `GET /api/v1/media/{id}` 获取。
 
 **示例响应**
 
@@ -758,7 +758,7 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 
 **未命中的措辞统一为「媒体不存在」**（含缓存被清理的情形）——「文件被清理」与「没这个名字」对调用方是同一种失败，两种措辞只会让它多写一条分支。
 
-> **迁移**：三段式 `/api/v1/media/{talker}/{mediaType}/{file}` 已删除，改用本路由。
+> [!NOTE] **迁移**：三段式 `/api/v1/media/{talker}/{mediaType}/{file}` 已删除，改用本路由。
 
 #### 媒体导出（WeFlow 形状，`media=1`）
 
@@ -776,7 +776,7 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 
 注意：链接仅在 `media=1` 导出过对应消息后可访问（WeFlow 同语义）。
 
-> **句柄只对「内容摘要派生」的名字给出**：导出名是 `<内容键>.<扩展名>`（md5 hex / uuid）时它同时是 ChatLab 面 `media.fileName` 的可用句柄；平台给的原文件名回落**只作元数据**，因为按名解析是跨会话的、同名可能是别的文件。
+> [!NOTE] **句柄只对「内容摘要派生」的名字给出**：导出名是 `<内容键>.<扩展名>`（md5 hex / uuid）时它同时是 ChatLab 面 `media.fileName` 的可用句柄；平台给的原文件名回落**只作元数据**，因为按名解析是跨会话的、同名可能是别的文件。
 
 **与 WeFlow 的已知差异**（不可避免，文档化）：
 
@@ -797,7 +797,7 @@ GET /api/v1/media/{id}?access_token=YOUR_TOKEN
 GET /api/v1/sessions
 ```
 
-> 读端点只留 GET（POST 返回 405）；`/api/v1/sync` 与 `/health` 仍接受 POST。
+> [!NOTE] 读端点只留 GET（POST 返回 405）；`/api/v1/sync` 与 `/health` 仍接受 POST。
 
 **参数**
 
@@ -989,7 +989,7 @@ GET /api/v1/sessions/{id}/messages
 
 因此实现只在**恰好一个候选**（同一 `40003` 且不晚于本条的时间）时输出，否则**省略该键**：实测覆盖 **1522/1616 = 94.2%** 的回复，其余 5.8% 的表现是「看不到引用」，而不是「看到错的引用」。
 
-> 列 `40900`（引用场景的消息快照）经实测**不含**目标身份——四种编码 × 两列 × 发送者维度都试过，不能用来消歧。上游文档在这一点上与本库形态不同，**以本库实测为准**。
+> [!NOTE] 列 `40900`（引用场景的消息快照）经实测**不含**目标身份——四种编码 × 两列 × 发送者维度都试过，不能用来消歧。上游文档在这一点上与本库形态不同，**以本库实测为准**。
 
 #### 字段无值时怎么表示：省略键 / `null` / 空串
 
@@ -1036,7 +1036,7 @@ GET /api/v1/sessions/{id}/messages
 
 ### GET `/api/v1/contacts` — 联系人列表
 
-> **只接受 GET**（POST 一律 405），参数走查询串。
+> [!NOTE] **只接受 GET**（POST 一律 405），参数走查询串。
 
 v1 联系人来源：消息中出现过的 UID ∪ 档案/映射表中出现的 UID（无聊天记录的 UID 也会出现）。
 
@@ -1061,7 +1061,7 @@ GET /api/v1/contacts
 
 **响应**
 
-> 仅为「显示消息发送者名字」而调用本接口已无必要：「获取消息」的每条消息自带 `senderName`，且它按会话解析、含本群群名片，比本接口的 `displayName`（全局，无群名片）更准。本接口留给需要**完整通讯录**的场景（例如列出无聊天记录的联系人、读取 `alias`/QQ 号）。
+> [!TIP] 仅为「显示消息发送者名字」而调用本接口已无必要：「获取消息」的每条消息自带 `senderName`，且它按会话解析、含本群群名片，比本接口的 `displayName`（全局，无群名片）更准。本接口留给需要**完整通讯录**的场景（例如列出无聊天记录的联系人、读取 `alias`/QQ 号）。
 
 **必须翻页**：`limit` 默认 100，不传就只拿到前 100 条，静默丢掉其余联系人。按 `offset` 递增直到 `hasMore=false`：
 
@@ -1089,7 +1089,7 @@ v1 成员来源：**名册 ∪ 发言人** —— `group_info.db::group_member3`
 
 只列发言人会让「群里有谁」的答案取决于谁最近说过话，潜水成员永远不出现，而他们恰恰是「这个群还有谁」的主要部分。代价是出现 `messageCount` 为 0 的成员，这是接受的。
 
-> 同「获取联系人列表」：只为显示发送者名字不必调用本接口，「获取消息」每条消息的 `senderName` 已是同一条解析链路（含本群群名片）。本接口留给需要成员名单本身的场景（发言数统计等）。
+> [!TIP] 同「获取联系人列表」：只为显示发送者名字不必调用本接口，「获取消息」每条消息的 `senderName` 已是同一条解析链路（含本群群名片）。本接口留给需要成员名单本身的场景（发言数统计等）。
 
 **请求**
 
@@ -1104,7 +1104,7 @@ GET /api/v1/group-members
 | `chatroomId`           | string | 是   | 群 ID（`talker` 别名已删除） |
 | `includeMessageCounts` | string | 否   | `1/true` 时附带成员发言数（`withCounts` 别名已删除） |
 
-> **迁移**：`talker` 与 `withCounts` 别名、`forceRefresh` 占位参数都已删除；它们被**静默忽略**（未知参数不报错）。同步统一走 `POST /api/v1/sync`。
+> [!NOTE] **迁移**：`talker` 与 `withCounts` 别名、`forceRefresh` 占位参数都已删除；它们被**静默忽略**（未知参数不报错）。同步统一走 `POST /api/v1/sync`。
 
 **群不存在时返回 404**；名册有而消息无时**返回成员**（不再 404 —— 那时名册恰好是唯一能回答「群里有谁」的来源）。
 
@@ -1129,7 +1129,7 @@ GET /api/v1/group-members
 
 ### POST `/api/v1/sync` — 手动同步（动作端点）
 
-> GET/POST 均可。**除鉴权外没有任何参数**（`Params` 只有 `access_token` 一个字段）——body 里放什么都会被忽略，它只是「立刻跑一轮增量」的触发器。
+> [!TIP] GET/POST 均可。**除鉴权外没有任何参数**（`Params` 只有 `access_token` 一个字段）——body 里放什么都会被忽略，它只是「立刻跑一轮增量」的触发器。
 
 立即对所有账号执行一次完整同步（直连活库的增量读取，**绕过后台变化检测循环**），返回本次新增的**条数**。客户端初始化或手动刷新时调用；新增消息同时广播给 SSE 订阅端，也可随后用「获取消息」 `/api/v1/messages` 读回。
 
@@ -1161,7 +1161,7 @@ POST /api/v1/sync
 }
 ```
 
-> 说明：账号注册后索引已全量构建，之后无新消息时两个计数均为 `0`；QQ 运行中产生新消息后调用可立即同步。WeFlow（安装版）没有这个接口，因此本接口没有可对齐的上游契约，形状与 weflow-server 对齐。
+> [!NOTE] 说明：账号注册后索引已全量构建，之后无新消息时两个计数均为 `0`；QQ 运行中产生新消息后调用可立即同步。WeFlow（安装版）没有这个接口，因此本接口没有可对齐的上游契约，形状与 weflow-server 对齐。
 
 ---
 
@@ -1180,7 +1180,7 @@ POST /api/v1/sync
 - **`503`**：索引构建中（"服务正在建立索引，请稍后重试"）
 - **`500`**：内部错误
 
-> 说明：非 JSON 的 POST Body 会被忽略（仅记录日志），请求沿用 Query 参数，不会报 400；`start`/`end` 无法解析时该过滤条件被忽略。
+> [!NOTE] 说明：非 JSON 的 POST Body 会被忽略（仅记录日志），请求沿用 Query 参数，不会报 400；`start`/`end` 无法解析时该过滤条件被忽略。
 >
 > 上文列出的 `405` 与未知路径 `404` 的实际文案是中文「方法不允许」与「未知路径」，随统一信封返回——按语言匹配提示的脚本不要假设 `message` 恒为中文业务描述。回归位置：快照 `error-method-not-allowed`／`error-unknown-path`。
 >
