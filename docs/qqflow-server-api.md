@@ -582,6 +582,8 @@ GET /chatlab/push/messages
 
 规范把 ChatLab 的 `baseUrl` 定义为 `/chatlab`，这条是其中的**通知通道**。与 `/api/v1/push/messages` 是**同一条总线、同一套连接机制**（鉴权、`Last-Event-ID` 重放、保活、滞后重基线、关机自收），差别只有**帧的形状**：
 
+**响应**（SSE 事件流，`content-type: text/event-stream`）
+
 | | `/api/v1/push/messages` | `/chatlab/push/messages` |
 |---|---|---|
 | 载荷 | 整个事件（含 `content` 与媒体元数据）| **只带标识与时间** |
