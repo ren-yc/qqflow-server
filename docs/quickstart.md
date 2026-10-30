@@ -6,7 +6,8 @@
 
 - **Release 二进制** — 入口：GitHub Releases 的最新 tag，下载对应平台归档＋`SHA256SUMS`；说明：免工具链；校验 `sha256sum -c SHA256SUMS` 后再运行
 - **`cargo install`** — 入口：`cargo install --locked qqflow-server`；说明：从 crates.io 编译；仍需 C 工具链（SQLCipher/OpenSSL 源码编译）
-- **源码构建** — 入口：Windows `powershell -File scripts\build.ps1 build --release`；Linux/macOS `bash scripts/build.sh build --release`；说明：前置（MSVC/Perl/nasm、gcc/make）与命令见 [AGENTS.md](../AGENTS.md)，产物在 `target/release/`
+- **源码构建** — 入口：Windows `powershell -File scripts\build.ps1 build --release`；Linux/macOS `bash scripts/build.sh build --release`。
+  - 说明：前置（MSVC/Perl/nasm、gcc/make）与命令见 [AGENTS.md](../AGENTS.md)，产物在 `target/release/`
 
 ## 起服务与停服务
 
@@ -15,7 +16,12 @@ qqflow-server            # 等价于 serve，默认 127.0.0.1:5032
 qqflow-server --port 5032 --host 127.0.0.1 --log info
 ```
 
-**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--log-format`（text）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
+**无配置文件**；运行参数全部由命令行指定（均有默认值）：
+
+- `--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--log-format`（text）
+- `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000）
+
+`qqflow-server.exe` 直接启动即为默认状态。
 
 - 默认监听地址：`127.0.0.1`
 - 默认端口：`5032`
@@ -26,7 +32,8 @@ qqflow-server --port 5032 --host 127.0.0.1 --log info
 - token：首次启动生成并存入系统凭据库；`qqflow-server token` 打印。CLI 的 token 来源链是 `QQFLOW_TOKEN` → 本机凭据库。
 - 索引就绪前（账号处于 `indexing` / `error` 时），业务接口返回 `503`（见「错误响应」）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts`（含明细、注销）不检查就绪状态，可随时调用
 - 与 weflow-server 的**有意差异**（SNS 仅 weflow、`messageCount` 群成员面条件键、`meta.type` 推导面、默认端口、SDK/ts 状态）见 [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
-- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
+- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失）。
+  - 源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步。
 - **日志走 stderr**（0.10.0 起）：收日志用 `qqflow-server 2> 服务.log`——此前 `>` 收 stdout 日志的部署会拿到空文件，需改用 `2>`（`[init]`/`[fatal]` 与服务日志从此一处收齐）。
 - 数据目录：Windows `%LOCALAPPDATA%\qqflow-server`。
 - 停服务：前台 `Ctrl-C`；收到信号会停止 watcher 与 SSE 并退出。
@@ -95,11 +102,15 @@ qqflow-server mcp
 
 ## 配方五：重启后恢复账号
 
-密钥只存进程内存（见 [架构文档](architecture.md) 的「密钥不落盘」），所以**服务重启后账号回到未注册**：`/health` 的 `account` 是 `unregistered`，业务端点返回 503。恢复动作只有一步——用**与重启前相同的密钥与 `db_path`** 重新调 `POST /api/v1/accounts`。
+密钥只存进程内存（见 [架构文档](architecture.md) 的「密钥不落盘」），所以**服务重启后账号回到未注册**：`/health` 的 `account` 是 `unregistered`，业务端点返回 503。
+
+恢复动作只有一步——用**与重启前相同的密钥与 `db_path`** 重新调 `POST /api/v1/accounts`。
 
 ### 1. 准备 token
 
-token 的来源链是 `QQFLOW_TOKEN`（非空）→ 本机凭据库（与 `qqflow-server token` 同一份）。同机可以直接从凭据库取；跨机把 `QQFLOW_TOKEN` 设成服务端实际使用的那个值。一个会踩的坑：本机凭据库不可用时，服务端生成的是**会话级 token**（不落库、随每次启动而变，只在启动日志打印一次）——此时凭据库里没有值可回落，`token` 子命令与 `--show-token` 都会落空，必须从启动日志取当前值并设进 `QQFLOW_TOKEN`。
+token 的来源链是 `QQFLOW_TOKEN`（非空）→ 本机凭据库（与 `qqflow-server token` 同一份）。同机可以直接从凭据库取；跨机把 `QQFLOW_TOKEN` 设成服务端实际使用的那个值。
+
+一个会踩的坑：本机凭据库不可用时，服务端生成的是**会话级 token**（不落库、随每次启动而变，只在启动日志打印一次）——此时凭据库里没有值可回落，`token` 子命令与 `--show-token` 都会落空，必须从启动日志取当前值并设进 `QQFLOW_TOKEN`。
 
 ### 2. 准备恢复配置
 

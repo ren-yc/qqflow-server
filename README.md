@@ -28,7 +28,9 @@ qqflow-server --port 5032 --host 127.0.0.1 --log info
 
 ## 注册账号（第一次查询之前）
 
-服务是**零账号启动**的：`/health` 免鉴权、可先看阶段，而业务端点在账号 `ready` 之前一律返回 503。启动时它会扫描本机 QQ 目录，但**不会自己去读密钥**——库密钥（16 字节 ASCII）要你用独立工具提取（如 QQBackup / qq-win-db-key，本仓库不做密钥提取）。注册就一次 POST：
+服务是**零账号启动**的：`/health` 免鉴权、可先看阶段，而业务端点在账号 `ready` 之前一律返回 503。
+
+启动时它会扫描本机 QQ 目录，但**不会自己去读密钥**——库密钥（16 字节 ASCII）要你用独立工具提取（如 QQBackup / qq-win-db-key，本仓库不做密钥提取）。注册就一次 POST：
 
 ```bash
 curl -X POST -H "Authorization: Bearer $QQFLOW_TOKEN" -H "Content-Type: application/json" \
@@ -66,7 +68,13 @@ curl -H "Authorization: Bearer $QQFLOW_TOKEN" \
 
 ## 重启后恢复账号
 
-密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。用 [`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或 [`.sh`](scripts/examples/register-accounts.sh)）从你自备的本地配置读 key 后重新注册；完整配方见 [docs/quickstart.md](docs/quickstart.md#配方五重启后恢复账号)。脚本只读配置、不代存密钥。
+密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。
+
+用 [`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或 [`.sh`](scripts/examples/register-accounts.sh)）。
+
+从你自备的本地配置读 key 后重新注册。
+
+完整配方见 [docs/quickstart.md](docs/quickstart.md#配方五重启后恢复账号)。脚本只读配置、不代存密钥。
 
 ## 去哪看细节
 
@@ -89,4 +97,6 @@ curl -H "Authorization: Bearer $QQFLOW_TOKEN" \
 
 ## 免责声明
 
-仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）；QQ 升级可能导致列名/消息格式解析退化（结构化解析优先、启发式兜底，天然容错）。参考实现（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，未逐字复制。
+仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）；QQ 升级可能导致列名/消息格式解析退化（结构化解析优先、启发式兜底，天然容错）。
+
+参考实现（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，未逐字复制。

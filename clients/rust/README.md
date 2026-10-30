@@ -1,10 +1,19 @@
 # qqflow-client
 
-Typed Rust client for [qqflow-server](https://github.com/ren-yc/qqflow-server) — a headless, read-only HTTP/SSE service over local QQ NT chat databases.
+Typed Rust client for [qqflow-server](https://github.com/ren-yc/qqflow-server).
 
-Published in lockstep with the server crate (currently `0.9.1`); behavioral changes are recorded in the repository's [CHANGELOG.md](https://github.com/ren-yc/qqflow-server/blob/master/CHANGELOG.md).
+A headless, read-only HTTP/SSE service over local QQ NT chat databases.
 
-Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top: transport failures folded into a proper error tree, readiness polling, pagination helpers, SSE streaming, and media download helpers.
+Published in lockstep with the server crate (currently `0.9.1`).
+
+Behavioral changes are recorded in the repository's [CHANGELOG.md](https://github.com/ren-yc/qqflow-server/blob/master/CHANGELOG.md).
+
+Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top:
+
+- transport failures folded into a proper error tree
+- readiness polling
+- pagination helpers
+- SSE streaming, and media download helpers
 
 ## Install
 
@@ -33,7 +42,14 @@ Requires `tokio` (`rt-multi-thread` + `macros`) as a dependency — the SDK itse
 
 ## Scope
 
-The server exposes a strictly read-only surface: accounts, sessions, messages, contacts, group members, media export, and an SSE push stream. (Moments / `sns` endpoints belong to the sibling WeChat service — QQ NT local databases carry no such data.) This client mirrors that surface one-to-one; see the server repository for the API reference and the interface contract the client is tested against.
+The server exposes a strictly read-only surface:
+
+- accounts, sessions, messages, contacts, group members
+- media export, and an SSE push stream
+
+(Moments / `sns` endpoints belong to the sibling WeChat service — QQ NT local databases carry no such data.)
+
+This client mirrors that surface one-to-one; see the server repository for the API reference and the interface contract the client is tested against.
 
 ## License
 
