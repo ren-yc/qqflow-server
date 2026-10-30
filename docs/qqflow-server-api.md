@@ -6,18 +6,17 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 >
 > **本节结构与命名约定与 weflow-server api 文档同构**：端点按语义命名分节、不使用编号小节。
 
-## 启用方式
+> 本文是**端点参考**；任务型操作见 [quickstart](quickstart.md) 与 [guides/](guides/)（命令行子命令、批量导出、使用示例）。
 
-**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--log-format`（text）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
+## 目录
 
-- 默认监听地址：`127.0.0.1`
-- 默认端口：`5032`
-- 基础地址：`http://127.0.0.1:5032`
-- **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台以只读直连方式打开源库（偏移 VFS 虚拟剥离自定义头）、解密并构建索引（见「注册账号」）
-- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到系统凭据库（`--show-token` 获取）。两种情形启动日志**会打印 token 值**：凭据库为空首次生成时（info 级），凭据库不可用而降级为会话级 token 时（warn 级）——后者的 token 重启即变
-- 索引就绪前（账号处于 `indexing` / `error` 时），业务接口返回 `503`（见「错误响应」）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts`（含明细、注销）不检查就绪状态，可随时调用
-- 与 weflow-server 的**有意差异**（SNS 仅 weflow、`messageCount` 群成员面条件键、`meta.type` 推导面、默认端口、SDK/ts 状态）见 [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
-- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步
+- [最小必读路径](#最小必读路径)
+- [鉴权规范](#鉴权规范)
+- [接口列表](#接口列表)
+- [端点](#端点)
+- [错误响应](#错误响应)
+- [注意事项](#注意事项)
+- [类型化客户端（SDK）](#类型化客户端sdk)
 
 ## 最小必读路径
 
@@ -27,90 +26,11 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 |---|---|---|
 | 第一次跑通（获取→起服务→注册→查询） | [quickstart](quickstart.md) | 本文「鉴权规范」「错误响应」 |
 | 接 ChatLab 前端 | quickstart 配方一 | 「拉取会话消息（ChatLab Pull）」＋「接口列表」里的上限列表 |
-| 程序化取数 / 翻页 | 本文「接口列表」→ 对应小节 | 「类型化客户端（SDK）」「使用示例」 |
+| 程序化取数 / 翻页 | 本文「接口列表」→ 对应小节 | 「类型化客户端（SDK）」与 [使用示例](guides/examples.md) |
 | 只要增量（watcher/SSE） | quickstart 配方二 | 「主动推送（SSE）」 |
-| 批量导出（含媒体） | quickstart 配方三 | 「批量导出（`export`）」＋「媒体导出」 |
-| 让 agent 接入（MCP） | [mcp.md](mcp.md) | 「命令行子命令（`cli`）」 |
+| 批量导出（含媒体） | quickstart 配方三 | [批量导出](guides/export.md)＋「媒体导出」 |
+| 让 agent 接入（MCP） | [mcp.md](mcp.md) | [命令行子命令](guides/cli.md) |
 | 账号卡住 / 排障 | 「错误响应」＋账号明细节（「账号明细」）的 `progress` 段 | 「注意事项」与 quickstart 配方五 |
-
-## 命令行子命令（`cli`）
-
-裸跑仍是「起服务」；既有旗标（`--port`／`--help`／`--show-token` …）**逐字不变**。新增的子命令面与退出码：
-
-| 码 | 含义 | 例子 |
-| --- | --- | --- |
-| `0` | 成功 | `qqflow-server sessions` |
-| `1` | 运行期错误：连不上、被拒、缺 token／缺配置文件 | 未设 `QQFLOW_TOKEN` 且本机凭据库无记录就跑查询 |
-| `2` | 用法错误：未知子命令、缺必需参数 | `qqflow-server bogus`、`search` 不带 `--keyword` |
-
-- **`serve`** — 打哪个面：—；要点：起服务；等价裸跑
-- **`token`** — 打哪个面：系统凭据库；要点：打印 API token 并退出（等价 `--show-token`）
-- **`sessions`** — 打哪个面：SDK `list_all_sessions`；要点：`page_size=10000`（服务端硬上限），一次取尽
-- **`messages`** — 打哪个面：SDK `list_messages`；要点：HTTP 形态必须给 `--talker`；`--since` 接受 unix 秒或 `YYYYMMDD`
-- **`search`** — 打哪个面：SDK `list_messages` 带 `keyword`；要点：`--keyword` 必填；搜不到不是错误（退出 0）
-- **`contacts`** — 打哪个面：SDK `contacts`；要点：**只走 HTTP**：本仓的嵌入面没有联系人读面
-- **`accounts`** — 打哪个面：SDK `accounts`；要点：**只有 HTTP 形态**：这一面问的是「服务端此刻实际绑定了什么」
-- **`sync`** — 打哪个面：SDK `sync_now`；要点：**写动作**：立刻跑一次增量同步；没有 `--embedded`
-- **`export`** — 打哪个面：SDK `list_all_sessions` ＋ `pull_page` ＋ `chatlab_messages`；要点：**只走 HTTP**：批量导出到 ChatLab Format 文件；`--with-media` 时用同一页的时间窗调 `chatlab_messages(media=1)` 触发导出并下载字节，见下一节
-- **`mcp`** — 打哪个面：经 SDK 打 HTTP 面；要点：stdio 上的 MCP 服务端：进程不碰数据库密钥，token 走同一来源链；**必须先起服务端**。工具清单与安全提示见 [docs/mcp.md](mcp.md)
-
-环境变量：`QQFLOW_BASE_URL`（默认 `http://127.0.0.1:5032`）、`QQFLOW_TOKEN`（API token）。**token 来源链**：`QQFLOW_TOKEN`（非空）→ 本机凭据库（与 `qqflow-server token` 同一份）。同机运行不必每次 export；跨机仍走环境变量。环境变量未设且凭据库无记录（或后端不可读）时，错误会分别点名这两种成因并指路 `qqflow-server token`。**token 一律不经命令行传递** —— 命令行会落进 shell history 与进程列表。
-
-`--embedded`（进程内直读本地库，不起也不打 HTTP）只开放给 `sessions`／`messages`／`search`：配置路径由 `QQFLOW_EMBED_CONFIG` 给出，JSON 形态 `{"db_path": "<nt_msg.db 文件>", "key": "<库密钥>"}`（本仓的嵌入面是 `api::open(db_path, key)`：一库一钥）。关键词在嵌入形态只对**解析后的正文**判命中（本仓不保存原始 XML）—— 这是与 weflow-server 的能力差异，写在这里而不是留给用户猜。
-
-输出：默认人类可读紧凑行，`--json` 给机器可读形状。
-
-### 日志旗标（`--log` / `--log-format`）
-
-子命令面带两个 **global 旗标**（在任何子命令的位置都可用）：
-
-- **`--log`** — 取值：`error\|warn\|info\|debug`；默认：子命令 **warn**；serve **info**；说明：日志详细度。子命令默认只播失败原因，正常路径不刷屏
-- **`--log-format`** — 取值：`text\|json`；默认：`text`；说明：`json` 为**逐行一个对象**（含 `level`/`target`/`fields`），给日志采集器消费；两入口日志统一走 stderr
-
-关键口径（回归位置：`tests/cli_e2e.rs::subcommand_failures_are_logged_on_stderr` 与 `tests/cli_e2e.rs::log_json_format_emits_parseable_lines`、`tests/cli.rs::invalid_log_flags_are_usage_errors_exit_2`）：
-
-- **子命令的日志只进 stderr，stdout 永远是命令输出**。`--json` 的 stdout 可被管道直接解析，加 `--log-format json` 也不会让 JSON 日志混进 stdout（serve 的日志去向见下下条）。
-- **子命令在动手执行前就装好日志**——所以 `export` 把某个会话标记为 `skipped` 时，「**为什么**跳过」会以 `warn` 行出现在 stderr（改造前那行 `tracing::warn!` 落在没装 subscriber 的进程里，是 no-op：只剩退出码 1 与一行「跳过」，原因永远看不到）。
-- **`serve` 的 `--log` 仍走老解析器**：`serve --log debug` 与裸跑 `--log debug` 逐字等价，info 默认也不被子命令预装的 warn 劫走（dispatch 在构造 clap 之前就短路进 legacy；回归位置：`tests/cli.rs::serve_log_flag_still_goes_through_the_old_parser`）。
-- **输出去向统一 stderr**（0.10.0 破坏性变更）：子命令的日志走 stderr（stdout 留给命令输出），**serve 的日志也走 stderr**——`2>` 一处收齐服务日志与 `[init]`/`[fatal]`；此前 serve 走 stdout 的 `qqflow-server > 日志文件` 类部署会拿到空 stdout，**迁移方式：改用 `2>` 收日志**。回归位置：`tests/cli.rs::serve_logs_go_to_stderr`。理由与历史代价写在 `docs/architecture.md` 的「日志：装在哪、写去哪、说什么话」。
-- 非法取值（`--log verbose`、`--log-format yaml`）是**用法错误（退出码 2）**，与 `--since` 同一契约。
-- 环境变量 `RUST_LOG` **优先于 `--log`**（EnvFilter 的既有语义）：设了它时命令行旗标被忽略。脚本与测试基座里一律 `env_remove` 它，避免级别随环境漂移。
-- 子命令日志**不带 ANSI 颜色码**（`--log-format json` 与 text 同）：stderr 是脚本与采集器的消费面，`2> 日志文件` 里出现 `\x1b[33m` 会毁掉按行解析。这条是产品保证、不依赖 `NO_COLOR` 环境变量。serve 自 0.10.0 起并入同一通道，观感一致（同为无颜色码的行）。
-
-## 批量导出（`export`）
-
-`qqflow-server export --out <目录> [--format jsonl|json] [--session <id> …] [--since <t>] [--resume] [--with-media]`
-
-**只走 HTTP**：这个面不提供 `--embedded`。服务端已经把数据库密钥握在内存里，CLI 只做编排与落盘；否则一个可能跑几分钟的任务会长时间持有密钥，还得把密钥带上命令行。
-
-产物布局：
-
-- **每个会话一个文件**（`<slug>.jsonl` 或 `<slug>.json`）。`<slug>` 由会话显示名经 `pathsafe::slugify` 得到；**折叠后不含任何 ASCII 字母数字时**（纯中文群名会被折成一串下划线，既不可读也极易互撞）**回落到会话 id 的 slug**；同名会话按出现顺序追加 `-2`／`-3`。文件名是确定性函数 —— 这是 `--resume` 成立的前提。两个补充口径：
-
-  - **去重按大小写折叠**（Windows 卷默认大小写不敏感，`Team` 与 `team` 是同一个文件），而交付名保留原大小写；
-  - **编排文件名 `index` 永远留给清单**：显示名恰好是 `index` 的会话拿到 `index-2`，否则 json 形态下会话信封会被清单原地覆盖。
-
-  回归位置：`export::tests::slug_collision_gets_deterministic_suffix`。
-- **JSONL 形态**：第一行是 `_type: header`（含 `chatlab` 与 `meta`），其后是 `_type: message` 行。规范建议按时间升序，因此**页内**排序（跨页排序会把内存恒定这条承诺打破）。**不写 member 行**：流式写不出「先集齐成员再写消息」的顺序，而消息行自带 `accountName` 与 `groupNickname`，信息不丢。
-- **JSON 形态**：一个会话一个完整信封（`chatlab`／`meta`／`members`／`messages`）。整会话留在内存，因此大语料请用 jsonl。
-- **`index.json`**：本服务自造的编排清单。**它不属于 ChatLab 规范，导入请用单个 `<slug>.jsonl`／`.json`。**
-- **`--with-media`**：把本会话用到的媒体字节下载到 `<目录>/media/`，并把导出物里的 `media.fileName` **限定为确实落盘的那些句柄**。实现是**单遍**的：每取到一页 Pull 行，就用这一页的时间窗（`(since, nextSince]` 正好对应消息面认的 `start`/`end`，两端都是闭区间的秒级戳；同秒的行必然落在同一页里，所以窗口两端不漏行）调一次 `/chatlab/messages?media=1` 触发导出（每请求的条数由 CLI 自己设成 200，**服务端本仓不设导出条数闸门**）并取字节，然后才写这一页的行；顺序不能反 —— 服务端只有在真的写出了本地副本之后，才把 `fileName` 回填成可取句柄。**`--since` 因此同时下推到导出面**：过去它是两趟独立的全历史遍历，`--since` 只管住写出来的行、媒体照样把整个会话导出并重下一遍；而两趟之间若有并发同步推进水位，第一趟没覆盖到的消息会「有行、无句柄」地静默缺件。磁盘上已有的摘要文件**不重下**（内容摘要名同名即同内容，按存在性复用是安全的）——这也是 `--resume` 能「只补下缺件」的依据。回归位置：`cli_e2e::media_window_follows_the_pull_page`（每个导出请求都带 `start`/`end`、请求条数等于 Pull 页数、两页窗口互不重叠，且 250 条句柄与 `media/` 文件集合大小相等）与 `cli_e2e::with_media_reuses_bytes_already_on_disk`（第二次跑不得重下覆盖）。注意**两个面给的名字不必相同**：消息面回填的是导出后的内容摘要名，拉取面携带的仍是索引里的原始名，所以句柄**按消息 id 对账**（不是按名字比对），导出物里写的是实际落盘的那个名字。外链媒体与未能导出的媒体**不会**留下句柄：宁可少一个 `media` 字段，也不给一个指向不存在文件的句柄。单个媒体取不到只跳过，不升级成会话级失败。
-- **响应里的媒体名要过本地路径校验**：服务端回传的 `media.fileName` 要拿去拼 `<目录>/media/` 下的路径，`../`、盘符、ADS、Win32 设备名这类值配合 `join` 能写到导出目录之外（URL 段编码只防 HTTP 层）。因此落盘前先过 `pathsafe::safe_segment`，非法名按 404 同级跳过**并计数可见**（汇总行给出个数）。同名（含仅大小写不同，折叠口径与会话名一致）的媒体只下载一份字节，引用它的每条消息都映射到**实际落盘的那个名字**。回归位置：`cli_e2e::with_media_rejects_unsafe_response_file_names` 与 `cli_e2e::with_media_maps_exported_names_back_to_message_ids`。
-
-三条硬约束：
-
-1. **导出物里不得出现访问令牌**。服务端的媒体是**根相对路径**（`/api/v1/media/<file>`，**不含令牌** ——令牌只走请求头或 `?access_token=`，响应体从不嵌它）。导出仍然不写任何 URL（相对路径换台机器就失效），传上网盘。因此导出**不写任何 URL**，媒体只以 `{type, fileName}` 表达；并且每一行写盘前会拿调用方给的令牌做一次子串检查，**命中即整轮中止**（不是跳过该会话）并删掉半成品。
-2. **会话级失败不静默**：取数失败的会话被记入 `skipped`，而只要 `skipped` 非空，CLI 就以退出码 1 结束。静默少导几个会话是这类工具最坏的失败方式。**`--resume` 的命中不算失败**：记入 `reused`（幂等完成），同参数续跑以退出码 0 收场。
-3. **最终名是唯一的完成标记**：会话先写 `<slug>.<格式>.part`，整个会话成功收尾后才 `rename` 成最终名。因此 `.part` 残留意味着「没写完」，续跑一律重写；失败的那一轮只删 `.part`，**不会**碰上一轮已经交付的完整产物。清单 `index.json` 同样先 `index.json.part` 再改名 —— 它是续跑唯一的「完成记录」来源，半路被杀的截断清单会让下一轮误判「没有上一轮」。
-4. **`--resume` 复用要同时满足四条**（缺一条就重写，并在日志点名原因）：上一轮清单记着该会话、且它登记的**就是本轮这个文件名**（换格式 `jsonl`／`json` 后盘上的另一扩展名文件是孤儿，不算本轮产物）、没有 `.part` 残留、本轮带 `--with-media` 时上一轮也带过媒体。「有个同名文件」单独不构成完成记录：清单被删或被截断时，那会让从没导出过的会话被静默判成已完成，而它在新清单里没有条目，既看不见也不能自愈。
-5. **媒体承诺按轮成立**：`--with-media --resume` 复用上一轮产物时，CLI 会逐个核对复用会话里的 `fileName` 在 `media/` 下确有字节；有悬空就点名该会话并以退出码 1 结束（媒体目录被清理或搬走过的交付包不该静默通过）。处理办法：对点名的会话去掉 `--resume` 重跑，或恢复 `media/`。
-6. **单个会话的起手／收尾失败只跳过该会话**（记入 `skipped`），不中止整轮 —— 整轮中止会让本轮已写出的会话留在盘上却不进清单，比留一个 `.part` 更难恢复。令牌泄漏仍是整轮中止。
-
-   回归位置：`export::tests::resume_rewrites_an_incomplete_artifact`、`export::tests::failed_rerun_keeps_the_previous_complete_artifact`、`cli_e2e::export_writes_a_file_against_a_live_service`（含续跑第二次退 0）。
-
-内存：JSONL 逐页写盘、写完即丢，**峰值常驻集与消息条数无关**；`--with-media` 的句柄映射现在**只活在这一页**（O(本页不同媒体数)，不随会话长度增长），因此媒体侧不再破坏这条承诺。同秒组的消息会被服务端扩页带出（Pull 段的「同秒扩页」），那一项仍在承诺之外。大语料的实测口径与造库工具（隐藏的 `--rows` 参数，仅 `testing` feature 下编译进二进制）见 `docs/architecture.md` 的「测试与夹具」。
-
-回归位置：`export::tests::*`（行形状、slug、`--resume`、令牌熔断、`--with-media` 的句柄契约）与 `tests/cli.rs` 的 `export_help_does_not_advertise_the_rows_param`／`export_requires_out_dir_as_usage_error`。
 
 ## 鉴权规范
 
@@ -1193,58 +1113,6 @@ POST /api/v1/sync
 > 上文列出的 `405` 与未知路径 `404` 的实际文案是中文「方法不允许」与「未知路径」，随统一信封返回——按语言匹配提示的脚本不要假设 `message` 恒为中文业务描述。回归位置：快照 `error-method-not-allowed`／`error-unknown-path`。
 >
 > Query 数值参数类型错误（如 `limit=abc`）返回 **400 统一信封**。框架默认给的是**纯文本空响应体**，于是客户端只能靠状态码特判——而「参数错了」恰恰是它能自己修的那一类，不该与「传输返回了无法解析的东西」长得一样。适用于 `/api/v1/messages`、`/api/v1/sessions`、`/api/v1/contacts`。**例外是 ChatLab 拉取** `/api/v1/sessions/{id}/messages`：该接口的 `limit` / `offset` 为容错解析，非法值退化为默认值而不报错（见「拉取会话消息」），因为 WeFlow 的 Pull 契约对分页参数没有 400 语义。
-
----
-
-## 使用示例
-
-提供 cURL 与 Python 两套可直接复制的调用示例，覆盖从取 token、注册账号到查询、注销的主干流程。
-
-### cURL
-
-```bash
-# 取 token：它存在系统凭据库里、不落文件，只能用子命令打印。
-# bash / Git-Bash：
-TOKEN=$(qqflow-server token)
-# PowerShell（`VAR=$(…)` 是 bash 语法，PowerShell 里会当成命令名报错、$TOKEN 变空）：
-#   $TOKEN = qqflow-server token
-# 注册账号（客户端驱动启动；密钥仅内存保存）。鉴权走 Header，别把 token 放进 body。
-curl -X POST http://127.0.0.1:5032/api/v1/accounts \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d "{\"qq\": \"1234567890\", \"key\": \"<16字节密钥>\", \"db_path\": \"C:\\\\Users\\\\<用户名>\\\\Documents\\\\Tencent Files\"}"
-# 账号明细（需鉴权；/health 只给标量 account 阶段）
-curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:5032/api/v1/accounts
-# 注销账号（恢复未注册状态；加 purge_media=1 才删导出媒体）
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
-  "http://127.0.0.1:5032/api/v1/accounts/1234567890?purge_media=1"
-# GET 带 Token Header
-curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=20"
-# 读端点只有 GET：参数走查询串（POST 会得 405，body 里的 token 也不是鉴权通道）
-curl -H "Authorization: Bearer $TOKEN" \
-  "http://127.0.0.1:5032/api/v1/messages?talker=10001&limit=50"
-# SSE
-curl -N "http://127.0.0.1:5032/api/v1/push/messages?access_token=$TOKEN"
-```
-
-### Python
-
-```python
-import requests
-
-BASE_URL = "http://127.0.0.1:5032"
-headers = {"Authorization": "Bearer YOUR_TOKEN", "Content-Type": "application/json"}
-
-# 读端点只接受 GET（POST 得 405）
-messages = requests.get(
-    f"{BASE_URL}/api/v1/messages",
-    params={"talker": "10001", "limit": 50},
-    headers=headers,
-).json()
-
-sessions = requests.get(f"{BASE_URL}/api/v1/sessions", params={"limit": 20}, headers=headers).json()
-```
-
----
 
 ## 注意事项
 

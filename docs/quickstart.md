@@ -15,11 +15,19 @@ qqflow-server            # 等价于 serve，默认 127.0.0.1:5032
 qqflow-server --port 5032 --host 127.0.0.1 --log info
 ```
 
-- token：首次启动生成并存入系统凭据库；`qqflow-server token` 打印。CLI 的 token 来源链是 `QQFLOW_TOKEN` → 本机凭据库。
+**无配置文件**；运行参数全部由命令行指定（均有默认值）：`--port`（5032）/ `--host`（127.0.0.1）/ `--log`（info）/ `--log-format`（text）/ `--watch-debounce-ms`（350）/ `--watch-fallback-ms`（30000），`qqflow-server.exe` 直接启动即为默认状态。
+
+- 默认监听地址：`127.0.0.1`
+- 默认端口：`5032`
+- 基础地址：`http://127.0.0.1:5032`
+- **账号为客户端驱动**：启动时仅做平台路径扫描，发现的账号列为 `awaiting_key`（零账号启动合法）；由客户端调用 `POST /api/v1/accounts` 传入 `{qq, key, db_path}` 注册账号后，服务在后台以只读直连方式打开源库（偏移 VFS 虚拟剥离自定义头）、解密并构建索引（见 [api 文档](qqflow-server-api.md)「注册账号」）。注册前业务端点返回 503（`/health` 仍是 `starting`）。
+- API Token：首次启动自动生成（32 字节随机数的 64 字符十六进制）并持久化到系统凭据库（`--show-token` 或 `qqflow-server token` 获取）。两种情形启动日志**会打印 token 值**：凭据库为空首次生成时（info 级），凭据库不可用而降级为会话级 token 时（warn 级）——后者的 token 重启即变。CLI 的 token 来源链是 `QQFLOW_TOKEN` → 本机凭据库。
+- 索引就绪前（账号处于 `indexing` / `error` 时），业务接口返回 `503`（见 [api 文档](qqflow-server-api.md)「错误响应」）；`/health` 返回 `starting` 状态。例外：SSE 接口 `/api/v1/push/messages` 与 `/api/v1/accounts`（含明细、注销）不检查就绪状态，可随时调用。
+- 与 weflow-server 的**有意差异**（SNS 仅 weflow、`messageCount` 群成员面条件键、`meta.type` 推导面、默认端口、SDK/ts 状态）见 [flow-contract ADAPTATION.md](https://github.com/ren-yc/flow-contract/blob/master/ADAPTATION.md)。
+- 新消息检测：后台以**文件系统事件**驱动（Windows ReadDirectoryChangesW / Linux inotify / macOS FSEvents，`--watch-debounce-ms` 默认 350ms 防抖，辅以 `--watch-fallback-ms` 默认 30s 慢速兜底轮询防事件丢失），源数据库文件变化时执行完整同步（直连活库的增量读取，零拷贝），经 `GET /api/v1/push/messages` 推送 SSE；客户端亦可主动调用 `POST /api/v1/sync` 立即同步。
 - **日志走 stderr**（0.10.0 起）：收日志用 `qqflow-server 2> 服务.log`——此前 `>` 收 stdout 日志的部署会拿到空文件，需改用 `2>`（`[init]`/`[fatal]` 与服务日志从此一处收齐）。
 - 数据目录：Windows `%LOCALAPPDATA%\qqflow-server`。
 - 停服务：前台 `Ctrl-C`；收到信号会停止 watcher 与 SSE 并退出。
-- **零账号启动**：先注册再查询；注册前业务端点返回 503（`/health` 仍是 `starting`）。注册/密钥/账号面的细节见 [api 文档](qqflow-server-api.md)。
 
 ## 第一个请求
 
@@ -71,7 +79,7 @@ qqflow-server export --out ./export --format jsonl --with-media
 - 只导出个别会话用 `--session <id>`（可重复）；只要某时间之后用 `--since`。
 - 媒体可取性以**客户端落地**为准：新图在客户端全图落地前（数十秒到分钟级）可能仍无句柄；缺句柄时退回消息面的按需导出，不要当错误。
 
-深入：api 文档「批量导出（`export`）」（产物形状、`index.json`、失败跳过语义都在那里）。
+深入：[批量导出指南](guides/export.md)（产物形状、`index.json`、失败跳过语义都在那里）。
 
 ## 配方四：让 agent 接入（MCP）
 
