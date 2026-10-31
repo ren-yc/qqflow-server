@@ -514,6 +514,10 @@ GET /chatlab/sessions
 
 没有次键时同刻的两个会话会在不同进程里换位置，`skip/take` 翻页于是会重复拿到一个、同时漏掉另一个（回归位置：`same_timestamp_sessions_page_stably_across_rebuilt_stores`）。
 
+`count` 是**本页条数**（不是总数），`messageCount` 是索引里的真实条数。
+
+**`page` 块是必需的**：ChatLab 把「没有 `page` 块」读作「这就是完整一页」，不带 `page` 的截断会被下游当成全量（默认 `limit` 100，普通账号就会撞上，表现为「第 101 个会话凭空消失」且不报错）。
+
 ### GET `/chatlab/push/messages` — ChatLab 通知面（SSE，只发元信息）
 
 **请求**
@@ -831,38 +835,6 @@ GET /api/v1/sessions
   ]
 }
 ```
-
-### GET `/chatlab/sessions` — ChatLab 形状（发现面）
-
-**请求**
-
-```http
-GET /chatlab/sessions
-```
-
-**参数**：同上一「ChatLab 发现面」小节（`keyword` / `limit` / `cursor`）。
-
-**响应**
-
-`/api/v1/sessions` 只输出原生形状；ChatLab 形状走这个面（详见「获取会话列表」的 ChatLab 发现面一节）。
-
-```json
-{
-  "sessions": [
-    { "id": "10001", "name": "项目群", "platform": "qq", "type": "group", "messageCount": 128, "lastMessageAt": 1782864000 }
-  ],
-  "count": 1,
-  "page": { "hasMore": true, "nextCursor": "1" }
-}
-```
-
-`platform` 固定 `"qq"`；`messageCount` 是**索引里的真实条数**。`count` 是**本页条数**。老面**不再识别** `cursor`：继续传不会报错，而是静默回到第一页。
-
-**`page` 块是必需的。** ChatLab 把「没有 `page` 块」的响应读作「这就是完整一页」，所以不带 `page` 的截断会被下游当成全量——默认 `limit` 是 100，普通账号就能撞上，表现是「第 101 个会话凭空消失」且不报错。
-
-`hasMore` 为假时 `nextCursor` 为 `null`；把 `nextCursor` 原样回传即可继续翻页。
-
----
 
 ### GET `/api/v1/sessions/{id}/messages` — ChatLab 拉取（消息游标）
 
