@@ -8,7 +8,7 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 >
 > **本节结构与命名约定与 weflow-server api 文档同构**：端点按语义命名分节、不使用编号小节。
 
-> 本文是**端点参考**；任务型操作见 [quickstart](quickstart.md) 与 [guides/](guides/)（命令行子命令、批量导出、使用示例）。
+> 本文是**端点参考**；任务型操作见 [quickstart](quickstart.md)（命令行子命令、批量导出、启动旗标速查）。
 
 ## 目录
 
@@ -28,10 +28,10 @@ qqflow-server 提供本地 HTTP API（已支持 GET 和 POST 请求），便于�
 |---|---|---|
 | 第一次跑通（获取→起服务→注册→查询） | [quickstart](quickstart.md) | 本文「鉴权规范」「错误响应」 |
 | 接 ChatLab 前端 | quickstart 配方一 | 「拉取会话消息（ChatLab Pull）」＋「接口列表」里的上限列表 |
-| 程序化取数 / 翻页 | 本文「接口列表」→ 对应小节 | 「类型化客户端（SDK）」与 [使用示例](guides/examples.md) |
+| 程序化取数 / 翻页 | 本文「接口列表」→ 对应小节 | 「类型化客户端（SDK）」与 quickstart 的「命令行子命令」 |
 | 只要增量（watcher/SSE） | quickstart 配方二 | 「主动推送（SSE）」 |
-| 批量导出（含媒体） | quickstart 配方三 | [批量导出](guides/export.md)＋「媒体导出」 |
-| 让 agent 接入（MCP） | [mcp.md](mcp.md) | [命令行子命令](guides/cli.md) |
+| 批量导出（含媒体） | quickstart 配方三 | 「媒体导出」 |
+| 让 agent 接入（MCP） | [mcp.md](mcp.md) | quickstart 的「命令行子命令」 |
 | 账号卡住 / 排障 | 「错误响应」＋账号明细节（「账号明细」）的 `progress` 段 | 「注意事项」与 quickstart 配方五 |
 
 ## 鉴权规范
