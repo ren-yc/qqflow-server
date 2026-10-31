@@ -1,0 +1,15 @@
+# release-runbook 模板变量：本仓 profile。发版时更新 sdist_* 并重跑 render_docs_common.py。
+
+server = "qqflow-server"
+client = "qqflow-client"
+sdk = "qqflow-sdk"
+sdk_mod = "qqflow_sdk"
+envp = "QQFLOW"
+idx_prefix = "qq/fl"
+sibling = "weflow"
+sdist_entries = "62"
+sdist_bytes = "121,965"
+sib_entries = "67"
+sib_bytes = "129,161"
+chacha_note = "**本轮姊妹仓 weflow 已遇到并解掉**："
+chacha_it = "它"
