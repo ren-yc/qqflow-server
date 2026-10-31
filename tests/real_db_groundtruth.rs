@@ -34,7 +34,7 @@ use tower::ServiceExt;
 mod common;
 use common::{FAKE_KEY, FAKE_QQ};
 
-/// Fake DB location (also used by the behavioral-repro runbook).
+/// Fake DB location (also used by the behavioral-repro procedure).
 pub fn fake_db_path() -> std::path::PathBuf {
     std::env::temp_dir()
         .join("qqflow_fake")
@@ -125,7 +125,7 @@ fn probe_columns(conn: &rusqlite::Connection, table: &str) {
 }
 
 /// Verify the fake DB is readable through the server's pipeline (live
-/// reader + direct row counts). The behavioral-repro runbook depends on it.
+/// reader + direct row counts). The behavioral-repro procedure depends on it.
 #[test]
 fn fake_db_for_behavioral_repro() {
     let _guard = FAKE_DB_LOCK.lock().unwrap();
