@@ -1,10 +1,6 @@
 # qqflow-client
 
-Typed Rust client for [qqflow-server](https://github.com/ren-yc/qqflow-server) — a headless, read-only HTTP/SSE service over local QQ NT chat databases.
-
-Published in lockstep with the server crate (currently `0.9.1`); behavioral changes are recorded in the repository's [CHANGELOG.md](https://github.com/ren-yc/qqflow-server/blob/master/CHANGELOG.md).
-
-Generated from the server's OpenAPI description (types + request plumbing), with a handwritten behavior layer on top: transport failures folded into a proper error tree, readiness polling, pagination helpers, SSE streaming, and media download helpers.
+Typed Rust client for [qqflow-server](https://github.com/ren-yc/qqflow-server), a read-only HTTP/SSE service over local QQ NT databases.
 
 ## Install
 
@@ -20,21 +16,29 @@ use qqflow_client::client::{Client, ClientError};
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
-    let client = Client::new("http://127.0.0.1:5032", "your-token");
+    let client = Client::new("http://127.0.0.1:5032", "<token>");
     client.wait_ready("<qq>", Duration::from_secs(30)).await?;
-    // page_size / keyword are both optional; None keeps the server defaults.
     let sessions = client.list_all_sessions(None, None).await?;
     println!("{} sessions", sessions.len());
     Ok(())
 }
 ```
 
-Requires `tokio` (`rt-multi-thread` + `macros`) as a dependency — the SDK itself uses tokio for timeouts and retries.
+Requires `tokio` with `rt-multi-thread` and `macros`; the SDK uses tokio for timeouts and retries.
+
+## Generated and handwritten layers
+
+Types and request plumbing are generated; the behavior layer is handwritten. Never edit them by hand — run `cargo run -p qqflow-regen --` instead.
 
 ## Scope
 
-The server exposes a strictly read-only surface: accounts, sessions, messages, contacts, group members, media export, and an SSE push stream. (Moments / `sns` endpoints belong to the sibling WeChat service — QQ NT local databases carry no such data.) This client mirrors that surface one-to-one; see the server repository for the API reference and the interface contract the client is tested against.
+Read-only over the user's databases; `sync` is the one state-changing call. Covers all read surfaces plus media export.
 
-## License
+This client mirrors that surface one-to-one.
 
-MIT
+## Links
+
+- [Server repository](https://github.com/ren-yc/qqflow-server)
+- [API reference](https://github.com/ren-yc/qqflow-server/blob/master/docs/qqflow-server-api.md)
+- [CHANGELOG](https://github.com/ren-yc/qqflow-server/blob/master/CHANGELOG.md)
+- [License](https://github.com/ren-yc/qqflow-server/blob/master/LICENSE) — MIT

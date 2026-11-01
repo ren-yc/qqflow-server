@@ -1,34 +1,43 @@
 # qqflow-server
 
-无头 HTTP API + SSE 服务：读取本地 QQ NT 版聊天记录（SQLCipher 解密 `nt_msg.db`）。独立实现，接口形态参考 **WeFlow HTTP API**。
+[![crates.io](https://img.shields.io/crates/v/qqflow-server.svg)](https://crates.io/crates/qqflow-server)
 
-## 家族术语
+[![CI](https://img.shields.io/github/actions/workflow/status/ren-yc/qqflow-server/check.yml)](https://github.com/ren-yc/qqflow-server/actions)
 
-- **WeFlow** —— 安装版 HTTP API（默认端口 :5031）；三仓文档中的「WeFlow 形状 / 与 WeFlow 的差异」均以它为基线。
-- **weflow-server** —— 本家族的微信 4.x 只读服务（默认端口 :5033），纯 Rust 实现，接口契约对齐 WeFlow HTTP API。
-- **qqflow-server** —— 本家族的 QQ NT 只读服务（默认端口 :5032），与 weflow-server 同构。
-- **WeFlow Legacy** —— briefdesk 里的旧采集插件，走安装版 WeFlow 的 HTTP 面取数。
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 获取
+无头 HTTP API + SSE 服务：读取本地 **QQ NT 版**聊天记录（SQLCipher 解密 `nt_msg.db`，直读实时源库、无镜像）。接口形态参考安装版 WeFlow HTTP API（:5031）。
 
-- **Release 二进制** — 入口：GitHub Releases 的最新 tag（三平台归档 ＋ `SHA256SUMS`）；说明：免工具链；校验后再运行
-- **`cargo install`** — 入口：`cargo install --locked qqflow-server`；说明：从 crates.io 编译
-- **源码构建** — 入口：`powershell -File scripts\build.ps1 build --release`（Windows）／`bash scripts/build.sh build --release`；说明：前置工具链见 [AGENTS.md](AGENTS.md) 的「命令」
+姊妹仓库 [weflow-server](https://github.com/ren-yc/weflow-server) 对微信 4.x 做同构的事（:5033）。本服务默认端口 **:5032**。
 
-## 起服务
+## Highlights
+
+- **只读不落盘**：活库直读 ＋ 内存索引，从不写用户的数据库，也没有第二份数据副本。
+- **密钥仅内存**：16 字节库密钥经 API 注册，只在进程内存；本仓库不做密钥提取。
+- **SSE 实时推送**：新消息与撤回经单条事件总线广播，迟到订阅者靠重放缓冲补齐。
+- **ChatLab 兼容**：`/chatlab/*` 四条路由输出 ChatLab Format 形状，媒体可按需导出。
+- **类型化 SDK**：Rust / Python 客户端（生成形状 ＋ 手写行为层），另有 TS 示例。
+- **CLI 与 MCP**：命令行子命令取数与批量导出；stdio MCP 工具面供 agent 接入。
+
+## 快速开始
+
+获取（三选一）：
+
+```bash
+# Release 二进制：GitHub Releases 下载对应平台归档，sha256sum -c SHA256SUMS 校验后运行
+cargo install --locked qqflow-server
+# 源码构建（前置工具链见 AGENTS.md 的「命令」）
+powershell -File scripts\build.ps1 build --release      # Windows
+bash scripts/build.sh build --release                   # Linux / macOS
+```
+
+起服务（token 首次启动生成并存入系统凭据库，`qqflow-server token` 打印）：
 
 ```powershell
 qqflow-server            # 默认 127.0.0.1:5032
-qqflow-server --port 5032 --host 127.0.0.1 --log info
 ```
 
-- token 首次启动生成并存入系统凭据库（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service）；`qqflow-server token` 打印。CLI 的 token 来源链是 `QQFLOW_TOKEN` → 本机凭据库。凭据库不可用时 token 只在启动日志打印一次（会话级），详见 quickstart 配方五。
-- 数据目录：Windows `%LOCALAPPDATA%\qqflow-server`。
-- 停服务：前台 `Ctrl-C`。
-
-## 注册账号（第一次查询之前）
-
-服务是**零账号启动**的：`/health` 免鉴权、可先看阶段，而业务端点在账号 `ready` 之前一律返回 503。启动时它会扫描本机 QQ 目录，但**不会自己去读密钥**——库密钥（16 字节 ASCII）要你用独立工具提取（如 QQBackup / qq-win-db-key，本仓库不做密钥提取）。注册就一次 POST：
+注册账号（服务零账号启动，业务端点在账号 `ready` 前一律 503；库密钥要你用独立工具提取，如 QQBackup / qq-win-db-key）：
 
 ```bash
 curl -X POST -H "Authorization: Bearer $QQFLOW_TOKEN" -H "Content-Type: application/json" \
@@ -36,15 +45,7 @@ curl -X POST -H "Authorization: Bearer $QQFLOW_TOKEN" -H "Content-Type: applicat
   http://127.0.0.1:5032/api/v1/accounts
 ```
 
-受理返回 `state: "accepted"`，后台开始建索引；轮询到 `ready` 即可查询：
-
-```bash
-curl -H "Authorization: Bearer $QQFLOW_TOKEN" http://127.0.0.1:5032/api/v1/accounts
-```
-
-`db_path` 允许松散（给库文件或其上级目录都可），字段全谱与重启恢复见 [quickstart 配方五](docs/quickstart.md#配方五重启后恢复账号)与 api 文档的注册端点小节。
-
-## 第一个请求
+第一个请求：
 
 ```bash
 curl http://127.0.0.1:5032/health
@@ -52,40 +53,33 @@ curl -H "Authorization: Bearer $QQFLOW_TOKEN" \
   "http://127.0.0.1:5032/api/v1/sessions?limit=10"
 ```
 
-`/health` 免鉴权且只回标量阶段；账号身份、消息数与库路径在需鉴权的 `GET /api/v1/accounts`。
+重启后恢复、字段全谱等完整配方见 [quickstart 配方五](docs/quickstart.md#配方五重启后恢复账号)。
 
 ## 范围
 
-- ✅ 解密层：SQLCipher 4（kdf_iter=4000 / HMAC-SHA1 / PBKDF2-HMAC-SHA512 / AES-256-CBC），剥离 1024B 自定义头；直读实时源库（QQ 运行中可读，无镜像）。
-- ✅ 数据读取：全量扫描建内存索引 + 文件系统事件驱动的增量同步（notify watch + 慢速兜底轮询）。
-- ✅ 服务封装：axum HTTP + SSE，WeFlow 参考端点与字段。
-- ✅ 媒体：`GET /api/v1/media/{id}` 从 QQ 本地缓存直服，未命中再按导出文件名在导出根下解析；`media=1` 按需导出。
-- ✅ 三平台：Windows / Linux / macOS。
-- ❌ 不做密钥提取：密钥由外部工具提供，运行期注册（见上）。
-- ✅ 任务配方：[quickstart](docs/quickstart.md)（接 ChatLab、只要增量、导出含媒体、MCP、重启恢复）。
+- ✅ 解密：SQLCipher 4 ＋ 剥离 1024B 自定义头；直读实时源库，QQ 运行中亦可读。
+- ✅ 实时监控：notify 监听 ＋ 慢速兜底轮询；水位增量；撤回检测。
+- ✅ 媒体：本地缓存直服，未命中再按导出文件名解析；`media=1` 按需导出。
+- ❌ 不做：密钥提取、消息注入、桌面通知。
 
-## 重启后恢复账号
+## 文档
 
-密钥只存进程内存；服务重启后账号回到未注册（业务端点 503）。用 [`scripts/examples/register-accounts.ps1`](scripts/examples/register-accounts.ps1)（或 [`.sh`](scripts/examples/register-accounts.sh)）从你自备的本地配置读 key 后重新注册；完整配方见 [docs/quickstart.md](docs/quickstart.md#配方五重启后恢复账号)。脚本只读配置、不代存密钥。
-
-## 去哪看细节
-
-- **这个版本改了什么（逐版行为变化与迁移）**：[CHANGELOG.md](CHANGELOG.md)
-- **按任务怎么做（ChatLab/增量/导出/MCP/恢复）**：[docs/quickstart.md](docs/quickstart.md)
-- **HTTP 端点、CLI、退出码、错误形状**：[docs/qqflow-server-api.md](docs/qqflow-server-api.md)
-- **模块职责、feature 矩阵、嵌入与测试纪律**：[docs/architecture.md](docs/architecture.md)
-- **agent 客户端接入（stdio MCP）**：[docs/mcp.md](docs/mcp.md)
-- **发版流程与凭据/审批闸门**：[docs/release-runbook.md](docs/release-runbook.md)
-- **贡献者命令、钩子、提交规范、作为库嵌入**：[AGENTS.md](AGENTS.md) 与 [examples/embed.rs](examples/embed.rs)
-- **类型化 SDK**：`clients/rust`、`clients/python`；`clients/ts` **未发布 npm**，从源码取
+- 教程（5 分钟跑通）：[docs/quickstart.md](docs/quickstart.md)
+- 操作指南（子命令、导出、MCP）：[docs/quickstart.md](docs/quickstart.md)、[docs/mcp.md](docs/mcp.md)
+- 参考（端点、参数、字段、错误码）：[docs/qqflow-server-api.md](docs/qqflow-server-api.md)
+- 解释（架构与陷阱）：[docs/architecture.md](docs/architecture.md)
+- 贡献（命令、门禁、提交规范）：[AGENTS.md](AGENTS.md)；逐版变化：[CHANGELOG.md](CHANGELOG.md)
+- SDK：`clients/`（`clients/ts` 未发布 npm）；库嵌入示例：[examples/embed.rs](examples/embed.rs)
 
 ## 鸣谢
 
 本项目借鉴了以下项目的部分功能特性（均为行为规格层面的参考，代码独立编写）：
 
-- [hicccc77/WeFlow](https://github.com/hicccc77/WeFlow)
-- [yfgug/QQFlow](https://github.com/yfgug/QQFlow)
+- [hicccc77/WeFlow](https://github.com/hicccc77/WeFlow)（HTTP API 契约、监控/推送语义）
+- [yfgug/QQFlow](https://github.com/yfgug/QQFlow)（QQ NT 库布局与解密参数参考；无 LICENSE，本仓库代码均按行为规格重写，未逐字复制）
 
 ## 免责声明
 
-仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）；QQ 升级可能导致列名/消息格式解析退化（结构化解析优先、启发式兜底，天然容错）。参考实现（yfgug/QQFlow）无 LICENSE，本仓库代码均按行为规格重写，未逐字复制。
+仅供个人学习、研究与本地数据备份。API 仅监听 127.0.0.1；密钥经 HTTP 传入且仅内存保存（不落盘）；鉴权 token 存 OS 凭据库（本地回环场景，非防泄密机制）。
+
+QQ 升级可能导致列名/消息格式解析退化（结构化解析优先、启发式兜底，天然容错）。请遵守法律法规，仅解密**自己**的 QQ 数据。
