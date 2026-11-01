@@ -33,7 +33,7 @@ Types are generated; the behavior layer is handwritten. Never edit `generated/` 
 
 ## Scope
 
-The server is strictly read-only: accounts, sessions, messages, contacts, group members, media export and an SSE push stream.
+Read-only over the user's databases; `sync` is the one state-changing call. Covers all read surfaces plus media export.
 
 This client mirrors that surface one-to-one.
 
