@@ -158,7 +158,10 @@ fn harness_router(
                                 qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
                         {
                             state.init.upsert_db(info);
-                            let _ = qqflow_server::server::begin_indexing(&state, common::FAKE_QQ);
+                            match qqflow_server::server::begin_indexing(&state, common::FAKE_QQ) {
+                                qqflow_server::server::BindOutcome::Bound(_) => {}
+                                _ => panic!("harness re-register must claim the binding"),
+                            }
                             for _ in 0..120 {
                                 let ready =
                                     state.accounts.read().iter().any(|a| a.state.is_ready());

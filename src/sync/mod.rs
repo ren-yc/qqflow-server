@@ -58,6 +58,13 @@ pub struct AccountSync {
     /// awaiting task is aborted — so the flag is what stops it from writing
     /// into a store that no longer belongs to this account.
     stopped: AtomicBool,
+    /// 一次注册的身份复查闭包（由 init_account 注入，持注册令牌）：最终写入
+    /// 点在 **Store 写锁内**调用它——`sync_all` 只在账号处理开始前查一次
+    /// stopped，注销发生在扫描完成与应用之间的窗口由这里封住。旧句柄在注销
+    /// 后仍可被调用（Arc 存活），没有这层复查时旧账号的名字表/媒体回退会把
+    /// 新注册的 store 覆盖掉。None = 未注入（嵌入者直接构造的句柄），复查
+    /// 退化为只看 stopped。
+    registration_guard: Mutex<Option<Box<dyn Fn() -> bool + Send>>>,
     /// Source main db path — derives the `-wal` path the fallback stats.
     db_path: PathBuf,
     /// `nt_db` directory — sibling group-info databases live here (name maps).
@@ -87,11 +94,29 @@ impl AccountSync {
             bus,
             retry: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            registration_guard: Mutex::new(None),
             db_path,
             db_dir,
             key,
             last_wal: Mutex::new(None),
         }
+    }
+
+    /// 注入注册身份复查闭包（生产路径由 init_account 在注册成功后调用）。
+    /// 闭包返回 false = 该句柄所属的注册已失效。
+    pub fn set_registration_guard(&self, guard: Box<dyn Fn() -> bool + Send>) {
+        *self.registration_guard.lock() = Some(guard);
+    }
+
+    /// 这个句柄还允许写共享 Store 吗？stopped（注销停机）与注册令牌复查
+    /// （旧注册借新注册名义写回）任一失败即否。
+    fn may_write_store(&self) -> bool {
+        !self.is_stopped()
+            && self
+                .registration_guard
+                .lock()
+                .as_ref()
+                .is_none_or(|g| g())
     }
 
     /// Retire this account's sync: no further pass may write to the store.
@@ -119,6 +144,12 @@ impl AccountSync {
         };
         let maps = crate::store::names::load_names(conn, &self.db_dir, &self.key, &known);
         let mut guard = self.store.write();
+        // 最终写入在写锁内复查注册身份：耗时读取在锁外做完之后，注销与重注册
+        // 都可能已经发生——旧账号的名字表不能落进（可能已属于）新账号的 store。
+        if !self.may_write_store() {
+            tracing::debug!("[names] refresh discarded: registration no longer current");
+            return;
+        }
         guard.names = maps;
     }
 
@@ -141,6 +172,13 @@ impl AccountSync {
         };
         let index = crate::store::media::scan_cache_index(&root);
         let mut guard = self.store.write();
+        // 复查必须包住 reapply_media_registration 整段：它按旧账号的缓存索引
+        // 改写**当前** store 已有行的媒体登记——只复查 media_fallback 赋值时，
+        // 注销后的旧账号仍能借 reapply 把新账号的行改写掉。
+        if !self.may_write_store() {
+            tracing::debug!("[media-fallback] refresh discarded: registration no longer current");
+            return;
+        }
         guard.media_fallback = index;
         crate::store::index::reapply_media_registration(&mut guard);
     }
@@ -322,16 +360,39 @@ impl SyncEngine {
         Self { accounts: Mutex::new(Vec::new()), watchers: Mutex::new(Default::default()) }
     }
 
-    pub fn register(&self, account: Arc<AccountSync>) {
+    /// Register a sync handle **only when `token_ok` still passes**. Registration
+    /// previously had no guard here at all: an init task whose `install_index`
+    /// check passed could be deregistered before reaching this line, and the
+    /// registration would then push a phantom engine entry whose watch pass
+    /// writes into the just-cleared store. The caller re-checks the same
+    /// registration token the rest of the build carries; a stale token means
+    /// the caller drops the handle instead of registering it.
+    pub fn register_if_current(&self, account: Arc<AccountSync>, token_ok: &dyn Fn() -> bool) -> bool {
+        if !token_ok() {
+            return false;
+        }
         self.accounts.lock().push(account);
+        true
     }
 
     /// Track one account's watch task (replacing any previous handle, which a
-    /// re-registration after a failure produces).
-    pub fn attach_watcher(&self, qq: &str, handle: tokio::task::JoinHandle<Result<()>>) {
+    /// re-registration after a failure produces). Same token gate as
+    /// [`SyncEngine::register_if_current`]: attaching a watcher for a stale
+    /// registration would let the watch pass poll a dead account into a
+    /// cleared store.
+    pub fn attach_watcher_if_current(
+        &self,
+        qq: &str,
+        handle: tokio::task::JoinHandle<Result<()>>,
+        token_ok: &dyn Fn() -> bool,
+    ) -> bool {
+        if !token_ok() {
+            return false;
+        }
         if let Some(old) = self.watchers.lock().insert(qq.to_string(), handle) {
             old.abort();
         }
+        true
     }
 
     /// Remove `qq` from the registry and return its sync handle plus its

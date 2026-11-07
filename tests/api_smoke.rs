@@ -165,6 +165,18 @@ async fn real_test_state() -> (Arc<AppState>, std::path::PathBuf) {
     .await;
     assert_eq!(s, StatusCode::OK, "注册失败: {v}");
     assert_eq!(v["state"], "accepted", "注册必须被受理: {v}");
+    // 诊断：3 秒后打印一次账号状态（定位 indexing 卡住）。
+    {
+        let diag_app = build_router(state.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let (_, dv) = common::get_json(
+            diag_app,
+            "/api/v1/accounts",
+            &[("authorization", "Bearer test-token-123456")],
+        )
+        .await;
+        println!("[real_test_state] t+3s: {dv}");
+    }
     let v = common::wait_account_state(
         &build_router(state.clone()),
         "test-token-123456",
@@ -173,14 +185,48 @@ async fn real_test_state() -> (Arc<AppState>, std::path::PathBuf) {
         std::time::Duration::from_secs(30),
     )
     .await;
-    assert!(
-        common::account_entry(&v, common::FAKE_QQ)["message_count"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        "真实索引必须产出消息: {v}"
-    );
+    let count = common::account_entry(&v, common::FAKE_QQ)["message_count"]
+        .as_u64()
+        .unwrap_or(0);
+    if count == 0 {
+        println!("[real_test_state] NOT ready with count 0: {v}");
+    }
+    assert!(count > 0, "真实索引必须产出消息: {v}");
     (state, root)
+}
+
+/// 退场账号的最终写入不得覆盖当前 store：注销后对旧句柄调 refresh_names，
+/// 名字表必须保持注销后的空态而不被旧账号的数据回写（写锁内复查注册身份）。
+/// 修复前的机制：sync_all 只在账号处理开始前查一次 stopped，注销发生在扫描
+/// 完成与应用之间时，旧句柄的名字表会落进（可能已属于新账号的）store。
+#[tokio::test]
+async fn stale_refresh_after_deregister_does_not_rewrite_names() {
+    let (state, _root) = real_test_state().await;
+    // 旧句柄：注销后 Arc 仍存活（sync_all 的快照、或调用方持有的任何引用）。
+    let stale = state.sync.snapshot().into_iter().next().expect("one account registered");
+    assert!(!stale.is_stopped());
+
+    // 注销：停 sync、清 store、移除绑定。
+    let outcome = qqflow_server::server::deregister_account(&state, common::FAKE_QQ, false);
+    assert!(matches!(
+        outcome,
+        qqflow_server::server::DeregisterOutcome::Deregistered { .. }
+    ));
+    assert!(stale.is_stopped(), "注销会停掉引擎句柄");
+    assert!(state.store.read().names.uid_remark.is_empty(), "注销清空名字表");
+
+    // 旧句柄仍可被调用（Arc 存活），但它的最终写入必须被写锁内的注册身份
+    // 复查丢弃：names 保持空，媒体回退也不会被重建。
+    stale.refresh_names();
+    stale.refresh_media_fallback();
+    assert!(
+        state.store.read().names.uid_remark.is_empty(),
+        "退场句柄不得把旧名字表写回 store"
+    );
+    assert!(
+        state.store.read().media_fallback.is_none(),
+        "退场句柄不得重建媒体回退索引"
+    );
 }
 
 /// Send a GET through `app` and return (status, json).

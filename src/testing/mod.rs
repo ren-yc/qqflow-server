@@ -127,7 +127,7 @@ pub fn ensure_fake_media_file(nt_db_dir: &Path) -> std::path::PathBuf {
 /// plain group rows.
 pub fn seed_dataset(conn: &Connection, extra: u32) {
     // Groups: normal text, recall, system (群名修改), large media blob, miniapp JSON.
-    // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 2051222400).
+    // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2035-01-01 (unix 2051222400，远离 now ± 1 年波动窗口).
     // dir: u_a rows are self-sent (1), u_b/u_c other (0), rename row system (3).
     let ts: i64 = 2051222400;
     let g = |rowid: i64, group: &str, seq: i64, uid: &str, nick: &str, dir: i64, card: &str, blob: &[u8]| {

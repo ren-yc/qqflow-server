@@ -260,7 +260,7 @@ pub async fn handler(
     // serialize here, so a duplicate observes the new state instead of
     // spawning a second initialization, and a different qq loses the race
     // instead of overwriting the winner's index.
-    match begin_indexing(&state, qq) {
+    let registration_token = match begin_indexing(&state, qq) {
         BindOutcome::SameQq(AccountStatus::Ready) => {
             return Ok(reply(
                 "already_ready",
@@ -280,8 +280,8 @@ pub async fn handler(
         BindOutcome::Occupied { qq: in_use, status } => {
             return Ok(conflict(&in_use, status, progress_of(&in_use)))
         }
-        BindOutcome::Bound => {}
-    }
+        BindOutcome::Bound(token) => token,
+    };
 
     // Build the reply BEFORE spawning: `begin_indexing` just set `indexing`,
     // and re-reading the state after the spawn would race the background
@@ -299,7 +299,10 @@ pub async fn handler(
     // Kick off the background build.
     let state_for_init = state.clone();
     let key_owned = key.to_string();
-    tokio::spawn(async move { init_account(&state_for_init, info, key_owned).await });
+    // 令牌来自 begin_indexing 的 Bound 分支（取得绑定的同一临界区内铸造），
+    // 后台任务带着它走到每个可见点复查。
+    let token = registration_token;
+    tokio::spawn(async move { init_account(&state_for_init, info, key_owned, token).await });
     Ok(out)
 }
 

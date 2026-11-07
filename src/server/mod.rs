@@ -114,10 +114,41 @@ pub fn bound_account(accounts: &[AccountState]) -> Option<&AccountState> {
 }
 
 /// Outcome of claiming the single account binding — see [`begin_indexing`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 一次注册的身份令牌：`(epoch, registration_id)` 二元组。
+///
+/// 只靠全局 `epoch` 不够——它是**注销**计数，旧任务在注销后启动会读到**新**
+/// 值而全部通过取消检查（这正是复活缺陷的机制）。`registration_id` 由
+/// `begin_indexing` 在取得绑定的**同一临界区**内铸造并随任务传递：注销时两个
+/// 计数都被推进，任何在飞任务的旧令牌在两处校验点都必失败。任务内部**不得**
+/// 重新推断自己属于哪次注册。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistrationToken {
+    pub epoch: u64,
+    pub registration_id: u64,
+}
+
+impl RegistrationToken {
+    /// The cancellation gate: true when this token no longer describes the
+    /// current registration (deregistered, or a later registration took over).
+    fn is_cancelled(&self, registry: &AccountRegistry) -> bool {
+        let e = registry.epoch.load(Ordering::SeqCst);
+        let r = registry.registration.load(Ordering::SeqCst);
+        let cancelled = e != self.epoch || r != self.registration_id;
+        println!(
+            "[DBG is_cancelled] self=({},{}) registry=({},{}) -> {}",
+            self.epoch, self.registration_id, e, r, cancelled
+        );
+        cancelled
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub enum BindOutcome {
-    /// The binding is now held by this qq and `indexing` was set.
-    Bound,
+    /// The binding is now held by this qq and `indexing` was set. The token
+    /// was minted inside the same critical section that claimed the binding;
+    /// the background build must carry it and verify it at every point where
+    /// its work becomes visible.
+    Bound(RegistrationToken),
     /// This same qq is already registered; nothing changed.
     SameQq(AccountStatus),
     /// A different qq holds the binding; nothing changed.
@@ -163,6 +194,16 @@ pub struct AccountRegistry {
     /// changed, so a build cannot install its index into a store that was
     /// cleared while it ran.
     pub epoch: std::sync::atomic::AtomicU64,
+    /// Bumped by every `begin_indexing` **inside the accounts write-lock
+    /// critical section that claims the binding**. Together with `epoch`
+    /// this forms the registration token handed to the background build:
+    /// a queued `init_account` that starts after its registration was
+    /// deregistered (and another one claimed the binding) reads the NEW
+    /// counters and — under an epoch-only check — would pass every
+    /// cancellation gate and resurrect the account. The token is created
+    /// where the binding is claimed and verified everywhere the build
+    /// becomes visible; it is never re-inferred inside the task.
+    pub registration: std::sync::atomic::AtomicU64,
     /// Watch behavior handed to deferred watch tasks.
     pub watch_cfg: crate::sync::watch::WatchConfig,
     /// Shutdown signal receiver (cloned per deferred watch task).
@@ -185,6 +226,7 @@ impl AccountRegistry {
             accounts_db: Mutex::new(accounts),
             scanned,
             epoch: std::sync::atomic::AtomicU64::new(0),
+            registration: std::sync::atomic::AtomicU64::new(0),
             watch_cfg,
             shutdown,
         }
@@ -294,7 +336,9 @@ fn install_index(
     // 它连基线一起清掉，终态干净），要么 epoch 重验先失败（根本不发布）。
     // 锁序为 store→history 单向：注销侧拿历史锁时不持 store，订阅端读历史时也不持 store，
     // 不存在反向嵌套，不会死锁。
-    if cancelled() {
+    // cancelled 形参承载的是「注册仍有效」谓词（与 sync 引擎令牌闸同一闭包）：
+    // 失效时拒绝安装。
+    if !cancelled() {
         return false;
     }
     *guard = st;
@@ -372,13 +416,15 @@ pub(crate) fn progress_dto(
 fn set_account_state_if_current(
     state: &AppState,
     qq: &str,
-    epoch: u64,
+    token: RegistrationToken,
     status: AccountStatus,
     count: usize,
     error: Option<String>,
 ) -> bool {
     let mut accs = state.accounts.write();
-    if state.init.epoch.load(Ordering::SeqCst) != epoch {
+    // 锁内双计数校验：epoch 或 registration 任一变化都拒绝——「注销后重注册」
+    // 只推进 registration 时的旧任务同样不能借新注册的名义写状态。
+    if token.is_cancelled(&state.init) {
         return false;
     }
     write_account_state(&mut accs, qq, status, count, error);
@@ -434,7 +480,14 @@ pub fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
             )),
         }),
     }
-    BindOutcome::Bound
+    // 铸造令牌：与「取得绑定」同一临界区——`registration` 推进发生在仍持有
+    // accounts 写锁的时刻，此刻任何已派发的后台任务持有的都是旧令牌。
+    let registration_id = state.init.registration.fetch_add(1, Ordering::SeqCst) + 1;
+    let minted = RegistrationToken {
+        epoch: state.init.epoch.load(Ordering::SeqCst),
+        registration_id,
+    };
+    BindOutcome::Bound(minted)
 }
 
 /// Base URL for exported media links (`mediaUrl`). An explicit `override`
@@ -603,6 +656,10 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
     let (talkers, index_cleared) = {
         let mut guard = state.store.write();
         state.init.epoch.fetch_add(1, Ordering::SeqCst);
+        // registration 同步推进：任何还持有旧注册令牌的后台任务（含「排队中、
+        // 尚未首次执行」的 init_account）在下一个校验点全部失效——只推 epoch
+        // 时，注销后启动的旧任务会读到新 epoch 而通过全部检查（复活缺陷的根）。
+        state.init.registration.fetch_add(1, Ordering::SeqCst);
         let talkers: Vec<String> = if purge_media {
             guard.convs.values().map(|c| c.talker.clone()).collect()
         } else {
@@ -655,7 +712,7 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
 /// recoverable by posting a corrected registration to /api/v1/accounts.
 /// The caller (the registration handler) has already flipped the account
 /// to `indexing` synchronously so /health shows it immediately.
-pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
+pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, token: RegistrationToken) {
     let qq = info.qq.clone();
     // 与 `begin_indexing` 创建的是同一份计数：从账号状态里取回 `Arc`，不要另起一份，
     // 否则 HTTP 侧永远读到零。
@@ -665,16 +722,28 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
         .iter()
         .find(|a| a.qq == qq)
         .and_then(|a| a.progress.clone());
-    // Deregistration bumps this. Checked again at both points where the build
-    // would become visible, so a registration that is cancelled mid-flight
-    // cannot resurrect itself: the decrypt + index of a large account takes
-    // seconds to minutes, which is plenty of time for a client to change its
-    // mind, and without this the build would install its index into a store
-    // the operator had just emptied.
-    let epoch = state.init.epoch.load(Ordering::SeqCst);
+    // 取消判据只认**任务参数带来的令牌**：注销推进 epoch、下一次注册推进
+    // registration——两者任一变化都让旧令牌失效。任务启动时重新读计数器的旧形态
+    // （本函数曾经的形态）会让「排队中的初始化」在注销后启动时读到新值而全部通过，
+    // 把刚被注销的账号复活成 ready（回归：
+    // queued_init_cannot_resurrect_after_deregister）。
+    // 这个闭包的语义是「**本次注册仍然有效**」（可继续、可写）：install_index 的
+    // cancelled 判据、sync 引擎的令牌闸与 set_account_state_if_current 全部共用它。
+    // 名字保留 cancelled 是历史形态——install_index 的参数名就叫 cancelled，
+    // 「失效才拒绝」与「有效才放行」是同一个谓词的两种读法。
+    //
+    // 闭包持 **registry 的 Weak**：持 Arc 会形成 AppState → sync → account →
+    // guard → AppState 的引用环，句柄与整个注册机器永不释放（Windows 上
+    // LiveReader 的文件句柄跟着不关，后续对同一目录的清理重建全部踩在打开的
+    // 旧文件上）。registry 死亡时谓词按「已失效」处理。
     let cancelled = {
-        let state = state.clone();
-        move || state.init.epoch.load(Ordering::SeqCst) != epoch
+        let state = Arc::downgrade(state);
+        move || {
+            match state.upgrade() {
+                Some(state) => !token.is_cancelled(&state.init),
+                None => false,
+            }
+        }
     };
 
     let store = state.store.clone();
@@ -723,22 +792,38 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
                 watch_dir.clone(),
                 key.clone(),
             ));
-            state.sync.register(account.clone());
+            // 注册与挂 watcher 都带同一令牌复查（cancelled 闭包）：install 通过
+            // 之后、register 之前注销的窗口此前完全无守卫——幽灵引擎条目的
+            // watch pass 会把死账号的轮询写进刚清空的 store。失败时停掉自己。
+            if !state.sync.register_if_current(account.clone(), &cancelled) {
+                account.stop();
+                tracing::info!("[init] QQ {qq} 注册引擎时已被注销，句柄丢弃");
+                return;
+            }
             // The handle is kept (not dropped as before) so deregistration can
             // abort the task — otherwise it holds the source database and its
             // directory handle open for the rest of the process's life.
             let watcher = tokio::spawn(sync::watch::spawn(
-                account,
+                account.clone(),
                 watch_dir,
                 state.init.watch_cfg.clone(),
                 state.init.shutdown.clone(),
             ));
-            state.sync.attach_watcher(&qq, watcher);
+            if !state.sync.attach_watcher_if_current(&qq, watcher, &cancelled) {
+                account.stop();
+                state.sync.unregister(&qq);
+                tracing::info!("[init] QQ {qq} 挂 watcher 时已被注销，注册回滚");
+                return;
+            }
+            // 注入注册身份复查：此后每一次对共享 Store 的最终写入（名字表、
+            // 媒体回退）都在写锁内先过这道闸。cancelled 持有的正是本任务
+            // 的注册令牌。
+            account.set_registration_guard(Box::new(cancelled));
             // Registering first and checking after means a deregistration that
             // lands in this window is guaranteed to be noticed by one side or
             // the other: either it finds the account in the engine and stops
             // it, or the epoch check below fails and we retire ourselves.
-            if !set_account_state_if_current(state, &qq, epoch, AccountStatus::Ready, count, None) {
+            if !set_account_state_if_current(state, &qq, token, AccountStatus::Ready, count, None) {
                 let (a, w) = state.sync.unregister(&qq);
                 if let Some(a) = a {
                     a.stop();
@@ -759,7 +844,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
             if !set_account_state_if_current(
                 state,
                 &qq,
-                epoch,
+                token,
                 AccountStatus::Error,
                 0,
                 Some(format!("{e:#}")),
@@ -773,7 +858,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String) {
             if !set_account_state_if_current(
                 state,
                 &qq,
-                epoch,
+                token,
                 AccountStatus::Error,
                 0,
                 Some(format!("index task panicked: {e}")),
@@ -1057,8 +1142,9 @@ mod tests {
         let epoch2 = epoch.clone();
         let builder = std::thread::spawn(move || {
             let st = Store { watermark_group: 42, ..Store::default() };
+            // 闭包返回「注册仍有效」：epoch 已变 ⇒ 返回 false ⇒ 安装被拒。
             let installed = install_index(&store2, &bus2, st, move || {
-                epoch2.load(Ordering::SeqCst) != 7
+                epoch2.load(Ordering::SeqCst) == 7
             });
             let _ = done_tx.send(installed);
         });
@@ -1082,7 +1168,7 @@ mod tests {
         let bus = EventBus::new(16);
         let mut rx = bus.subscribe();
         let st = Store { watermark_group: 42, watermark_c2c: 7, ..Store::default() };
-        install_index(&store, &bus, st, || false);
+        install_index(&store, &bus, st, || true);
         assert_eq!(store.read().watermark_group, 42, "store replaced");
         let ev = rx.try_recv().expect("build completion broadcasts a sync baseline").event;
         assert_eq!(ev.event, "sync");
@@ -1155,7 +1241,10 @@ mod tests {
     #[test]
     fn begin_indexing_flips_once_and_guards_duplicates() {
         let state = state_with_account(AccountStatus::AwaitingKey);
-        assert_eq!(begin_indexing(&state, "10001"), BindOutcome::Bound, "first registration proceeds");
+        let _token = match begin_indexing(&state, "10001") {
+            BindOutcome::Bound(t) => t,
+            other => panic!("first registration must claim the binding: {other:?}"),
+        };
         assert_eq!(
             begin_indexing(&state, "10001"),
             BindOutcome::SameQq(AccountStatus::Indexing),
@@ -1202,9 +1291,8 @@ mod tests {
             BindOutcome::Occupied { qq: "10001".into(), status: AccountStatus::Error },
             "error does not free the binding"
         );
-        assert_eq!(
-            begin_indexing(&state, "10001"),
-            BindOutcome::Bound,
+        assert!(
+            matches!(begin_indexing(&state, "10001"), BindOutcome::Bound(_)),
             "the same qq retries after a failure"
         );
     }
@@ -1256,6 +1344,61 @@ mod tests {
         h.clear_items();
         assert!(h.replay_since(0).is_empty(), "buffered events are gone");
         assert_eq!(h.append(test_event("sync")), 3, "ids keep climbing");
+    }
+
+    /// 排队中的 init_task 不得复活已注销的账号：注册令牌在 begin_indexing 的
+    /// 临界区内铸造，任务带着它走到每个可见点复查；注销推进两个计数器，旧令牌
+    /// 全部失效。修复前的机制：任务启动时**重新读取**全局 epoch——注销后启动
+    /// 读到新值，全部取消检查通过，账号被写回 ready。
+    #[test]
+    fn queued_init_cannot_resurrect_after_deregister() {
+        let state = state_with_account(AccountStatus::AwaitingKey);
+        let qq = "10001";
+        // 铸造令牌（begin_indexing 的 Bound 分支）。
+        let token = match begin_indexing(&state, qq) {
+            BindOutcome::Bound(t) => t,
+            other => panic!("claim the binding first: {other:?}"),
+        };
+        // 注销完整执行：双计数推进、绑定移除。
+        assert!(matches!(
+            deregister_account(&state, qq, false),
+            DeregisterOutcome::Deregistered { .. }
+        ));
+        assert!(bound_account(&state.accounts.read()).is_none());
+
+        // 等价于「排队中的 init_task 此时才获得首次执行机会」：用**旧令牌**走
+        // 全部可见点——每一个都必须拒绝。
+        assert!(
+            !set_account_state_if_current(&state, qq, token, AccountStatus::Ready, 8, None),
+            "旧令牌不得把注销账号写回 ready"
+        );
+        assert!(bound_account(&state.accounts.read()).is_none(), "状态写入被拒后绑定仍为空");
+        assert!(
+            state.store.read().convs.is_empty(),
+            "store 不得被旧令牌的索引填充"
+        );
+
+        // 注销后立即注册**别的账号**：旧令牌同样失效（registration 已被重注册推进）。
+        state.accounts.write().push(AccountState {
+            qq: "10002".into(),
+            state: AccountStatus::AwaitingKey,
+            message_count: 0,
+            error: None,
+            progress: None,
+        });
+        assert!(matches!(
+            begin_indexing(&state, "10002"),
+            BindOutcome::Bound(_)
+        ));
+        assert!(
+            !set_account_state_if_current(&state, "10002", token, AccountStatus::Ready, 8, None),
+            "旧令牌不得借新注册的名义写状态"
+        );
+        let accs = state.accounts.read();
+        let bound = bound_account(&accs).unwrap();
+        assert_eq!(bound.qq, "10002");
+        assert_ne!(bound.state, AccountStatus::Ready, "新账号不被旧令牌写成 ready");
+        drop(accs);
     }
 
     #[tokio::test]
@@ -1394,12 +1537,23 @@ mod tests {
 
         // The in-flight build now tries to publish its result.
         assert!(
-            !set_account_state_if_current(&state, "10001", epoch, AccountStatus::Ready, 500, None),
+            !set_account_state_if_current(
+                &state,
+                "10001",
+                RegistrationToken { epoch, registration_id: state.init.registration.load(Ordering::SeqCst) },
+                AccountStatus::Ready,
+                500,
+                None,
+            ),
             "a stale build must not resurrect the account"
         );
         assert!(state.accounts.read().is_empty(), "still unbound");
-        // A registration started AFTER the deregistration still works.
-        let fresh = state.init.epoch.load(Ordering::SeqCst);
+        // A registration started AFTER the deregistration still works: mint a
+        // fresh token the way begin_indexing would (both counters advanced).
+        let fresh = RegistrationToken {
+            epoch: state.init.epoch.load(Ordering::SeqCst),
+            registration_id: state.init.registration.load(Ordering::SeqCst),
+        };
         assert!(set_account_state_if_current(&state, "10001", fresh, AccountStatus::Ready, 3, None));
     }
 
