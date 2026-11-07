@@ -2,31 +2,63 @@
   "body": {
     "contacts": [
       {
-        "alias": "",
+        "alias": "10001",
         "avatarUrl": "",
-        "displayName": "张三",
+        "displayName": "张三备注",
         "nickname": "张三",
-        "remark": "",
+        "remark": "张三备注",
         "type": "friend",
         "username": "u_a"
       },
       {
-        "alias": "",
+        "alias": "10002",
         "avatarUrl": "",
         "displayName": "李四",
         "nickname": "李四",
         "remark": "",
         "type": "friend",
         "username": "u_b"
+      },
+      {
+        "alias": "12345",
+        "avatarUrl": "",
+        "displayName": "李四他哥",
+        "nickname": "王五",
+        "remark": "李四他哥",
+        "type": "friend",
+        "username": "u_12345"
+      },
+      {
+        "alias": "",
+        "avatarUrl": "",
+        "displayName": "王五",
+        "nickname": "王五",
+        "remark": "",
+        "type": "friend",
+        "username": "u_c"
       }
     ],
-    "count": 2,
+    "count": 4,
     "hasMore": false,
     "success": true,
-    "total": 2
+    "total": 4
   },
   "keys": [
     "contacts",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "nickname",
+    "remark",
+    "type",
+    "username",
+    "alias",
+    "avatarUrl",
+    "displayName",
+    "nickname",
+    "remark",
+    "type",
+    "username",
     "alias",
     "avatarUrl",
     "displayName",

@@ -127,9 +127,9 @@ pub fn ensure_fake_media_file(nt_db_dir: &Path) -> std::path::PathBuf {
 /// plain group rows.
 pub fn seed_dataset(conn: &Connection, extra: u32) {
     // Groups: normal text, recall, system (群名修改), large media blob, miniapp JSON.
-    // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 1782864000).
+    // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 2051222400).
     // dir: u_a rows are self-sent (1), u_b/u_c other (0), rename row system (3).
-    let ts: i64 = 1782864000;
+    let ts: i64 = 2051222400;
     let g = |rowid: i64, group: &str, seq: i64, uid: &str, nick: &str, dir: i64, card: &str, blob: &[u8]| {
         conn.execute(
             "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -188,7 +188,7 @@ pub fn build_source_with_rows(nt_db_dir: &Path, rows: usize) -> std::path::PathB
 
     let per = rows / BULK_GROUPS;
     let last = rows - per * (BULK_GROUPS - 1);
-    let ts: i64 = 1782864000;
+    let ts: i64 = 2051222400;
     // 一个事务包住全部插入：十万级行数下逐条自动提交要慢一个量级，而造库在 CI 的
     // 关键路径上（`unchecked_transaction` 取 &Connection，与既有助手签名相容）。
     let tx = conn.unchecked_transaction().unwrap();
@@ -222,7 +222,7 @@ pub fn build_source_with_rows(nt_db_dir: &Path, rows: usize) -> std::path::PathB
 /// Append one group row into group 10001 (simulating a new QQ message
 /// written by the live client).
 pub fn append_group_row(conn: &Connection, n: i64, text: &str) {
-    let ts: i64 = 1782864000;
+    let ts: i64 = 2051222400;
     conn.execute(
         "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params!["10001", (ts << 32) | n, "u_a", "张三", text.as_bytes(), 1, ts, "张三群名片"],
@@ -248,7 +248,7 @@ pub fn seed_reply_rows(conn: &Connection) {
          UPDATE group_msg_table SET \"40003\" = rowid WHERE \"40003\" IS NULL;",
     )
     .unwrap();
-    let ts: i64 = 1782864000;
+    let ts: i64 = 2051222400;
     let reply = |n: i64, inner: i64, target: i64| {
         conn.execute(
             "INSERT INTO group_msg_table (\"40021\", \"40001\", \"40020\", \"40093\", \"40800\", \"40013\", \"40050\", \"40090\", \"40003\", \"40850\") \
@@ -335,7 +335,7 @@ pub fn image_blob(md5_hex: &str, local_path: &Path) -> Vec<u8> {
 pub fn append_image_row(conn: &Connection, n: i64, nt_db_dir: &Path) -> String {
     let md5 = "aabbccddeeff00112233445566778899";
     let blob = image_blob(md5, &fake_media_path(nt_db_dir));
-    let ts: i64 = 1782864000;
+    let ts: i64 = 2051222400;
     conn.execute(
         "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params!["10001", (ts << 32) | n, "u_c", "王五", blob, 0, ts, ""],
@@ -367,7 +367,7 @@ pub fn image_blob_no_local(md5_hex: &str, file_name: &str) -> Vec<u8> {
 /// cache-fallback case). Returns the row's media key (md5 hex).
 pub fn append_image_row_no_local(conn: &Connection, n: i64, md5: &str, file_name: &str) -> String {
     let blob = image_blob_no_local(md5, file_name);
-    let ts: i64 = 1782864000;
+    let ts: i64 = 2051222400;
     conn.execute(
         "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params!["10001", (ts << 32) | n, "u_c", "王五", blob, 0, ts, ""],
