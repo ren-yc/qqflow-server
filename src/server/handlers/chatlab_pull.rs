@@ -26,8 +26,82 @@ pub struct Params {
     pub end: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
+    /// 不透明进度游标（`opaqueCursor` 能力）：原样回传由本端点编出的
+    /// `sync.nextCursor`。给出时覆盖 `since`/`offset`——进度游标是权威起点。
+    pub cursor: Option<String>,
     #[serde(default)]
     pub access_token: Option<String>,
+}
+
+/// 编码不透明进度游标：`v1.<epoch>.<rowid>` 的 base64。内容对客户端不透明；
+/// 排他性由 rowid 保证（比它小的行已全部交付），账号代次保证跨代次的旧游标
+/// 被识别为「从头拉取」而不是「错误续页」。
+fn encode_cursor(epoch: u64, rowid: i64) -> String {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    let _ = write!(buf, "v1.{}.{}", epoch, rowid);
+    base64_simply(&buf)
+}
+
+/// 解码本端点编出的游标；无法识别（外部来源/损坏/代次不匹配）返回 None，
+/// 调用方退回时间模式——不是错误，兼容期客户端可能仍用 `nextSince`。
+fn decode_cursor(cursor: &str, epoch: u64) -> Option<i64> {
+    let raw = decode_base64_simply(cursor)?;
+    let text = String::from_utf8(raw).ok()?;
+    let rest = text.strip_prefix("v1.")?;
+    let mut parts = rest.splitn(2, '.');
+    let token_epoch: u64 = parts.next()?.parse().ok()?;
+    let rowid: i64 = parts.next()?.parse().ok()?;
+    // 跨代次的游标 = 旧账号的进度线，新账号上不存在——从头拉取。
+    if token_epoch != epoch {
+        return Some(0);
+    }
+    Some(rowid)
+}
+
+/// 无依赖 base64（stdlib only，与服务端其余部分一致）：标准字母表 + padding。
+fn base64_simply(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn decode_base64_simply(text: &str) -> Option<Vec<u8>> {
+    const REV: fn(u8) -> Option<u32> = |c| match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+        b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let bytes: Vec<u8> = text.bytes().filter(|b| *b != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= REV(*c)? << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 pub async fn handler(
@@ -53,6 +127,12 @@ pub async fn handler(
     let since = params.since.as_deref().and_then(|s| parse_time_bound(s, false));
     let end = params.end.as_deref().and_then(|s| parse_time_bound(s, true));
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    // 进度游标模式：给出 `cursor` 时它取代 since/offset 成为权威起点。游标里的
+    // 账号代次与本端不匹配时按「从头拉取」处理（旧账号的进度线在新账号上不存在）。
+    let cursor_rowid = params
+        .cursor
+        .as_deref()
+        .and_then(|c| decode_cursor(c, state.init.epoch.load(std::sync::atomic::Ordering::SeqCst)));
 
     let store = state.store.read();
     // find_conversation falls back to the other chat type when the primary
@@ -72,6 +152,11 @@ pub async fn handler(
         .into_iter()
         .filter(|&i| {
             let m = &conv.msgs[i];
+            // 进度游标是权威起点：给出时忽略 since/offset（时间只是元数据，
+            // 入库进度才是增量判据）。排空后同秒晚入库的行由 rowid 排他性覆盖。
+            if let Some(rid) = cursor_rowid {
+                return m.rowid > rid && end.is_none_or(|e| m.ts <= e);
+            }
             since.is_none_or(|s| m.ts > s) && end.is_none_or(|e| m.ts <= e)
         })
         .collect();
@@ -79,7 +164,8 @@ pub async fn handler(
     let total = filtered.len();
     // Page from `offset`, extending to the end of the last second's ts
     // group: pages never split a second, so `nextSince` strictly advances.
-    let start = offset.min(total);
+    // 进度游标模式下 offset 无意义（游标已定位到行），恒从 0 开始。
+    let start = if cursor_rowid.is_some() { 0 } else { offset.min(total) };
     let mut page_end = start;
     let mut prev_ts = None;
     while page_end < total {
@@ -197,6 +283,11 @@ pub async fn handler(
         .unwrap_or_default();
 
     let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
+    // 进度游标恒编码**页末行**（排空时=最后交付行）的 rowid：它是下一次增量的
+    // 排他起点，排空后仍在场（进度游标不终结）。排空后同秒晚入库的行 rowid
+    // 更大，续拉必然可达——这正是时间游标补不上的盲区。
+    let last_rowid = page.last().map(|&i| conv.msgs[i].rowid).unwrap_or(cursor_rowid.unwrap_or(0));
+    let next_cursor = encode_cursor(state.init.epoch.load(std::sync::atomic::Ordering::SeqCst), last_rowid);
     let body = serde_json::to_value(PullEnvelope {
         chatlab: crate::server::chatlab::header(),
         members,
@@ -209,6 +300,7 @@ pub async fn handler(
         ),
         sync: PullSync {
             has_more,
+            next_cursor: Some(next_cursor),
             next_since: if has_more { next_since } else { watermark },
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the

@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, Request};
+use axum::response::IntoResponse;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -144,6 +145,63 @@ fn harness_router(
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 // 追加一条新消息：像运行中的 QQ 那样写进源库，再 materialize，
                 // 让活连接看得见（与 fs_watch_e2e 同一手法）。
+                // 游标相对追加（opaqueCursor 用例）：向 cursor 表达的入库进度
+                // **之后**追加一条新消息（seq 用递增序号保证唯一），回显新行的
+                // platformMessageId（QQFlow 侧即 seq 字符串）。cursor 本身编码
+                // rowid——入库进度之后 = rowid 更大，同一秒或更晚都可。
+                if v["action"].as_str() == Some("harness.append_message_at_cursor") {
+                    let usable = state.accounts.read().iter().any(|a| {
+                        a.state.is_ready()
+                            || a.state == qqflow_server::server::AccountStatus::Indexing
+                    });
+                    if !usable
+                        && let Some(info) =
+                            qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
+                    {
+                        state.init.upsert_db(info);
+                        if let qqflow_server::server::BindOutcome::Bound(_) =
+                            qqflow_server::server::begin_indexing(&state, common::FAKE_QQ)
+                        {
+                            for _ in 0..120 {
+                                if state.accounts.read().iter().any(|a| a.state.is_ready()) {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                        }
+                    }
+                    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let new_seq = ((2051222400i64 + 120) << 32) | (9000 + seq);
+                    let writer = writer.clone();
+                    let ins = tokio::task::spawn_blocking(move || {
+                        let conn = writer.lock();
+                        conn.execute(
+                            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            rusqlite::params![
+                                "10001",
+                                new_seq,
+                                "u_a",
+                                "张三",
+                                b"cursor-boundary append".as_slice(),
+                                1,
+                                2051222400i64 + 120,
+                                "张三群名片"
+                            ],
+                        )
+                    })
+                    .await;
+                    if let Ok(Err(e)) = &ins {
+                        println!("[harness] 游标追加失败：{e}");
+                    }
+                    common::materialize_source(&nt_db);
+                    let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
+                    // 回显新行的 id（用例经 save 取回作为 appended_id 基准）。
+                    return axum::Json(serde_json::json!({
+                        "success": true,
+                        "id": new_seq.to_string()
+                    }))
+                    .into_response();
+                }
                 if v["action"].as_str() == Some("harness.append_message") {
                         // **前提恢复**：用例之间必须互相独立，而 `sse-deregister-replay` 会注销
                         // 账号 —— 它字母序在前，于是一部分用例在「没有账号」的环境里跑。
@@ -211,7 +269,7 @@ fn harness_router(
                         // 成为确定的事，而不是等 Watcher 的时序。
                         let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
                 }
-                axum::http::StatusCode::OK
+                axum::http::StatusCode::OK.into_response()
             }
         }),
     )
@@ -219,7 +277,7 @@ fn harness_router(
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.8.0";
+const CONTRACT_VERSION: &str = "0.9.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
@@ -320,6 +378,9 @@ async fn conformance_suite_passes() {
             "harness": "/__harness",
             "group-members": "/api/v1/group-members",
             "health": "/health",
+            // 媒体字节端点（mediaById 能力的落点，契约用例
+            // nails-media-id-fetch-succeeds 按句柄取字节）。
+            "media": "/api/v1/media/{id}",
             "messages": "/api/v1/messages",
             "messages_chatlab": "/chatlab/messages",
             "pull": "/chatlab/sessions/{id}/messages",
@@ -334,9 +395,15 @@ async fn conformance_suite_passes() {
             "private_with_messages": { "id": "u_12345", "expect": { "messages": 2 } },
             "same_second_burst": { "id": "10001", "expect": { "same_second": 5 } },
             "unknown": { "id": "999999999", "expect": {} },
+            // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
+            // 夹具造库时写入的 fake_image_01.jpg，句柄即 mediaId 本身。
+            "exported_media": { "id": "aabbccddeeff00112233445566778899", "expect": {} },
         },
         "capabilities": {
             "mediaById": true,
+            // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
+            // 排空后同秒晚入库的行可经游标续拉到达。
+            "opaqueCursor": true,
             // 本仓库没有回调面（SNS 是微信侧的），如实置 false。
             "sns": false,
                         // 名册来源是 `group_info.db` 的 `group_member3`（见 `store::group_meta`）。
