@@ -158,17 +158,27 @@ fn harness_router(
                         && let Some(info) =
                             qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
                     {
-                        state.init.upsert_db(info);
-                        if let qqflow_server::server::BindOutcome::Bound(_) =
-                            qqflow_server::server::begin_indexing(&state, common::FAKE_QQ)
-                        {
-                            for _ in 0..120 {
-                                if state.accounts.read().iter().any(|a| a.state.is_ready()) {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        // 恢复前提走**完整注册机器**：绑定（铸造令牌）→ await
+                        // init_account（直接 await 到 set_ready 完成，没有后台
+                        // 任务）→ 等 ready。等待超时即失败——前提没恢复时追加
+                        // 的消息没人索引，用例会在 SSE/续拉断言上以更难定位的
+                        // 形态红；这里直接失败并点名根因。
+                        state.init.upsert_db(info.clone());
+                        let token = match qqflow_server::server::begin_indexing(&state, common::FAKE_QQ) {
+                            qqflow_server::server::BindOutcome::Bound(t) => t,
+                            other => panic!("harness re-register must claim the binding, got {other:?}"),
+                        };
+                        let key = common::FAKE_KEY.to_string();
+                        qqflow_server::server::init_account(&state, info, key, token).await;
+                        let mut ready = false;
+                        for _ in 0..120 {
+                            if state.accounts.read().iter().any(|a| a.state.is_ready()) {
+                                ready = true;
+                                break;
                             }
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }
+                        assert!(ready, "harness 重新注册后 30 秒内必须 ready");
                     }
                     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let new_seq = ((2051222400i64 + 120) << 32) | (9000 + seq);
@@ -215,19 +225,27 @@ fn harness_router(
                             && let Some(info) =
                                 qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
                         {
-                            state.init.upsert_db(info);
-                            match qqflow_server::server::begin_indexing(&state, common::FAKE_QQ) {
-                                qqflow_server::server::BindOutcome::Bound(_) => {}
-                                _ => panic!("harness re-register must claim the binding"),
-                            }
+                            // 恢复前提走**完整注册机器**：绑定（铸造令牌）→ await
+                            // init_account（直接 await 到 set_ready 完成，没有
+                            // 后台任务）→ 等 ready。等待超时即失败——前提没恢复
+                            // 时追加的消息没人索引，用例会在 SSE 断言上以更难
+                            // 定位的形态红；这里直接失败并点名根因。
+                            state.init.upsert_db(info.clone());
+                            let token = match qqflow_server::server::begin_indexing(&state, common::FAKE_QQ) {
+                                qqflow_server::server::BindOutcome::Bound(t) => t,
+                                other => panic!("harness re-register must claim the binding, got {other:?}"),
+                            };
+                            let key = common::FAKE_KEY.to_string();
+                            qqflow_server::server::init_account(&state, info, key, token).await;
+                            let mut ready = false;
                             for _ in 0..120 {
-                                let ready =
-                                    state.accounts.read().iter().any(|a| a.state.is_ready());
-                                if ready {
+                                if state.accounts.read().iter().any(|a| a.state.is_ready()) {
+                                    ready = true;
                                     break;
                                 }
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             }
+                            assert!(ready, "harness 重新注册后 30 秒内必须 ready");
                             println!("[harness] 账号不在（前面的用例注销了它），已重新注册");
                         }
                         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
