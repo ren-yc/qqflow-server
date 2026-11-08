@@ -54,6 +54,8 @@ pub enum Kind {
     Messages,
     /// 按导出文件名取字节（**唯一**的字节面）。
     MediaById,
+    /// Export one uniquely identified message's local media.
+    MediaExport,
     /// 会话列表：**原生形状**（ChatLab 形状走 ChatlabSessions）。
     Sessions,
     /// 游标拉取面（本身即 ChatLab 形状）。
@@ -105,6 +107,7 @@ pub const ROUTES: &[Route] = &[
     // （POST 读请求与 GET 完全等价）。动作端点（注册、同步）与免鉴权的 /health 保留两个方法。
     Route { path: "/api/v1/messages", kind: Kind::Messages, methods: GET_ONLY },
     Route { path: "/api/v1/media/{id}", kind: Kind::MediaById, methods: GET_ONLY },
+    Route { path: "/api/v1/media/export", kind: Kind::MediaExport, methods: &[Method::Post] },
     Route { path: "/api/v1/sessions", kind: Kind::Sessions, methods: GET_ONLY },
     Route { path: "/api/v1/sessions/{id}/messages", kind: Kind::SessionsPull, methods: GET_ONLY },
     Route { path: "/api/v1/contacts", kind: Kind::Contacts, methods: GET_ONLY },
@@ -148,6 +151,7 @@ pub fn method_router(kind: Kind) -> MethodRouter<Arc<AppState>> {
         Kind::AccountItem => axum::routing::delete(accounts::delete_handler),
         Kind::Messages => get(messages::handler),
         Kind::MediaById => get(media::handler),
+        Kind::MediaExport => axum::routing::post(media_export::handler),
         Kind::Sessions => get(sessions::handler),
         Kind::SessionsPull => get(chatlab_pull::handler),
         Kind::Contacts => get(contacts::handler),

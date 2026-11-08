@@ -407,6 +407,7 @@ async fn conformance_suite_passes() {
             // 媒体字节端点（mediaById 能力的落点，契约用例
             // nails-media-id-fetch-succeeds 按句柄取字节）。
             "media": "/api/v1/media/{id}",
+            "media_export": "/api/v1/media/export",
             "messages": "/api/v1/messages",
             "messages_chatlab": "/chatlab/messages",
             "pull": "/chatlab/sessions/{id}/messages",
@@ -424,9 +425,13 @@ async fn conformance_suite_passes() {
             // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
             // 夹具造库时写入的 fake_image_01.jpg，句柄即 mediaId 本身。
             "exported_media": { "id": "aabbccddeeff00112233445566778899", "expect": {} },
+            "targeted_media": {"id":"10001", "expect":{
+                "platformMessageId": ((2051222400i64 << 32) | 7).to_string(),
+                "sender":"u_c", "timestamp":2051222400i64}},
         },
         "capabilities": {
             "mediaById": true,
+            "mediaExportByMessage": true,
             // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
             // 排空后同秒晚入库的行可经游标续拉到达。
             "opaqueCursor": true,

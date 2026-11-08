@@ -51,6 +51,8 @@ __all__ = [
     "IndexProgressDto",
     "MediaBrief",
     "MediaEnvelope",
+    "MediaExportRequest",
+    "MediaExportResult",
     "MediaInfo",
     "MessageOut",
     "MessagesNative",
@@ -108,6 +110,8 @@ from qqflow_sdk.generated.qqflow_sdk.models.health import Health as Health
 from qqflow_sdk.generated.qqflow_sdk.models.index_progress_dto import IndexProgressDto as IndexProgressDto
 from qqflow_sdk.generated.qqflow_sdk.models.media_brief import MediaBrief as MediaBrief
 from qqflow_sdk.generated.qqflow_sdk.models.media_envelope import MediaEnvelope as MediaEnvelope
+from qqflow_sdk.generated.qqflow_sdk.models.media_export_request import MediaExportRequest as MediaExportRequest
+from qqflow_sdk.generated.qqflow_sdk.models.media_export_result import MediaExportResult as MediaExportResult
 from qqflow_sdk.generated.qqflow_sdk.models.media_info import MediaInfo as MediaInfo
 from qqflow_sdk.generated.qqflow_sdk.models.message_out import MessageOut as MessageOut
 from qqflow_sdk.generated.qqflow_sdk.models.messages_native import MessagesNative as MessagesNative

@@ -4,8 +4,18 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 新增 `POST /api/v1/media/export`，按完整消息身份恢复窗口外的本地媒体，返回实际摘要句柄；歧义、源缺失和导出失败保留不同错误状态。回归：`targeted_export_restores_old_media_with_actual_extension_and_handle`。
+- Rust 和 Python SDK 新增 `export_media_by_message`；媒体恢复最多触发一次定向导出。CLI 采用同一接口并按消息身份回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
+
+### 破坏性变更
+
+- 自动媒体恢复改用定向接口；旧服务缺少该能力时显式报错，源不可恢复时 CLI 导出返回失败。迁移：服务与 SDK/CLI 同步升级，调用方处理 404、409 和 422。回归：`targeted_export_reports_missing_server_capability`、`with_media_reports_an_unrecoverable_source`。
+
 ### 修复
 
+- 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_export_cancels_staged_bytes_after_account_switch`。
 - 账号注销与初始化最终提交串行化；旧任务不能重挂 watcher、置为就绪或移除后来的注册，拒绝的 watcher 显式取消。回归：`lifecycle_commit_excludes_deregister_through_watcher_and_ready`、`stale_cleanup_and_watcher_cannot_remove_new_registration`。
 - 账号路径只在取得绑定后登记，避免被并发失败请求覆盖。排队中的旧初始化不能替换新索引。回归：`source_path_only_changes_for_winning_binding`、`queued_initialization_cannot_replace_a_new_account_index`。
 

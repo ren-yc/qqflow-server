@@ -47,6 +47,8 @@ use utoipa::openapi::{Components, OpenApi, OpenApiBuilder};
     crate::server::dto::ChatlabMessages,
     crate::server::dto::MediaBrief,
     crate::server::dto::MediaEnvelope,
+    crate::server::dto::MediaExportRequest,
+    crate::server::dto::MediaExportResult,
     crate::server::dto::MessagesNative,
     crate::server::dto::NotificationFrame,
     crate::server::dto::Page,
@@ -94,6 +96,7 @@ type Ep = (&'static str, HttpMethod, Media, &'static str);
 ///
 /// 字节面与 SSE 面进不了 golden 端点清单，由本表收录。
 const ENDPOINTS: &[Ep] = &[
+    ("/api/v1/media/export", HttpMethod::Post, Media::Json(&["MediaExportResult"]), "按会话、消息 ID、发送者及时间唯一定位并导出本地媒体。"),
     ("/health", HttpMethod::Get, Media::Json(&["Health"]), ""),
     ("/health", HttpMethod::Post, Media::Json(&["Health"]), ""),
     ("/api/v1/health", HttpMethod::Get, Media::Json(&["Health"]), ""),
@@ -271,6 +274,19 @@ pub fn document() -> OpenApi {
             "operationId": op_id,
             "responses": { "200": success_response(media) },
         });
+        if *path == "/api/v1/media/export" {
+            op["requestBody"] = serde_json::json!({
+                "required": true,
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MediaExportRequest"}}}
+            });
+            for (code, description) in [
+                ("400", "请求字段缺失或非法"), ("401", "未鉴权"), ("404", "目标或原始媒体不存在"),
+                ("409", "目标不唯一或数据源切换"), ("422", "没有可导出的本地媒体"),
+                ("500", "实际读取或导出失败"), ("503", "账号尚未就绪"),
+            ] {
+                op["responses"][code] = serde_json::json!({"description": description});
+            }
+        }
         let params = path_params(path);
         if params.as_array().is_some_and(|a| !a.is_empty()) {
             op["parameters"] = params;

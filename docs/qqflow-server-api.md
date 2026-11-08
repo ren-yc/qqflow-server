@@ -369,6 +369,39 @@ curl -H "Authorization: Bearer <token>" \
 - `isOwner` 由群详情解析；群主不在本页时全为 `false`。`isFriend` 在本仓**恒为 `false`**（v1 不解析好友关系）。
 - `fromCache` 恒为 `false`：本请求既不读盘、也不触发同步。`updatedAt` 是索引构建/更新完成时刻，毫秒。
 
+### POST `/api/v1/media/export` — 定向导出消息媒体
+
+在当前账号整个会话中唯一定位目标，并导出可取的本地字节。
+
+**请求**
+
+```bash
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"talker":"<session-id>","platformMessageId":"<message-id>","sender":"<sender-id>","timestamp":1700000000}' \
+  "http://127.0.0.1:5032/api/v1/media/export"
+```
+
+将 `<session-id>`、`<message-id>` 和 `<sender-id>` 替换为消息所在会话、消息 ID 和发送者 ID。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `talker` | string | 是 | 会话 ID |
+| `platformMessageId` | string | 是 | 平台消息 ID |
+| `sender` | string | 是 | 发送者 ID |
+| `timestamp` | integer | 是 | 发送时刻，Unix 秒 |
+
+**响应**
+
+```json
+{"success":true,"mediaId":"<digest>.png","fileName":"<digest>.png","mediaUrl":"/api/v1/media/<digest>.png"}
+```
+
+- 返回实际文件名和不含凭据的根相对地址；随后通过 `GET /api/v1/media/{id}` 取字节。接口不下载任意外链。
+- 字段非法为 400、未鉴权为 401、目标或源文件缺失为 404、目标不唯一或注册切换为 409。
+- 无可导出的本地媒体为 422、读取或导出失败为 500、账号未就绪为 503。旧消息不受默认分页大小限制。
+
 ### GET `/api/v1/media/{id}` — 按 id 取媒体字节（唯一的字节面）
 
 `{id}` 是 store 键或导出文件名，也就是消息的 `media.fileName` 或 `mediaId`。

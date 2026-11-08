@@ -711,6 +711,56 @@
           ],
           "type": "object"
         },
+        "MediaExportRequest": {
+          "additionalProperties": false,
+          "description": "Locate exactly one media-bearing message in the bound account.",
+          "properties": {
+            "platformMessageId": {
+              "type": "string"
+            },
+            "sender": {
+              "type": "string"
+            },
+            "talker": {
+              "type": "string"
+            },
+            "timestamp": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "platformMessageId",
+            "sender",
+            "talker",
+            "timestamp"
+          ],
+          "type": "object"
+        },
+        "MediaExportResult": {
+          "description": "A local export whose actual filename is also its credential-free handle.",
+          "properties": {
+            "fileName": {
+              "type": "string"
+            },
+            "mediaId": {
+              "type": "string"
+            },
+            "mediaUrl": {
+              "type": "string"
+            },
+            "success": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "fileName",
+            "mediaId",
+            "mediaUrl",
+            "success"
+          ],
+          "type": "object"
+        },
         "MediaInfo": {
           "description": "Media metadata parsed from a structured message segment (image/voice/\nvideo) — field ids per the upstream 40800 analysis (45424 md5 hex,\n45405 size, 45411/45412 dims, 45503 uuid, 45812 local cache path, CDN\nurls 45802/45803/45804). All optional: absent fields stay absent.",
           "properties": {
@@ -1476,6 +1526,55 @@
           }
         }
       },
+      "/api/v1/media/export": {
+        "post": {
+          "description": "按会话、消息 ID、发送者及时间唯一定位并导出本地媒体。",
+          "operationId": "post__api_v1_media_export",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaExportRequest"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/MediaExportResult"
+                  }
+                }
+              },
+              "description": "成功"
+            },
+            "400": {
+              "description": "请求字段缺失或非法"
+            },
+            "401": {
+              "description": "未鉴权"
+            },
+            "404": {
+              "description": "目标或原始媒体不存在"
+            },
+            "409": {
+              "description": "目标不唯一或数据源切换"
+            },
+            "422": {
+              "description": "没有可导出的本地媒体"
+            },
+            "500": {
+              "description": "实际读取或导出失败"
+            },
+            "503": {
+              "description": "账号尚未就绪"
+            }
+          }
+        }
+      },
       "/api/v1/media/{id}": {
         "get": {
           "description": "字节面：`id` 是 store 键（md5 hex / uuid，直服本地缓存）或**导出文件名**（`media=1` 写进导出根的文件，按名在四个类型目录下解析）。同名多命中时内容一致才服务、不一致 404；未命中统一「媒体不存在」。",
@@ -2142,6 +2241,34 @@
     "type",
     "required",
     "type",
+    "MediaExportRequest",
+    "additionalProperties",
+    "description",
+    "properties",
+    "platformMessageId",
+    "type",
+    "sender",
+    "type",
+    "talker",
+    "type",
+    "timestamp",
+    "format",
+    "type",
+    "required",
+    "type",
+    "MediaExportResult",
+    "description",
+    "properties",
+    "fileName",
+    "type",
+    "mediaId",
+    "type",
+    "mediaUrl",
+    "type",
+    "success",
+    "type",
+    "required",
+    "type",
     "MediaInfo",
     "description",
     "properties",
@@ -2563,6 +2690,37 @@
     "application/json",
     "schema",
     "$ref",
+    "description",
+    "/api/v1/media/export",
+    "post",
+    "description",
+    "operationId",
+    "requestBody",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "required",
+    "responses",
+    "200",
+    "content",
+    "application/json",
+    "schema",
+    "$ref",
+    "description",
+    "400",
+    "description",
+    "401",
+    "description",
+    "404",
+    "description",
+    "409",
+    "description",
+    "422",
+    "description",
+    "500",
+    "description",
+    "503",
     "description",
     "/api/v1/media/{id}",
     "get",
