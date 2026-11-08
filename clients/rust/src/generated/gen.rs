@@ -706,6 +706,16 @@ QQ 会清理媒体缓存：缓存里的文件没了，这个键就跟着消失�
     pub struct PullSync {
         #[serde(rename = "hasMore")]
         pub has_more: bool,
+        /**不透明进度游标（`opaqueCursor` 能力）：编码入库进度（账号代次 + 会话 +
+唯一行标识），客户端原样回传、不得解析。排空后仍在场且非空——进度游标
+不终结（与消息面 `page.nextCursor` 排空为 null 的约定不同），它是下一次
+增量请求的起点。时间游标的盲区（排空后同秒晚入库的行永远落在
+`nextSince` 之后）由它补上。*/
+        #[serde(
+            rename = "nextCursor",
+            skip_serializing_if = "::std::option::Option::is_none"
+        )]
+        pub next_cursor: ::std::option::Option<::std::string::String>,
         #[serde(rename = "nextOffset")]
         pub next_offset: u64,
         #[serde(rename = "nextSince")]
