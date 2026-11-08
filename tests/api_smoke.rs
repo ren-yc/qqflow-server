@@ -2514,6 +2514,9 @@ mod golden {
         // 由 `chrono::Utc::now()` 派生
         "watermark",
         "nextSince",
+        // 不透明进度游标（pull 面 0.9.0）：base64(generation + rowid)，
+        // generation 随进程内注销计数变化 —— 值不确定，键必须留下。
+        "nextCursor",
         // 夹具的临时目录
         "db_path",
         "dir",

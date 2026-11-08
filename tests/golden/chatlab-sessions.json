@@ -3,7 +3,7 @@
     "count": 3,
     "page": {
       "hasMore": false,
-      "nextCursor": null
+      "nextCursor": "<volatile>"
     },
     "sessions": [
       {

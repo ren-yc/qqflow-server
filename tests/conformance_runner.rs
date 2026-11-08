@@ -307,6 +307,14 @@ async fn conformance_suite_passes() {
     // harness 追加消息时才写（注册时表还没出生），名册与群主全程为空，
     // `memberCount` 不出现（不变量允许缺席，于是「通过」却什么都没验）、群主断言拿 0 个。
     common::write_fake_group_info(&nt_db);
+    // 结构化图片行（40800 段带 45812 本地路径）：让真实索引登记媒体键
+    // aabbcc…——exported_media 槽位的句柄按它取字节（mediaId 承诺用例）。
+    // 不加这一行，nails-media-id-fetch-succeeds 会对一个从未登记的键拿到 404。
+    let _image_md5 = {
+        let conn = writer.lock();
+        common::append_image_row(&conn, 7, &nt_db)
+    };
+    common::materialize_source(&nt_db);
 
     let state = app_state(dir.join("export"));
     let app = build_router(state.clone()).merge(harness_router(writer.clone(), nt_db.clone(), state.clone()));

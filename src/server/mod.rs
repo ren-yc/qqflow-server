@@ -131,14 +131,8 @@ impl RegistrationToken {
     /// The cancellation gate: true when this token no longer describes the
     /// current registration (deregistered, or a later registration took over).
     fn is_cancelled(&self, registry: &AccountRegistry) -> bool {
-        let e = registry.epoch.load(Ordering::SeqCst);
-        let r = registry.registration.load(Ordering::SeqCst);
-        let cancelled = e != self.epoch || r != self.registration_id;
-        println!(
-            "[DBG is_cancelled] self=({},{}) registry=({},{}) -> {}",
-            self.epoch, self.registration_id, e, r, cancelled
-        );
-        cancelled
+        registry.epoch.load(Ordering::SeqCst) != self.epoch
+            || registry.registration.load(Ordering::SeqCst) != self.registration_id
     }
 }
 

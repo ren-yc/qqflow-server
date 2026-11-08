@@ -96,7 +96,7 @@
     },
     "sync": {
       "hasMore": false,
-      "nextCursor": "djEuMC43",
+      "nextCursor": "<volatile>",
       "nextOffset": 0,
       "nextSince": "<volatile>",
       "watermark": "<volatile>"
