@@ -790,25 +790,45 @@ impl Client {
             // 触发导出后**采用导出响应回填的实际文件名**重试：服务端落盘名与
             // 元数据名不必相同（媒体键是 md5/uuid 派生，扩展名由内容嗅探定），
             // 丢弃导出响应用旧名重试必然再次 404——即使目标就在导出页内。
-            // 导出页默认最新 100 条：目标不在页内时旧名重试也永远 404——
-            // 响应里按 platformMessageId 找不到时把「目标不在默认导出窗口」
-            // 如实报出来，而不是让调用方对着必 404 的句柄反复重试。
+            // 导出页默认最新 100 条：目标不在页内时旧名重试也永远 404。
+            // 导出页里的目标按「平台消息 id + 发送者 + 时间戳」三元组定位：
+            // 单看 id 会把同 id 的干扰行当成目标；都不匹配 ⇒ 目标不在导出页，
+            // 匹配到多行 ⇒ 无法确定哪一行才是本条，两者都如实报错而不是猜。
             let mut q = BTreeMap::new();
             q.insert("talker", talker.to_string());
             q.insert("media", "1".to_string());
             let exported: gen_types::ChatlabMessages = self.get_json("/chatlab/messages", &q).await?;
-            let my_id = &message.platform_message_id;
-            let exported_name = exported.messages.iter().find(|m| {
-                &m.platform_message_id == my_id
-            })
-            .and_then(|m| m.media.as_ref())
-            .map(|m| m.file_name.clone())
-            .unwrap_or_default();
+            let matches: Vec<&gen_types::ChatlabMessage> = exported
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.platform_message_id == message.platform_message_id
+                        && m.sender == message.sender
+                        && m.timestamp == message.timestamp
+                })
+                .collect();
+            let exported_name = match matches.as_slice() {
+                [one] => one.media.as_ref().map(|m| m.file_name.clone()).unwrap_or_default(),
+                [] => String::new(),
+                _ => {
+                    return Err(ClientError::UnexpectedBody {
+                        url: url.clone(),
+                        detail: format!(
+                            "export page matches {} messages for ({}, {}, {}); cannot pick one to re-export",
+                            matches.len(),
+                            message.platform_message_id,
+                            message.sender,
+                            message.timestamp
+                        ),
+                    });
+                }
+            };
             if exported_name.trim().is_empty() {
                 return Err(ClientError::UnexpectedBody {
                     url: url.clone(),
                     detail: format!(
-                        "handle 404s and the export page (latest 100) does not contain message {my_id}; cannot re-export by name"
+                        "handle 404s and the export page (latest 100) does not contain message {}; cannot re-export by name",
+                        message.platform_message_id
                     ),
                 });
             }
