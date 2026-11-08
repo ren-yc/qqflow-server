@@ -230,6 +230,23 @@ pub fn append_group_row(conn: &Connection, n: i64, text: &str) {
     .unwrap();
 }
 
+/// Append one group row whose business timestamp is **earlier** than the
+/// standard dataset while its row identity (rowid) is larger.
+///
+/// Why the fixture needs this: cursor continuation pages by row identity while
+/// the no-cursor time mode pages by timestamp. When the two orders diverge, a
+/// continuation that mixed the two keys would replay rows it already served
+/// (page-end row is not the largest rowid under time order) — this fixture is
+/// the divergence itself, so the out-of-order regression can pin the
+/// row-identity ordering.
+pub fn append_group_row_backdated(conn: &Connection, n: i64, seq_no: i64, ts: i64) {
+    conn.execute(
+        "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params!["10001", (ts << 32) | seq_no, "u_a", "张三", format!("回溯入库-{n}").as_bytes(), 1, ts, "张三群名片"],
+    )
+    .unwrap();
+}
+
 /// Add the reply columns ("40003" inner number, "40850" reply target) to the
 /// group table and seed two replies.
 ///

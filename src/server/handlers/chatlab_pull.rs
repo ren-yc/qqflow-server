@@ -146,8 +146,17 @@ pub async fn handler(
     // Chronological messages within (since, end] — `since` is exclusive, so
     // a client resuming with `nextSince` never re-fetches the boundary
     // second and can neither loop nor see duplicates.
+    // 进度游标模式（cursor 给出）下整个分页只用行标识（rowid）：过滤用
+    // 「rowid > 游标值」的排他下界，排序与页推进都按 rowid 单调——入库序与
+    // 时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行的 messages
+    // 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。无 cursor
+    // 的时间模式保持规范原行为：(ts, rowid) 复合键升序、页不跨秒推进。
     let mut idx: Vec<usize> = conv.msgs.iter().enumerate().map(|(i, _)| i).collect();
-    idx.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
+    if cursor_rowid.is_some() {
+        idx.sort_by_key(|&i| conv.msgs[i].rowid);
+    } else {
+        idx.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
+    }
     let filtered: Vec<usize> = idx
         .into_iter()
         .filter(|&i| {
@@ -167,14 +176,28 @@ pub async fn handler(
     // 进度游标模式下 offset 无意义（游标已定位到行），恒从 0 开始。
     let start = if cursor_rowid.is_some() { 0 } else { offset.min(total) };
     let mut page_end = start;
-    let mut prev_ts = None;
-    while page_end < total {
-        let ts_j = conv.msgs[filtered[page_end]].ts;
-        if prev_ts.is_some_and(|p| p != ts_j) && page_end - start >= limit {
-            break;
+    if cursor_rowid.is_some() {
+        // 游标模式：页推进按 rowid 组——与排序键一致，页边界不切断单调序，
+        // 页末 rowid 是严格的「已交付上界」。
+        let mut prev_rid = None;
+        while page_end < total {
+            let rid = conv.msgs[filtered[page_end]].rowid;
+            if prev_rid.is_some_and(|p| p != rid) && page_end - start >= limit {
+                break;
+            }
+            prev_rid = Some(rid);
+            page_end += 1;
         }
-        prev_ts = Some(ts_j);
-        page_end += 1;
+    } else {
+        let mut prev_ts = None;
+        while page_end < total {
+            let ts_j = conv.msgs[filtered[page_end]].ts;
+            if prev_ts.is_some_and(|p| p != ts_j) && page_end - start >= limit {
+                break;
+            }
+            prev_ts = Some(ts_j);
+            page_end += 1;
+        }
     }
     let page = &filtered[start..page_end];
     let has_more = page_end < total;
@@ -283,10 +306,34 @@ pub async fn handler(
         .unwrap_or_default();
 
     let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
-    // 进度游标恒编码**页末行**（排空时=最后交付行）的 rowid：它是下一次增量的
-    // 排他起点，排空后仍在场（进度游标不终结）。排空后同秒晚入库的行 rowid
-    // 更大，续拉必然可达——这正是时间游标补不上的盲区。
-    let last_rowid = page.last().map(|&i| conv.msgs[i].rowid).unwrap_or(cursor_rowid.unwrap_or(0));
+    // 进度游标编码「**已交付集合**」的进度上界——不是页末行：
+    //
+    // - cursor 模式：排序按 rowid 单调，页末行就是已交付集合的最大 rowid，
+    //   两者重合；空页时以本次游标值为准（进度不回退）。
+    // - 时间模式非空页：排序按时间复合键，页末行 rowid **可能不是已交付集合
+    //   里最大的**（回溯入库的行：时间早、rowid 大）。编码页末行会让后续游标
+    //   链重放它；必须编码「本次响应已交付的行里最大的 rowid」。
+    // - 时间模式空页：本响应没有交付任何行，但请求窗口 (since, end] 为空本身
+    //   就是进度陈述——窗口内无行，则一切 ts ≤ end 的行都已确立。游标编码
+    //   「end 界内已确立的最大 rowid」（end 缺省时水位线=now 覆盖全部行）。
+    //   编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤就会重放
+    //   全历史。
+    let last_rowid = if cursor_rowid.is_some() {
+        page.iter()
+            .map(|&i| conv.msgs[i].rowid)
+            .max()
+            .or(cursor_rowid)
+            .unwrap_or(0)
+    } else if page.is_empty() {
+        conv.msgs
+            .iter()
+            .filter(|m| m.ts <= watermark)
+            .map(|m| m.rowid)
+            .max()
+            .unwrap_or(0)
+    } else {
+        page.iter().map(|&i| conv.msgs[i].rowid).max().unwrap_or(0)
+    };
     let next_cursor = encode_cursor(state.init.epoch.load(std::sync::atomic::Ordering::SeqCst), last_rowid);
     let body = serde_json::to_value(PullEnvelope {
         chatlab: crate::server::chatlab::header(),
