@@ -174,6 +174,10 @@ pub use crate::sync::history::{EventBus, HistoryBuf, HistoryItem, Stamped};
 
 /// Runtime per-account registration machinery (client-driven startup).
 pub struct AccountRegistry {
+    /// Serializes binding, index installation, sync/watch publication and removal.
+    /// Lock order: lifecycle -> engine registry / accounts / store -> event history.
+    /// Readers never acquire lifecycle while holding any of those inner locks.
+    lifecycle: Mutex<()>,
     /// All known accounts: platform-scan results plus client registrations.
     pub accounts_db: Mutex<Vec<DbInfo>>,
     /// Accounts the STARTUP SCAN found, as opposed to ones a client
@@ -217,6 +221,7 @@ impl AccountRegistry {
         // without a signature change.
         let scanned = accounts.iter().map(|a| a.qq.clone()).collect();
         Self {
+            lifecycle: Mutex::new(()),
             accounts_db: Mutex::new(accounts),
             scanned,
             epoch: std::sync::atomic::AtomicU64::new(0),
@@ -297,41 +302,19 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
     }
 }
 
-/// Replace the store with a freshly built index and re-baseline SSE
-/// subscribers: a client that connected while we were indexing received a
-/// `sync(0,0)` event and would otherwise never learn the real watermarks.
-/// Install a freshly built index — **only if the registration that asked for it
-/// is still current**. The epoch re-check lives inside the same write-lock
-/// critical section as the store swap: `deregister_account` clears the store
-/// under that same lock *after* bumping the epoch, so holding it here means
-/// the two orders (bump→clear→install vs install→bump→clear) can no longer
-/// interleave. Without this, an `init_account` whose `cancelled_in_build()`
-/// check passed a few instructions ago could still land its index into the
-/// just-emptied store — and then re-baseline every SSE subscriber from a
-/// phantom account that was already deregistered (regression:
-/// `cancelled_build_cannot_install_after_deregister`).
-/// Returns false = the build lost its race against a deregistration.
-///
-/// `cancelled` 是调用方带来的 epoch 判据闭包：这个 helper 同时被初始化路径与测试用，
-/// 把 AppState 拖进来只会让它更难组合，判据本身留在调用方。
+/// Install a built index only while its registration is current. Lifecycle
+/// serializes with binding changes; the store write lock also orders this
+/// baseline against sync publication and the deregistration reset.
+/// Regression: `cancelled_build_cannot_install_after_deregister`.
 fn install_index(
+    lifecycle: &Mutex<()>,
     store: &Arc<RwLock<Store>>,
     bus: &EventBus,
     st: Store,
     cancelled: impl Fn() -> bool,
 ) -> bool {
+    let _lifecycle = lifecycle.lock();
     let mut guard = store.write();
-    // 重验、换 store、基线发布**同在这一把写锁的临界区内**：注销的顺序是「锁外 bump
-    // epoch → 锁内清空 store → 清历史 → 广播 reset」。发布若在锁外（曾经如此），交错
-    // 「install 放锁 → deregister 完整执行（清历史、bump 代号、广播 reset）→ install 才
-    // 发布」就会把已取消账号的基线**追加在 reset 之后** —— `clear_items` 保留 id 计数器，
-    // 幽灵基线拿到更大的新 id、盖着注销后的新代号，看起来像个合法的新事件，客户端无从
-    // 识别。锁内发布则两种交错都被挡住：要么 install 先完成（deregister 随后的清历史把
-    // 它连基线一起清掉，终态干净），要么 epoch 重验先失败（根本不发布）。
-    // 锁序为 store→history 单向：注销侧拿历史锁时不持 store，订阅端读历史时也不持 store，
-    // 不存在反向嵌套，不会死锁。
-    // cancelled 形参承载的是「注册仍有效」谓词（与 sync 引擎令牌闸同一闭包）：
-    // 失效时拒绝安装。
     if !cancelled() {
         return false;
     }
@@ -415,6 +398,7 @@ fn set_account_state_if_current(
     count: usize,
     error: Option<String>,
 ) -> bool {
+    let _lifecycle = state.init.lifecycle.lock();
     let mut accs = state.accounts.write();
     // 锁内双计数校验：epoch 或 registration 任一变化都拒绝——「注销后重注册」
     // 只推进 registration 时的旧任务同样不能借新注册的名义写状态。
@@ -445,6 +429,11 @@ fn set_account_state_if_current(
 /// (`start_account`) the same way, so this also removes an inconsistency between the two.
 /// The library boundary (narrowing what is `pub`) is a separate, later concern.
 pub fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
+    begin_indexing_with_source(state, qq, None)
+}
+
+fn begin_indexing_with_source(state: &AppState, qq: &str, source: Option<DbInfo>) -> BindOutcome {
+    let _lifecycle = state.init.lifecycle.lock();
     let mut accs = state.accounts.write();
     if let Some(b) = bound_account(&accs) {
         if b.qq != qq {
@@ -481,6 +470,10 @@ pub fn begin_indexing(state: &AppState, qq: &str) -> BindOutcome {
         epoch: state.init.epoch.load(Ordering::SeqCst),
         registration_id,
     };
+    if let Some(info) = source {
+        state.init.upsert_db(info);
+    }
+    state.ready.store(false, Ordering::SeqCst);
     BindOutcome::Bound(minted)
 }
 
@@ -618,6 +611,7 @@ fn purge_exported_media(root: &std::path::Path, talkers: &[String]) -> usize {
 ///    baseline — broadcasting before the history clear would wipe the very
 ///    event a reconnecting client needs to learn its watermarks went to zero.
 pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> DeregisterOutcome {
+    let _lifecycle = state.init.lifecycle.lock();
     let previous = {
         let accs = state.accounts.read();
         match bound_account(&accs) {
@@ -640,13 +634,9 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
         w.abort();
     }
 
-    // 2. Invalidate any in-flight initialization **并清空索引 —— 两者在同一把 store 写锁
-    //    的临界区内完成**。bump 若留在锁外（本函数曾经的形态）：一个在 bump 之后才开始、
-    //    读到新 epoch 的新注册，其 install 可能赶在清空之前拿到写锁装入索引，而它随后
-    //    set_account_state_if_current 用的正是这个新 epoch、照常通过 ⇒ 账号 Ready 但
-    //    store 是空的。bump 与清空同临界区后，这种新注册要么在锁前拿到（旧 epoch 被拒），
-    //    要么在锁后（清空已完成，装入的是自己的新索引），不存在半途交错。
-    //    install_index 的基线发布也在同一把锁内（见其注释）。
+    // Invalidate and clear under the store lock. A previously snapshotted sync
+    // handle either finishes publication first, or sees stopped/current=false.
+    // The outer lifecycle gate excludes a new binding until reset completes.
     let (talkers, index_cleared) = {
         let mut guard = state.store.write();
         state.init.epoch.fetch_add(1, Ordering::SeqCst);
@@ -699,6 +689,34 @@ pub fn deregister_account(state: &AppState, qq: &str, purge_media: bool) -> Dere
     DeregisterOutcome::Deregistered { previous, index_cleared, purged_dirs }
 }
 
+/// Publish a built account, its watcher and readiness as one lifecycle commit.
+/// Slow database work has already finished; no lock is held across an await.
+fn activate_account(
+    state: &Arc<AppState>,
+    token: RegistrationToken,
+    account: Arc<sync::AccountSync>,
+    count: usize,
+    spawn_watcher: impl FnOnce() -> tokio::task::JoinHandle<Result<()>>,
+) -> bool {
+    let current = {
+        let weak = Arc::downgrade(state);
+        move || weak.upgrade().is_some_and(|s| !token.is_cancelled(&s.init))
+    };
+    account.set_registration_guard(Box::new(current.clone()));
+    let _lifecycle = state.init.lifecycle.lock();
+    if !state.sync.register_if_current(account.clone(), &current) {
+        account.stop();
+        return false;
+    }
+    if !state.sync.attach_watcher_if_current(&account, spawn_watcher(), &current) {
+        state.sync.unregister_if(&account);
+        return false;
+    }
+    write_account_state(&mut state.accounts.write(), &account.qq, AccountStatus::Ready, count, None);
+    update_ready(state);
+    true
+}
+
 /// Full per-account initialization: open the LIVE source read-only, verify
 /// the key, build the index (blocking pool), SSE baseline broadcast,
 /// `AccountSync` registration, watch task. No copies, no mirror dir.
@@ -745,6 +763,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
     let info_for_build = info.clone();
     let key_for_build = key.clone();
     let cancelled_in_build = cancelled.clone();
+    let state_for_build = state.clone();
     // `Ok(None)` = cancelled mid-build (deregistered), as distinct from
     // `Err` = the build genuinely failed.
     let result = tokio::task::spawn_blocking(move || -> Result<Option<(Arc<Mutex<LiveReader>>, usize)>> {
@@ -763,7 +782,7 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
         // drop the freshly built index instead of installing it. The check
         // and the swap are one critical section inside install_index, so no
         // deregistration can slip between them.
-        if !install_index(&store, &bus, st, cancelled_in_build) {
+        if !install_index(&state_for_build.init.lifecycle, &store, &bus, st, cancelled_in_build) {
             return Ok(None);
         }
         Ok(Some((Arc::new(Mutex::new(reader)), count)))
@@ -786,46 +805,15 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
                 watch_dir.clone(),
                 key.clone(),
             ));
-            // 注册与挂 watcher 都带同一令牌复查（cancelled 闭包）：install 通过
-            // 之后、register 之前注销的窗口此前完全无守卫——幽灵引擎条目的
-            // watch pass 会把死账号的轮询写进刚清空的 store。失败时停掉自己。
-            if !state.sync.register_if_current(account.clone(), &cancelled) {
-                account.stop();
-                tracing::info!("[init] QQ {qq} 注册引擎时已被注销，句柄丢弃");
-                return;
-            }
-            // The handle is kept (not dropped as before) so deregistration can
-            // abort the task — otherwise it holds the source database and its
-            // directory handle open for the rest of the process's life.
-            let watcher = tokio::spawn(sync::watch::spawn(
-                account.clone(),
-                watch_dir,
-                state.init.watch_cfg.clone(),
-                state.init.shutdown.clone(),
-            ));
-            if !state.sync.attach_watcher_if_current(&qq, watcher, &cancelled) {
-                account.stop();
-                state.sync.unregister(&qq);
-                tracing::info!("[init] QQ {qq} 挂 watcher 时已被注销，注册回滚");
-                return;
-            }
-            // 注入注册身份复查：此后每一次对共享 Store 的最终写入（名字表、
-            // 媒体回退）都在写锁内先过这道闸。cancelled 持有的正是本任务
-            // 的注册令牌。
-            account.set_registration_guard(Box::new(cancelled));
-            // Registering first and checking after means a deregistration that
-            // lands in this window is guaranteed to be noticed by one side or
-            // the other: either it finds the account in the engine and stops
-            // it, or the epoch check below fails and we retire ourselves.
-            if !set_account_state_if_current(state, &qq, token, AccountStatus::Ready, count, None) {
-                let (a, w) = state.sync.unregister(&qq);
-                if let Some(a) = a {
-                    a.stop();
-                }
-                if let Some(w) = w {
-                    w.abort();
-                }
-                tracing::info!("[init] QQ {qq} 初始化完成但已被注销，结果丢弃");
+            if !activate_account(state, token, account.clone(), count, || {
+                tokio::spawn(sync::watch::spawn(
+                    account,
+                    watch_dir,
+                    state.init.watch_cfg.clone(),
+                    state.init.shutdown.clone(),
+                ))
+            }) {
+                tracing::info!("[init] QQ {qq} 注册已失效，初始化结果丢弃");
                 return;
             }
             tracing::info!("[init] QQ {qq} 索引完成: {count} 条消息");
@@ -1086,7 +1074,7 @@ mod tests {
     }
 
     /// `AppState` with the given `(qq, status)` accounts.
-    fn state_with_accounts(accounts: &[(&str, AccountStatus)]) -> Arc<AppState> {
+    pub(super) fn state_with_accounts(accounts: &[(&str, AccountStatus)]) -> Arc<AppState> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Arc::new(AppState {
             store: Arc::new(RwLock::new(Store::default())),
@@ -1115,59 +1103,6 @@ mod tests {
             base_url: Arc::new("http://127.0.0.1:5032".into()),
             shutdown: shutdown_tx,
         })
-    }
-
-    /// 取消与安装的**互斥性**：epoch 重验发生在写锁临界区内（检查与交换不可分两步）。
-    ///
-    /// 时序钉法：主线程占住 store 的写锁（模拟「注销已 bump epoch、还没清空」的半途），
-    /// 安装线程此时必须被挡在锁外；主线程随后 bump 并放锁。若判据在**取锁前**求值
-    /// （被删除的两步写法），它会看到尚未 bump 的旧 epoch 放行自己，把索引落进
-    /// 刚被清空的 store 并向所有订阅者广播幽灵账号的水位。
-    #[test]
-    fn cancelled_build_cannot_install_after_deregister() {
-        let store = Arc::new(RwLock::new(Store::default()));
-        let bus = EventBus::new(16);
-        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(7));
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
-        // 主线程占住写锁。
-        let guard = store.write();
-        let store2 = store.clone();
-        let bus2 = bus.clone();
-        let epoch2 = epoch.clone();
-        let builder = std::thread::spawn(move || {
-            let st = Store { watermark_group: 42, ..Store::default() };
-            // 闭包返回「注册仍有效」：epoch 已变 ⇒ 返回 false ⇒ 安装被拒。
-            let installed = install_index(&store2, &bus2, st, move || {
-                epoch2.load(Ordering::SeqCst) == 7
-            });
-            let _ = done_tx.send(installed);
-        });
-        // 让 builder 确实走到锁上排队，再演「注销发生」。
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        epoch.fetch_add(1, Ordering::SeqCst);
-        drop(guard);
-        let installed = done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("builder settles");
-        builder.join().unwrap();
-        assert!(!installed, "重验必须在锁内：拿到锁时 epoch 已变，安装必须被拒");
-        assert_eq!(store.read().watermark_group, 0, "store 保持注销后的空态");
-        assert!(
-            bus.history().lock().replay_since(0).is_empty(),
-            "被拒的安装也不得留下幽灵基线 —— 发布与换库在同一临界区",
-        );
-    }
-
-    #[tokio::test]
-    async fn install_index_rebaselines_subscribers() {
-        let store = Arc::new(RwLock::new(Store::default()));
-        let bus = EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let st = Store { watermark_group: 42, watermark_c2c: 7, ..Store::default() };
-        install_index(&store, &bus, st, || true);
-        assert_eq!(store.read().watermark_group, 42, "store replaced");
-        let ev = rx.try_recv().expect("build completion broadcasts a sync baseline").event;
-        assert_eq!(ev.event, "sync");
-        assert_eq!(ev.last_rowid_group, Some(42));
-        assert_eq!(ev.last_rowid_c2c, Some(7));
     }
 
     #[test]
@@ -1586,3 +1521,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(all(test, feature = "testing"))]
+mod lifecycle_tests;

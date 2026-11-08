@@ -337,6 +337,11 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 
 ### 增量同步
 
+- 账号绑定、索引安装、同步句柄与 watcher 登记、ready 提交和注销共用生命周期锁；慢速扫描留在锁外。锁序为生命周期锁 → 注册表、账号或 Store → 事件历史，不反向获取。
+- watcher 绑定具体句柄，拒绝时显式取消；旧任务仅能回滚自身。回归：`stale_cleanup_and_watcher_cannot_remove_new_registration`。
+- 注销必须等最终提交结束，新注册必须等注销清理结束；消息发布与 Store 更新同锁，避免旧事件落在 reset 之后。回归：`lifecycle_commit_excludes_deregister_through_watcher_and_ready`。
+- 排队中的旧初始化即使在新账号就绪后才执行，也不能替换索引、事件基线或 ready 状态。回归：`queued_initialization_cannot_replace_a_new_account_index`。
+
 - **水位是 SQLite 行号**（weflow 是三元组）：`generation` 变化后的补拉语义因此是「整会话重排空」，而不是按行续传。事件类型的唯一出处是 `sync/events.rs`，SSE 载荷与总线共用。
 - **`sync/watch.rs` 只决定何时再轮询**，不解析内容；真正的增量来自水位线。改 watch 的判据时不要顺手把它变成内容感知——那是另一条路径的职责。
 

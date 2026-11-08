@@ -189,7 +189,7 @@ curl -X DELETE -H "Authorization: Bearer <token>" \
 
 - `deregistered`——已注销；`previous_status` 是注销前状态，`index_cleared` 表示内存索引确有内容被清空。
 - `not_registered`——本就没有绑定账号，幂等。`wxid_mismatch` 对偶的 `qq_mismatch`——路径里的 qq 不是在位账号，附 `occupied_by` / `occupied_status`，在位账号毫发无损。
-- 允许在 `indexing` 中途注销；正在跑的全量构建会看到退场标志并丢弃结果。注销时清掉 SSE 重放条目并推进 `generation`。
+- 允许在 `indexing` 中途注销；尚未提交的构建结果会被丢弃。注销后旧任务不能重新置为 `ready`、挂接 watcher 或撤销同账号的新注册。注销时清掉 SSE 重放条目并推进 `generation`。
 - `purge_media=1` 只删已知布局，仅在会话目录已空时删它；导出根目录永不触碰。
 
 ### GET `/api/v1/messages` — 消息查询（原生/富数据形状）

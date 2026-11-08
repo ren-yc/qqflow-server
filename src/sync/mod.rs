@@ -102,7 +102,7 @@ impl AccountSync {
         }
     }
 
-    /// 注入注册身份复查闭包（生产路径由 init_account 在注册成功后调用）。
+    /// 注入注册身份复查闭包（生产路径由 init_account 在公开句柄前调用）。
     /// 闭包返回 false = 该句柄所属的注册已失效。
     pub fn set_registration_guard(&self, guard: Box<dyn Fn() -> bool + Send>) {
         *self.registration_guard.lock() = Some(guard);
@@ -256,7 +256,7 @@ impl AccountSync {
         // cache-index fallback must advertise the same fetchable id in its
         // own event), then build the SSE events and response rows (the
         // records are borrowed — see apply_records), advance watermarks.
-        let (events, outs): (Vec<Event>, Vec<MessageOut>) = {
+        let outs: Vec<MessageOut> = {
             let mut guard = self.store.write();
             // Deregistration check, deliberately the first thing inside the
             // critical section rather than at `poll_once`'s entry: the read
@@ -265,7 +265,7 @@ impl AccountSync {
             // this account's rows (and watermarks) into the cleared store —
             // resurrecting data the operator just removed. Checking under the
             // same lock deregistration takes makes the two mutually exclusive.
-            if self.is_stopped() {
+            if !self.may_write_store() {
                 tracing::debug!(qq = %self.qq, "sync pass discarded: account deregistered");
                 return Ok(Vec::new());
             }
@@ -334,11 +334,13 @@ impl AccountSync {
                 .chain(&new_c)
                 .map(|r| crate::store::query::shape_record(&guard, r))
                 .collect();
-            (events, outs)
+            // Keep events before a deregistration reset: clearing the store and
+            // resetting history cannot overtake this publication.
+            for ev in events {
+                self.bus.publish(ev);
+            }
+            outs
         };
-        for ev in events {
-            self.bus.publish(ev);
-        }
         Ok(outs)
     }
 }
@@ -347,71 +349,83 @@ impl AccountSync {
 /// the manual-sync endpoint. Accounts are registered as their indexes
 /// finish building.
 pub struct SyncEngine {
-    accounts: Mutex<Vec<Arc<AccountSync>>>,
-    /// Per-account watch task handles, so deregistration can abort the task
-    /// that would otherwise keep the source database and its directory
-    /// handle open for the rest of the process's life. Previously the handle
-    /// was dropped at spawn time, which detached the task permanently.
-    watchers: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<Result<()>>>>,
+    registry: Mutex<SyncRegistry>,
+}
+
+#[derive(Default)]
+struct SyncRegistry {
+    accounts: Vec<Arc<AccountSync>>,
+    watchers: std::collections::HashMap<String, tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl SyncEngine {
     pub fn new() -> Self {
-        Self { accounts: Mutex::new(Vec::new()), watchers: Mutex::new(Default::default()) }
+        Self { registry: Mutex::new(SyncRegistry::default()) }
     }
 
-    /// Register a sync handle **only when `token_ok` still passes**. Registration
-    /// previously had no guard here at all: an init task whose `install_index`
-    /// check passed could be deregistered before reaching this line, and the
-    /// registration would then push a phantom engine entry whose watch pass
-    /// writes into the just-cleared store. The caller re-checks the same
-    /// registration token the rest of the build carries; a stale token means
-    /// the caller drops the handle instead of registering it.
+    /// Validate and publish under the same registry lock used by removal.
+    /// Server callers also hold the lifecycle gate while changing the token.
     pub fn register_if_current(&self, account: Arc<AccountSync>, token_ok: &dyn Fn() -> bool) -> bool {
-        if !token_ok() {
+        let mut registry = self.registry.lock();
+        if !token_ok() || account.is_stopped()
+            || registry.accounts.iter().any(|a| a.qq == account.qq)
+        {
             return false;
         }
-        self.accounts.lock().push(account);
+        registry.accounts.push(account);
         true
     }
 
-    /// Track one account's watch task (replacing any previous handle, which a
-    /// re-registration after a failure produces). Same token gate as
-    /// [`SyncEngine::register_if_current`]: attaching a watcher for a stale
-    /// registration would let the watch pass poll a dead account into a
-    /// cleared store.
+    /// Attach only to the exact registered handle. A rejected task must be
+    /// aborted explicitly: dropping a JoinHandle would detach it permanently.
     pub fn attach_watcher_if_current(
         &self,
-        qq: &str,
+        account: &Arc<AccountSync>,
         handle: tokio::task::JoinHandle<Result<()>>,
         token_ok: &dyn Fn() -> bool,
     ) -> bool {
-        if !token_ok() {
+        let mut registry = self.registry.lock();
+        if !token_ok() || account.is_stopped()
+            || !registry.accounts.iter().any(|a| Arc::ptr_eq(a, account))
+        {
+            handle.abort();
             return false;
         }
-        if let Some(old) = self.watchers.lock().insert(qq.to_string(), handle) {
+        if let Some(old) = registry.watchers.insert(account.qq.clone(), handle) {
             old.abort();
         }
         true
     }
 
-    /// Remove `qq` from the registry and return its sync handle plus its
-    /// watch task, if it was registered. The caller stops them — this only
-    /// detaches them from the engine so no later pass can pick them up.
+    /// Remove the current account and watcher together. Callers stop the
+    /// returned handle before clearing the index under its write lock.
     pub fn unregister(
         &self,
         qq: &str,
     ) -> (Option<Arc<AccountSync>>, Option<tokio::task::JoinHandle<Result<()>>>) {
-        let account = {
-            let mut accs = self.accounts.lock();
-            accs.iter().position(|a| a.qq == qq).map(|i| accs.remove(i))
-        };
-        let watcher = self.watchers.lock().remove(qq);
+        let mut registry = self.registry.lock();
+        let account = registry.accounts.iter().position(|a| a.qq == qq)
+            .map(|i| registry.accounts.remove(i));
+        let watcher = registry.watchers.remove(qq);
         (account, watcher)
     }
 
+    /// A stale initialization may retire itself, never a later registration
+    /// of the same account. The identity check and removal are indivisible.
+    pub fn unregister_if(&self, account: &Arc<AccountSync>) -> bool {
+        let mut registry = self.registry.lock();
+        let Some(i) = registry.accounts.iter().position(|a| Arc::ptr_eq(a, account)) else {
+            return false;
+        };
+        registry.accounts.remove(i).stop();
+        if let Some(watcher) = registry.watchers.remove(&account.qq) {
+            watcher.abort();
+        }
+        true
+    }
+
     pub fn snapshot(&self) -> Vec<Arc<AccountSync>> {
-        self.accounts.lock().clone()
+        self.registry.lock().accounts.clone()
     }
 
     /// Manual sync: run a full pass on every registered account and return

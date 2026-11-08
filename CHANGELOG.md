@@ -2,6 +2,13 @@
 
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- 账号注销与初始化最终提交串行化；旧任务不能重挂 watcher、置为就绪或移除后来的注册，拒绝的 watcher 显式取消。回归：`lifecycle_commit_excludes_deregister_through_watcher_and_ready`、`stale_cleanup_and_watcher_cannot_remove_new_registration`。
+- 账号路径只在取得绑定后登记，避免被并发失败请求覆盖。排队中的旧初始化不能替换新索引。回归：`source_path_only_changes_for_winning_binding`、`queued_initialization_cannot_replace_a_new_account_index`。
+
 ## [0.10.0] - 2026-10-24
 
 ### 破坏性变更

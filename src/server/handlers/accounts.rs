@@ -30,7 +30,7 @@ use crate::server::dto::{
 };
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::server::{
-    begin_indexing, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
+    begin_indexing_with_source, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
     DeregisterOutcome,
 };
 use crate::server::AppState;
@@ -103,17 +103,13 @@ pub async fn list_handler(
 }
 
 /// Resolve `(qq, db_path)` to a `DbInfo`: an explicit path (nt_msg.db file
-/// or Tencent Files-style root dir) registers or overrides the account in
-/// the registry; without one, the startup scan must have found it.
+/// or Tencent Files-style root dir) is resolved without changing registration.
+/// Without one, the startup scan must have found it.
 fn resolve_db_path(state: &AppState, qq: &str, db_path: Option<&str>) -> Option<DbInfo> {
     let Some(p) = db_path.filter(|p| !p.is_empty()) else {
         return state.init.find_db(qq);
     };
-    // Resolve outside the registry lock (the stat calls are syscalls);
-    // only the find-or-insert needs the lock.
-    let info = scan::resolve_account(qq, Path::new(p))?;
-    state.init.upsert_db(info.clone());
-    Some(info)
+    scan::resolve_account(qq, Path::new(p))
 }
 
 pub async fn handler(
@@ -260,7 +256,7 @@ pub async fn handler(
     // serialize here, so a duplicate observes the new state instead of
     // spawning a second initialization, and a different qq loses the race
     // instead of overwriting the winner's index.
-    let registration_token = match begin_indexing(&state, qq) {
+    let registration_token = match begin_indexing_with_source(&state, qq, Some(info.clone())) {
         BindOutcome::SameQq(AccountStatus::Ready) => {
             return Ok(reply(
                 "already_ready",
