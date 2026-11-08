@@ -981,6 +981,11 @@
           "hasMore": {
             "type": "boolean"
           },
+          "nextCursor": {
+            "description": "不透明进度游标（`opaqueCursor` 能力）：编码入库进度（账号代次 + 会话 +\n唯一行标识），客户端原样回传、不得解析。排空后仍在场且非空——进度游标\n不终结（与消息面 `page.nextCursor` 排空为 null 的约定不同），它是下一次\n增量请求的起点。时间游标的盲区（排空后同秒晚入库的行永远落在\n`nextSince` 之后）由它补上。",
+            "nullable": true,
+            "type": "string"
+          },
           "nextOffset": {
             "minimum": 0,
             "type": "integer"
