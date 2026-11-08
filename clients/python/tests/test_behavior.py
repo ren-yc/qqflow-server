@@ -374,7 +374,12 @@ async def test_media_bytes_exports_then_retries() -> None:
     mock = Mock()
     mock.chatlab_page = {
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-        "count": 0, "members": [], "messages": [],
+        "count": 1, "members": [],
+        "messages": [{
+            "accountName": "Alice DISPLAY", "content": "x", "groupNickname": "",
+            "media": {"type": "image", "fileName": "abc.exported.png", "md5": "z"},
+            "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+        }],
         "meta": {"groupId": "", "name": "", "ownerId": "",
                  "platform": "qq", "type": "chat"},
         "page": {"hasMore": False, "nextCursor": None},
@@ -389,7 +394,10 @@ async def test_media_bytes_exports_then_retries() -> None:
     })
     data = await client.media_bytes(message, "wxid_alice")
     assert data == b"png-bytes"
-    assert mock.media_calls == ["abc.png", "abc.png"]
+    assert mock.media_calls == ["abc.png", "abc.exported.png"], (
+        "first GET uses the metadata name, the retry uses the name the export "
+        "response backfilled"
+    )
     assert mock.messages_query == {"talker": "wxid_alice", "media": "1"}
     await client.aclose()
 
@@ -405,7 +413,12 @@ async def test_media_bytes_rejects_redirect_like_statuses() -> None:
         mock = Mock()
         mock.chatlab_page = {
             "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-            "count": 0, "members": [], "messages": [],
+            "count": 1, "members": [],
+            "messages": [{
+                "accountName": "alice", "content": "x", "groupNickname": "",
+                "media": {"type": "image", "fileName": "abc.png", "md5": "z"},
+                "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+            }],
             "meta": {"groupId": "", "name": "", "ownerId": "",
                      "platform": "qq", "type": "chat"},
             "page": {"hasMore": False, "nextCursor": None},
