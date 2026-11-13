@@ -33,77 +33,9 @@ pub struct Params {
     pub access_token: Option<String>,
 }
 
-/// 编码不透明进度游标：`v1.<epoch>.<rowid>` 的 base64。内容对客户端不透明；
-/// 排他性由 rowid 保证（比它小的行已全部交付），账号代次保证跨代次的旧游标
-/// 被识别为「从头拉取」而不是「错误续页」。
-fn encode_cursor(epoch: u64, rowid: i64) -> String {
-    use std::io::Write;
-    let mut buf = Vec::new();
-    let _ = write!(buf, "v1.{}.{}", epoch, rowid);
-    base64_simply(&buf)
-}
-
-/// 解码本端点编出的游标；无法识别（外部来源/损坏/代次不匹配）返回 None，
-/// 调用方退回时间模式——不是错误，兼容期客户端可能仍用 `nextSince`。
-fn decode_cursor(cursor: &str, epoch: u64) -> Option<i64> {
-    let raw = decode_base64_simply(cursor)?;
-    let text = String::from_utf8(raw).ok()?;
-    let rest = text.strip_prefix("v1.")?;
-    let mut parts = rest.splitn(2, '.');
-    let token_epoch: u64 = parts.next()?.parse().ok()?;
-    let rowid: i64 = parts.next()?.parse().ok()?;
-    // 跨代次的游标 = 旧账号的进度线，新账号上不存在——从头拉取。
-    if token_epoch != epoch {
-        return Some(0);
-    }
-    Some(rowid)
-}
-
-/// 无依赖 base64（stdlib only，与服务端其余部分一致）：标准字母表 + padding。
-fn base64_simply(data: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(TABLE[(n >> 18) as usize & 63] as char);
-        out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-fn decode_base64_simply(text: &str) -> Option<Vec<u8>> {
-    const REV: fn(u8) -> Option<u32> = |c| match c {
-        b'A'..=b'Z' => Some((c - b'A') as u32),
-        b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-        b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    };
-    let bytes: Vec<u8> = text.bytes().filter(|b| *b != b'=').collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        if chunk.len() == 1 {
-            return None;
-        }
-        let mut n: u32 = 0;
-        for (i, c) in chunk.iter().enumerate() {
-            n |= REV(*c)? << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    Some(out)
-}
-
+/// 编码/解码一律走 `crate::server::cursor`（v2）：它把「进程 / 账号 / 会话 /
+/// 注册代次 / 数据源世代」绑进载荷，失效时返回 409 + `reason`，而不是静默
+/// 退回时间模式。本文件不再保留 v1 的编解码助手。
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -127,12 +59,6 @@ pub async fn handler(
     let since = params.since.as_deref().and_then(|s| parse_time_bound(s, false));
     let end = params.end.as_deref().and_then(|s| parse_time_bound(s, true));
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
-    // 进度游标模式：给出 `cursor` 时它取代 since/offset 成为权威起点。游标里的
-    // 账号代次与本端不匹配时按「从头拉取」处理（旧账号的进度线在新账号上不存在）。
-    let cursor_rowid = params
-        .cursor
-        .as_deref()
-        .and_then(|c| decode_cursor(c, state.init.epoch.load(std::sync::atomic::Ordering::SeqCst)));
 
     let store = state.store.read();
     // find_conversation falls back to the other chat type when the primary
@@ -142,6 +68,43 @@ pub async fn handler(
     };
     let chat_type = conv.chat_type;
     let talker = conv.talker.clone();
+
+    // 游标上下文：本进程 + 本账号 + 本会话 + (注册代次, 数据源世代)。会话摘要
+    // 绑**解析后的** `(chat_type, talker)` 而不是裸 `id`：两个不同的裸 id 落到
+    // 同一个会话（`find_conversation` 的回退）时必须编出同一条线，而不是互相
+    // 误判成跨会话。注册代次用注册令牌的二元组序数（注销与重注册都推进它），
+    // 数据源世代来自该账号同步句柄的指纹采样（库身份变化才推进）。
+    let registration = state.init.registration.load(std::sync::atomic::Ordering::SeqCst);
+    // 绑定账号（与下面 `ownerId` 的取法同源）：store 没有账号维度，注册表里
+    // 唯一的绑定条目就是它。
+    let bound_qq = state
+        .accounts
+        .read()
+        .iter()
+        .find(|a| a.state.is_ready())
+        .map(|a| a.qq.clone())
+        .unwrap_or_default();
+    let source_generation = state
+        .sync
+        .snapshot()
+        .iter()
+        .find(|a| a.qq == bound_qq)
+        .map(|a| a.generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(0);
+    let session_key = crate::store::conv_key(chat_type, &talker);
+    let cursor_ctx = crate::server::cursor::CursorContext::for_session(
+        &bound_qq,
+        &session_key,
+        registration,
+        source_generation,
+    );
+    // 解码失败分两种——语法坏是 400，身份/代次不符是 409 + `reason:
+    // cursor_reset_required`；两者都不退回时间模式：静默退回等于让客户端以为
+    // 续上了、实际从头重放。
+    let cursor_rowid = match params.cursor.as_deref() {
+        Some(raw) => Some(cursor_ctx.decode(raw).map_err(|e| e.into_api_error())?),
+        None => None,
+    };
 
     // Chronological messages within (since, end] — `since` is exclusive, so
     // a client resuming with `nextSince` never re-fetches the boundary
@@ -347,7 +310,7 @@ pub async fn handler(
     } else {
         page.iter().map(|&i| conv.msgs[i].rowid).max().unwrap_or(0)
     };
-    let next_cursor = encode_cursor(state.init.epoch.load(std::sync::atomic::Ordering::SeqCst), last_rowid);
+    let next_cursor = cursor_ctx.encode(last_rowid);
     let body = serde_json::to_value(PullEnvelope {
         chatlab: crate::server::chatlab::header(),
         members,

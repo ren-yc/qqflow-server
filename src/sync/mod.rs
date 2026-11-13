@@ -20,7 +20,7 @@ pub mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
@@ -74,6 +74,17 @@ pub struct AccountSync {
     /// Last observed (mtime-millis, size) of the source WAL; the fallback
     /// poll compares against it to detect changes the watcher missed.
     last_wal: Mutex<Option<(u64, u64)>>,
+    /// 数据源世代：库文件**身份**（路径、创建时间、salt）变化时递增。
+    ///
+    /// 游标 v2 把它编进载荷：身份换了（删库重建、还原成另一份文件），旧游标
+    /// 的行标识在新文件上毫无意义，续拉等于按旧表的位置读新表。与指纹基线
+    /// `source_digest` 配对，每轮同步前采样一次。
+    ///
+    /// 共享句柄经 [`AccountSync::generation_handle`] 交给 HTTP 层：读路径不能
+    /// 去拿 reader/store 的锁（见 `poll_locked` 的临界区），交出去的必须是 `Arc`。
+    generation: Arc<AtomicU32>,
+    /// 上一次采样到的指纹摘要（基线）。`None` = 尚未采样成功过。
+    source_digest: Mutex<Option<[u8; 32]>>,
 }
 
 impl AccountSync {
@@ -99,6 +110,8 @@ impl AccountSync {
             db_dir,
             key,
             last_wal: Mutex::new(None),
+            generation: Arc::new(AtomicU32::new(0)),
+            source_digest: Mutex::new(None),
         }
     }
 
@@ -117,6 +130,45 @@ impl AccountSync {
                 .lock()
                 .as_ref()
                 .is_none_or(|g| g())
+    }
+
+    /// 数据源世代的共享句柄，给 HTTP 层编游标用。
+    ///
+    /// 与 `reader`/`store` 的锁同理：读世代是一次原子加载，HTTP 侧不应为此排队
+    /// 等一个可能正持锁数秒的同步轮次——交出去的必须是 `Arc` 的克隆。
+    pub fn generation_handle(&self) -> Arc<AtomicU32> {
+        self.generation.clone()
+    }
+
+    /// 采一次数据源指纹；身份类线索变化时推进世代并返回 `true`。
+    ///
+    /// 只比对库路径、创建时间与 SQLCipher salt（页 1 明文前缀，在 QQ 的 1024
+    /// 字节自定义头之后）——**追加写入不会改变它们**，所以正常的新消息入库不会
+    /// 让游标失效。采样失败时**不推进**世代：一次读失败（文件被 QQ 短暂占用、
+    /// 权限抖动）不能把所有在用游标判死，下一轮重试即可；失败本身记警告，不静默吞掉。
+    fn sample_source(&self) -> bool {
+        match crate::db::source_identity::fingerprint(&self.db_path) {
+            Ok(fp) => {
+                let mut baseline = self.source_digest.lock();
+                match *baseline {
+                    None => {
+                        *baseline = Some(fp.digest);
+                        false
+                    }
+                    Some(previous) if previous != fp.digest => {
+                        *baseline = Some(fp.digest);
+                        self.generation.fetch_add(1, Ordering::SeqCst);
+                        tracing::warn!("数据源身份发生变化：旧游标与进行中的导出将失效");
+                        true
+                    }
+                    Some(_) => false,
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "数据源指纹采样失败，本轮不推进世代");
+                false
+            }
+        }
     }
 
     /// Retire this account's sync: no further pass may write to the store.
@@ -183,6 +235,12 @@ impl AccountSync {
         crate::store::index::reapply_media_registration(&mut guard);
     }
 
+    /// 建索引完成后、对外可用之前的一次基线采样（见 `init_account` 的调用注释）。
+    /// 失败只告警：下一轮 `poll_once` 会重试，基线缺失不判死任何游标。
+    pub fn sample_source_baseline(&self) {
+        self.sample_source();
+    }
+
     /// Cheap change detection (no data IO — at most one metadata stat):
     /// true right after a failed sync (retry flag), while the live
     /// connection is closed (QQ not running yet — reopen on the next
@@ -227,6 +285,9 @@ impl AccountSync {
     /// the store write lock serialize overlapping passes (the second one
     /// finds nothing new).
     pub fn poll_once(&self) -> Result<Vec<MessageOut>> {
+        // 每轮同步前采一次数据源指纹：换了库就在这里推进世代。放在读阶段之前
+        // ——本轮读出的行如果来自新文件，游标也必须从这一代开始算。
+        self.sample_source();
         let mut reader = self.reader.lock();
         let result = self.poll_locked(&mut reader);
         if result.is_err() {

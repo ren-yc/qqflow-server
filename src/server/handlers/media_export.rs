@@ -85,9 +85,9 @@ async fn restore(
 }
 
 fn conflict(message: &str) -> ApiError {
-    ApiError { status: StatusCode::CONFLICT, message: message.into() }
+    ApiError { status: StatusCode::CONFLICT, message: message.into(), reason: None }
 }
 
 fn unexportable() -> ApiError {
-    ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: "目标消息没有可导出的本地媒体".into() }
+    ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: "目标消息没有可导出的本地媒体".into(), reason: None }
 }

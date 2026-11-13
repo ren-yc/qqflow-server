@@ -1859,6 +1859,71 @@ async fn chatlab_pull_drains_when_client_echoes_both_cursors() {
     assert_eq!(unique.len(), 7, "no duplicates across pages: {ids:?}");
 }
 
+/// 进度游标 v2 的失效语义：同一个游标必须能用，语法坏是 400，v1 旧形态、
+/// 跨会话一律 409 且响应体带 `reason: "cursor_reset_required"`。
+///
+/// 服务端**绝不静默退回时间模式**：退回会让客户端以为续上了，实际从头重放。
+/// 旧行为（v1 认不出 → None → 时间模式；跨代次 → Some(0) → 从头拉）正是这两条
+/// 失败模式，本测试把它们钉死在错误信封上。
+#[tokio::test]
+async fn chatlab_pull_cursor_v2_reset_semantics() {
+    let app = build_router(test_state());
+    let pull = "/api/v1/sessions/10001/messages";
+
+    // 第一页拿到 v2 游标；同一个游标能用（回传后仍 200，且能拿到第二页游标）。
+    let (s1, v1) = call(app.clone(), &format!("{pull}?limit=2&access_token=test-token-123456")).await;
+    assert_eq!(s1, StatusCode::OK);
+    let c0 = v1["sync"]["nextCursor"].as_str().expect("v2 游标必须在场").to_string();
+    let (s2, v2) = call(app.clone(), &format!("{pull}?limit=2&cursor={c0}&access_token=test-token-123456")).await;
+    assert_eq!(s2, StatusCode::OK, "服务端签发的游标原样回传必须可用");
+    assert!(v2["sync"]["nextCursor"].as_str().is_some(), "续页仍要给出游标");
+
+    // 语法坏 → 400（不是退回时间模式）。
+    for bad in ["", "!!!", "AAAA"] {
+        let uri = if bad.is_empty() {
+            format!("{pull}?cursor=&access_token=test-token-123456")
+        } else {
+            format!("{pull}?cursor={bad}&access_token=test-token-123456")
+        };
+        let (s, v) = call(app.clone(), &uri).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "语法坏的游标 {bad:?} 必须 400: {v}");
+        assert!(v["reason"].is_null(), "400 不是失效，不得带 reason: {v}");
+    }
+
+    // 伪造的 v1 旧形态 → 409 + reason。v1 是本服务签发过的历史形态，所以是
+    // 「需要重拉」信号，不是垃圾输入。
+    let v1_cursor = "djEuMC41"; // base64("v1.0.5")，URL-safe 变体
+    let (s, v) = call(app.clone(), &format!("{pull}?cursor={v1_cursor}&access_token=test-token-123456")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "v1 旧游标必须 409: {v}");
+    assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+
+    // 跨会话 → 409 + reason：把群会话的游标拿到 c2c 会话上续拉。两个会话的
+    // 摘要不同，解码必须判「跨会话」而不是沿用。
+    let (s, v) = call(
+        app.clone(),
+        &format!("/api/v1/sessions/u_12345/messages?cursor={c0}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "跨会话的游标必须 409: {v}");
+    assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+
+    // 游标模式的空页：进度保持（游标值不变），不回退为从头拉取。
+    // `watermark` 是易变值（VOLATILE_KEYS），用绝对 `end` 钉死它，让两次
+    // `nextCursor` 逐字可比。
+    let (s, v) = call(
+        app.clone(),
+        &format!("{pull}?limit=2&cursor={c0}&end=1622505700&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 0, "end 过滤让本页为空");
+    assert_eq!(
+        v["sync"]["nextCursor"].as_str(),
+        Some(c0.as_str()),
+        "带 cursor 的空页必须保持进度（游标不变，不回退为从头拉取）"
+    );
+}
+
 #[tokio::test]
 async fn chatlab_pull_huge_offset_does_not_panic() {
     let app = build_router(ts_boundary_state());

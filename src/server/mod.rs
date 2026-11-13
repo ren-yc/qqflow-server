@@ -2,6 +2,7 @@
 //! client-driven account initialization machinery.
 
 pub mod auth;
+pub mod cursor;
 pub mod dto;
 pub mod error;
 pub mod openapi;
@@ -169,6 +170,24 @@ pub fn bump_generation() -> u64 {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
 }
 
+/// 进程级 nonce：游标里带上它，重启后旧游标一律按「需要重拉」处理。
+///
+/// 内存索引的行标识只在**本进程**内连续；跨进程沿用等于按一张新表的位置去读
+/// 旧表。用随机值而不是 pid + 启动时间：后者在同一秒内重启会撞。
+pub fn process_nonce() -> &'static str {
+    static NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NONCE.get_or_init(|| {
+        use rand::RngCore;
+        let mut raw = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut raw);
+        let mut hex = String::with_capacity(16);
+        for b in raw {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        hex
+    })
+}
+
 pub use crate::sync::history::{EventBus, HistoryBuf, HistoryItem, Stamped};
 
 
@@ -299,6 +318,7 @@ async fn method_not_allowed() -> crate::server::error::ApiError {
     crate::server::error::ApiError {
         status: axum::http::StatusCode::METHOD_NOT_ALLOWED,
         message: "方法不允许".into(),
+        reason: None,
     }
 }
 
@@ -805,6 +825,10 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
                 watch_dir.clone(),
                 key.clone(),
             ));
+            // 全量构建的基线采样：`poll_once` 每轮都会采，但第一轮 poll 之前
+            // 必须先有基线——否则首个新消息触发的 poll 会把「建索引时的文件」
+            // 与「此刻的文件」都当首次采样，基线静默换成后者，换库窗口被吞掉。
+            account.sample_source_baseline();
             if !activate_account(state, token, account.clone(), count, || {
                 tokio::spawn(sync::watch::spawn(
                     account,

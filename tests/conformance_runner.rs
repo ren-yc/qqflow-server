@@ -435,6 +435,10 @@ async fn conformance_suite_passes() {
             // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
             // 排空后同秒晚入库的行可经游标续拉到达。
             "opaqueCursor": true,
+            // 游标失效语义（契约 0.11.0）：语法坏 400、身份不符 409 +
+            // reason: cursor_reset_required，绝不静默退回时间模式
+            // （cursor::CursorError 与 chatlab_pull_cursor_v2_reset_semantics）。
+            "cursorReset": true,
             // 本仓库没有回调面（SNS 是微信侧的），如实置 false。
             "sns": false,
                         // 名册来源是 `group_info.db` 的 `group_member3`（见 `store::group_meta`）。
@@ -621,17 +625,20 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
         .collect();
     assert!(got.is_empty(), "end 过滤必须让本页为空");
+    // 游标 v2 是 URL-safe base64（无填充），载荷 `v2.<nonce>.<账号8>.<注册代次>.
+    // <世代>.<会话8>.<rowid>`——rowid 在第 6 段。不解析其余字段：解析游标等于把
+    // 服务端的进度模型抄进测试，这里只需要「不是 0」这一个位。
     use base64::Engine as _;
     let c_empty_raw = v["sync"]["nextCursor"].as_str().unwrap();
     let decoded = String::from_utf8(
-        base64::engine::general_purpose::STANDARD
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(c_empty_raw)
             .unwrap(),
     )
     .unwrap();
     let rid: i64 = decoded
         .split('.')
-        .nth(2)
+        .nth(5)
         .and_then(|s| s.parse().ok())
         .unwrap_or(-1);
     assert_ne!(rid, 0, "空页游标不得编码 rowid 0（从头拉取）：{decoded}");
