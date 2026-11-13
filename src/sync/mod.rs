@@ -66,7 +66,11 @@ pub struct AccountSync {
     /// 退化为只看 stopped。
     registration_guard: Mutex<Option<Box<dyn Fn() -> bool + Send>>>,
     /// Source main db path — derives the `-wal` path the fallback stats.
-    db_path: PathBuf,
+    ///
+    /// 只读暴露给定向导出：发布前的身份复查要在**导出自己**的阻塞任务里再采一次
+    /// 指纹（轮询采样在整个导出期间被 `reader`/`store` 的锁挡住，世代计数必然
+    /// 不动），采样的输入就是这条路径。
+    pub db_path: PathBuf,
     /// `nt_db` directory — sibling group-info databases live here (name maps).
     db_dir: PathBuf,
     /// SQLCipher key — sibling databases share it (name maps).

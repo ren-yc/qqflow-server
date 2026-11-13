@@ -348,6 +348,20 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 ### 导出与媒体
 
 - 定向导出以会话、消息 ID、发送者及时间唯一定位，耗时工作在阻塞池执行，在不对外服务的临时目录写完后，持生命周期锁复查注册身份，再发布文件。实际字节摘要形成可取句柄，非唯一平台文件名不能成为全局地址。
+- 发布前还要复查**数据源身份**：请求开始时采一次指纹（库路径 + 创建时间 + 偏移 1024 起的 salt），发布前再采一次。
+  - 不一致返回 409 加 `reason: "cursor_reset_required"`。只比世代计数不够：它只在同步路径采样时推进，导出的阻塞任务可能持锁让轮询停摆。
+  - 起始采样失败时退回世代比较（尽力检测）；起始采到、发布前采不到，按「无法证明」处理，不发布。回归：`targeted_export_cancels_when_the_source_identity_changes_midway`。
+- 这条复查是**尽力检测**，盲区必须说清：同一库文件的备份还原可能连指纹都不变（salt 与创建时间都可保持不变）。要闭合它得把文件身份做到卷级，本仓不做。
+
+### 拉取面的进度游标
+
+游标是**不透明的身份绑定串**：客户端原样回传，失效时响亮失败，绝不静默退回时间模式。
+
+- 载荷是本进程 nonce、账号摘要、注册代次、数据源世代、会话摘要与最后交付的 rowid。
+  - 会话摘要绑**解析后**的 `(chat_type, talker)` 而不是裸 id：`find_conversation` 的类型回退让两个裸 id 落到同一个会话，它们必须编出同一条线。回归 `chatlab_pull_cursor_v2_reset_semantics`。
+- 失效分两档：语法坏或版本未知是 400；v1 旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
+  - 判据只看身份不看内容：QQ 的追加写入与 WAL checkpoint 都不改变身份线索，放进判据等于让游标每次新消息都失效。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
+- 数据源世代由同步侧每轮采样推进（`db/source_identity.rs`），基线在建索引完成后立一次——没有基线时首个新消息触发的采样会把「建索引时的文件」当首次 sighting，换库窗口被吞掉。回归 `replacing_the_database_changes_the_fingerprint`。
 - 账号切换时清理本次临时文件，不发布旧任务结果。已有可取副本优先复用；新产物按实际字节摘要命名。
 - SDK 在取字节 404 后只触发一次定向导出，并使用实际返回句柄；CLI 对缺失句柄逐消息恢复，以消息 ID、发送者和时间关联回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
 

@@ -132,6 +132,37 @@ async fn targeted_export_cancels_staged_bytes_after_account_switch() {
     assert_eq!(std::fs::read_dir(fixture.root.join("export/.pending")).unwrap().count(), 0);
 }
 
+/// 发布前的数据源身份复查：导出途中换库必须 409，且 staged 字节与 `.pending/`
+/// 都不残留。
+///
+/// 只比世代计数不够：它只在同步路径采样时推进，而导出的阻塞任务可能持锁让轮询
+/// 停摆——计数器必然不动。导出请求自采指纹、发布前再采比对，才是真正起作用的
+/// 那一半（与 weflow 的同名机制对齐）。回归
+/// `targeted_export_cancels_when_the_source_identity_changes_midway`。
+#[tokio::test]
+async fn targeted_export_cancels_when_the_source_identity_changes_midway() {
+    let fixture = Fixture::new(false).await;
+    let state = fixture.state.clone();
+    let nt_db = fixture.root.join("nt_db");
+    let error = server::handlers::media_export::restore_before_publish(
+        state.clone(), serde_json::from_value(Fixture::target()).unwrap(), move || {
+            // 在 staging 与 publish 之间把库文件整个换掉：写一份 salt 不同的
+            // 合法 QQ 形状库。**不动** `raw.db` 与存活 writer——它们属于夹具的
+            // 「运行中的 QQ」，真实换库也不会动到这个进程外的东西；被替换的
+            // 只是服务端读的那份 nt_msg.db（写场景 = 删库重建 / 备份还原）。
+            let db = nt_db.join("nt_msg.db");
+            let mut bytes = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
+            bytes.extend_from_slice(&[0xEEu8; 16]); // 新 salt
+            bytes.extend_from_slice(&[0u8; 4096]);
+            std::fs::write(&db, bytes).expect("写替换库");
+        },
+    ).await.unwrap_err();
+    assert_eq!(error.status, StatusCode::CONFLICT, "换库必须让导出失败: {:?}", error.message);
+    assert_eq!(error.reason, Some("cursor_reset_required"), "409 带机器可读 reason: {:?}", error.reason);
+    assert_eq!(std::fs::read_dir(fixture.root.join("export/10001/images")).unwrap().count(), 0, "不落产物");
+    assert_eq!(std::fs::read_dir(fixture.root.join("export/.pending")).unwrap().count(), 0, "无残留 pending");
+}
+
 #[tokio::test]
 async fn targeted_export_concurrent_retries_share_complete_bytes() {
     let fixture = Fixture::new(false).await;
