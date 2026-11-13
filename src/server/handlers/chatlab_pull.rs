@@ -325,11 +325,24 @@ pub async fn handler(
             .or(cursor_rowid)
             .unwrap_or(0)
     } else if page.is_empty() {
+        // 水位线内找不到任何行时**不能**退回 0：那种情况下客户端已经拉过一批
+        // （否则它的 `since` 从哪来），编码 0 等于让它从头重放。改为退到
+        // 「`since` 界内已确立的最大 rowid」——`since` 之前的行客户端见过。
+        // 两者都空（首次请求就没有行）才编码 0，那才是真正的「从头拉」。
         conv.msgs
             .iter()
             .filter(|m| m.ts <= watermark)
             .map(|m| m.rowid)
             .max()
+            .or_else(|| {
+                since.and_then(|s| {
+                    conv.msgs
+                        .iter()
+                        .filter(|m| m.ts <= s)
+                        .map(|m| m.rowid)
+                        .max()
+                })
+            })
             .unwrap_or(0)
     } else {
         page.iter().map(|&i| conv.msgs[i].rowid).max().unwrap_or(0)
