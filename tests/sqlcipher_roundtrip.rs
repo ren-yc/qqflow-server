@@ -37,7 +37,7 @@ fn live_read_wal_and_checkpoint() {
 
     // ---- writer (simulated QQ client), kept alive -------------------------
     let (writer, raw) = common::open_fake_writer(&dir);
-    let ts: i64 = 2051222400;
+    let ts: i64 = 1622505600;
     let insert = |conn: &Connection, rowid: i64, seq: i64, nick: &str, text: &str| {
         conn.execute(
             "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",

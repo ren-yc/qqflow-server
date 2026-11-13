@@ -1138,7 +1138,15 @@ mod tests {
         // 末尾换行检查只看最后一字节，中部损坏只有这里能发现。
         let mut corrupted = b"{\"_type\":\"header\"}\n".to_vec();
         corrupted.extend_from_slice(&[0xFF, 0xFE, 0xC0, 0x80]);
+        // 夹具必须**真的满足复用判据**（以换行收尾）。否则真正的 --resume 会先把它判成
+        // 不完整、直接重写，这条用例就永远碰不到「复用的产物中部损坏」——它证明的只是
+        // 那个辅助函数，不是续跑路径。
+        corrupted.push(b'\n');
         std::fs::write(d.join(artifact), &corrupted).unwrap();
+        assert!(
+            export::file_is_complete(&d.join(artifact), export::Format::Jsonl),
+            "夹具必须满足复用判据，否则续跑会重写而不是复用"
+        );
         let err = reused_dangling_handles(&index, &reused, &d.join("media"))
             .expect_err("中部损坏必须显式失败，不能静默当作无悬空");
         assert!(

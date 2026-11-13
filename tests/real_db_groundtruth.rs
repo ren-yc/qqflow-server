@@ -395,7 +395,7 @@ fn fake_db_index_media_metadata() {
     assert_eq!(media.file_name.as_deref(), Some("fake_image_01.jpg"));
     assert_eq!(media.size, Some(12345));
     assert_eq!((media.width, media.height), (Some(640), Some(480)));
-    assert_eq!(m.ts, 2051222400, "40050 authoritative over seq>>32");
+    assert_eq!(m.ts, 1622505600, "40050 authoritative over seq>>32");
     assert_eq!(m.direction, Some(0), "image row dir=0");
 
     // MessageOut: is_send mapping (0 other / 1 self / 3 system), media id.

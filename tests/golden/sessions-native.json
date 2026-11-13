@@ -4,21 +4,21 @@
     "sessions": [
       {
         "displayName": "测试群a",
-        "lastTimestamp": 2051222400,
+        "lastTimestamp": 1622505600,
         "type": 2,
         "unreadCount": 0,
         "username": "10001"
       },
       {
         "displayName": "第二群",
-        "lastTimestamp": 2051222400,
+        "lastTimestamp": 1622505600,
         "type": 2,
         "unreadCount": 0,
         "username": "20002"
       },
       {
         "displayName": "李四他哥",
-        "lastTimestamp": 2051222400,
+        "lastTimestamp": 1622505600,
         "type": 1,
         "unreadCount": 0,
         "username": "u_12345"

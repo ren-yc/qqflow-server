@@ -24,10 +24,10 @@ impl Fixture {
         common::append_image_row(&writer, 7, &nt_db);
         if duplicate { common::append_image_row(&writer, 7, &nt_db); }
         writer.execute("UPDATE group_msg_table SET \"40050\"=?1 WHERE \"40001\"=?2 AND \"40020\"='u_c'",
-            rusqlite::params![2051222300i64, (2051222400i64 << 32) | 7]).unwrap();
+            rusqlite::params![1622505500i64, (1622505600i64 << 32) | 7]).unwrap();
         // Same platform ID with another sender is not ambiguous.
         writer.execute("INSERT INTO group_msg_table SELECT \"40021\",\"40001\",'another',\"40093\",\"40800\",\"40013\",\"40050\",\"40090\" FROM group_msg_table WHERE \"40020\"='u_c' AND \"40001\"=?1 LIMIT 1",
-            [(2051222400i64 << 32) | 7]).unwrap();
+            [(1622505600i64 << 32) | 7]).unwrap();
         let path = common::materialize_source(&nt_db);
         std::fs::write(common::fake_media_path(&nt_db), b"\x89PNG\r\n\x1a\nactual bytes").unwrap();
         let (shutdown, rx) = tokio::sync::watch::channel(false);
@@ -46,8 +46,8 @@ impl Fixture {
     }
 
     fn target() -> Value {
-        json!({"talker":"10001", "platformMessageId": ((2051222400i64 << 32) | 7).to_string(),
-            "sender":"u_c", "timestamp":2051222300i64})
+        json!({"talker":"10001", "platformMessageId": ((1622505600i64 << 32) | 7).to_string(),
+            "sender":"u_c", "timestamp":1622505500i64})
     }
 
     async fn export(&self, target: Value) -> (StatusCode, Value) {
@@ -105,8 +105,8 @@ async fn targeted_export_distinguishes_missing_ambiguous_and_io_failures() {
     let mut missing = Fixture::target(); missing["platformMessageId"] = json!("absent");
     assert_eq!(fixture.export(missing).await.0, StatusCode::NOT_FOUND);
     assert_eq!(fixture.export(json!({})).await.0, StatusCode::BAD_REQUEST);
-    let plain = json!({"talker":"10001", "platformMessageId":((2051222400i64 << 32) | 1).to_string(),
-        "sender":"u_a", "timestamp":2051222400i64});
+    let plain = json!({"talker":"10001", "platformMessageId":((1622505600i64 << 32) | 1).to_string(),
+        "sender":"u_a", "timestamp":1622505600i64});
     assert_eq!(fixture.export(plain).await.0, StatusCode::UNPROCESSABLE_ENTITY);
 
     let fixture = Fixture::new(false).await;
@@ -148,7 +148,7 @@ async fn targeted_export_reuses_existing_copy_after_source_removal() {
     let source = common::fake_media_path(&fixture.root.join("nt_db"));
     std::fs::write(&source, b"\xff\xd8\xffjpeg bytes").unwrap();
     let app = server::build_router(fixture.state.clone());
-    let (status, result) = common::get_json(app, "/chatlab/messages?talker=10001&media=1&start=2051222300&end=2051222300",
+    let (status, result) = common::get_json(app, "/chatlab/messages?talker=10001&media=1&start=1622505500&end=1622505500",
         &[("authorization", "Bearer target-token")]).await;
     assert_eq!(status, StatusCode::OK);
     let previous = result["messages"].as_array().unwrap().iter().find(|m| m["sender"] == "u_c").unwrap()["media"]["fileName"].as_str().unwrap();

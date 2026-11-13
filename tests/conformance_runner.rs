@@ -181,7 +181,7 @@ fn harness_router(
                         assert!(ready, "harness 重新注册后 30 秒内必须 ready");
                     }
                     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let new_seq = ((2051222400i64 + 120) << 32) | (9000 + seq);
+                    let new_seq = ((1622505600i64 + 120) << 32) | (9000 + seq);
                     let writer = writer.clone();
                     let ins = tokio::task::spawn_blocking(move || {
                         let conn = writer.lock();
@@ -194,7 +194,7 @@ fn harness_router(
                                 "张三",
                                 b"cursor-boundary append".as_slice(),
                                 1,
-                                2051222400i64 + 120,
+                                1622505600i64 + 120,
                                 "张三群名片"
                             ],
                         )
@@ -265,12 +265,12 @@ fn harness_router(
                                     // `seq` 的高 32 位是时间戳：**必须晚于夹具既有的行**，否则新行落在
                                     // 水位线之内，`poll_once` 返回 0 —— 症状又是「SSE 收不到事件」
                                     // （与 weflow 那边同一个坑：追加的时间戳要越过水位线）。
-                                    ((2051222400i64 + 60) << 32) | (99 + seq),
+                                    ((1622505600i64 + 60) << 32) | (99 + seq),
                                     "u_a",
                                     "张三",
                                     "一致性套件新增".as_bytes(),
                                     1,
-                                    2051222400i64 + 60,
+                                    1622505600i64 + 60,
                                     "张三群名片"
                                 ],
                             )
@@ -426,8 +426,8 @@ async fn conformance_suite_passes() {
             // 夹具造库时写入的 fake_image_01.jpg，句柄即 mediaId 本身。
             "exported_media": { "id": "aabbccddeeff00112233445566778899", "expect": {} },
             "targeted_media": {"id":"10001", "expect":{
-                "platformMessageId": ((2051222400i64 << 32) | 7).to_string(),
-                "sender":"u_c", "timestamp":2051222400i64}},
+                "platformMessageId": ((1622505600i64 << 32) | 7).to_string(),
+                "sender":"u_c", "timestamp":1622505600i64}},
         },
         "capabilities": {
             "mediaById": true,
@@ -520,11 +520,11 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     let (writer, _main) = common::open_fake_source(&nt_db, 0);
     let writer = Arc::new(parking_lot::Mutex::new(writer));
     common::write_fake_group_info(&nt_db);
-    // 回溯入库在**注册之前**：时间戳早于标准数据集（2051222400 → 2051222300）、
+    // 回溯入库在**注册之前**：时间戳早于标准数据集（1622505600 → 1622505500）、
     // rowid 更大（插入顺序在后）。注册后的全量索引把它一并收进来。
     {
         let conn = writer.lock();
-        common::append_group_row_backdated(&conn, 990, 990, 2051222300);
+        common::append_group_row_backdated(&conn, 990, 990, 1622505500);
     }
     common::materialize_source(&nt_db);
     let src = nt_db.join("nt_msg.db");
@@ -551,7 +551,7 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
 
     let pull_url = format!("/chatlab/sessions/{}/messages", "10001");
-    let backdated = format!("{}", (2051222300i64 << 32) | 990);
+    let backdated = format!("{}", (1622505500i64 << 32) | 990);
 
     // 段一：单页排空 + 一次续拉——无重放。
     // limit 放大到能一页装下全部 6 行（5 行常规 + 回溯行）。全部常规行共享
@@ -592,7 +592,7 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     //    游标再丢掉时间过滤，必须不重放全历史。
     let v = json_of(
         &client,
-        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end={}", 2051222350)),
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end={}", 1622505550)),
     )
     .await;
     let got: Vec<String> = v["messages"]
@@ -605,13 +605,13 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     let c1 = v["sync"]["nextCursor"].as_str().unwrap();
     assert_eq!(c1, c0, "带 cursor 的空页必须保持进度（游标不变）");
 
-    // 无 cursor 的空 time-filtered 页：窗口 (2051222320, 2051222350] 内
-    // 无行，但「ts ≤ end 的行都已确立」——游标必须编码回溯行（ts=2051222300、
+    // 无 cursor 的空 time-filtered 页：窗口 (1622505520, 1622505550] 内
+    // 无行，但「ts ≤ end 的行都已确立」——游标必须编码回溯行（ts=1622505500、
     // rowid 最大），而不是 0（从头拉取）。周期轮询的客户端（end=now）采纳
     // 空页游标再丢掉时间过滤，必须不重放全历史。
     let v = json_of(
         &client,
-        req("GET", &format!("{pull_url}?limit=5000&since=2051222320&end=2051222350")),
+        req("GET", &format!("{pull_url}?limit=5000&since=1622505520&end=1622505550")),
     )
     .await;
     let got: Vec<String> = v["messages"]
@@ -670,7 +670,7 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
     }
     // 基准游标是段一的排空游标 c0（全量排空线，全部行在链内）；段二的空页
-    // 游标属于「end=2051222350 的时间过滤线」，拿它接无过滤链会跳过
+    // 游标属于「end=1622505550 的时间过滤线」，拿它接无过滤链会跳过
     // rowid 更小的常规行——那不是缺陷，是线语义。
     let v = json_of(
         &client,
@@ -685,7 +685,7 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .collect();
     assert_eq!(
         got,
-        vec![format!("{}", (2051222400i64 << 32) | (991 + seq))],
+        vec![format!("{}", (1622505600i64 << 32) | (991 + seq))],
         "排空后追加的行必须经排空游标可达（且只交付它）"
     );
 
@@ -736,9 +736,9 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     let mut expected = [
         // 本次循环交付的是 rowid 大于排空游标的三条同秒追加行（段三一条 + 这里
         // 两条），按 rowid 序被 limit=2 切成 2+1 两页。
-        (2051222400i64 << 32) | (991 + seq),
-        (2051222400i64 << 32) | (992 + seq2),
-        (2051222400i64 << 32) | (993 + seq2),
+        (1622505600i64 << 32) | (991 + seq),
+        (1622505600i64 << 32) | (992 + seq2),
+        (1622505600i64 << 32) | (993 + seq2),
     ]
     .iter()
     .map(|v| v.to_string())

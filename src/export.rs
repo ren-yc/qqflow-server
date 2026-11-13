@@ -507,7 +507,7 @@ fn previous_index(out_dir: &Path) -> BTreeMap<String, Value> {
 /// 判据刻意便宜，但能抓住真实残缺：空文件、jsonl 末尾没有换行（flush 丢失、进程被杀留下的
 /// 半行）、json 缺收尾花括号。写盘已经改成先 .part 再 rename，最终名只在成功后出现——这些
 /// 内容判据只是深度防御，防的是旧版本或外力留在最终名上的残缺文件。
-fn file_is_complete(path: &Path, format: Format) -> bool {
+pub(crate) fn file_is_complete(path: &Path, format: Format) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     match std::fs::metadata(path) {
         Ok(m) if m.len() == 0 => false,

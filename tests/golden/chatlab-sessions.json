@@ -3,12 +3,12 @@
     "count": 3,
     "page": {
       "hasMore": false,
-      "nextCursor": "<volatile>"
+      "nextCursor": null
     },
     "sessions": [
       {
         "id": "10001",
-        "lastMessageAt": 2051222400,
+        "lastMessageAt": 1622505600,
         "memberCount": 4,
         "messageCount": 6,
         "name": "测试群a",
@@ -17,7 +17,7 @@
       },
       {
         "id": "20002",
-        "lastMessageAt": 2051222400,
+        "lastMessageAt": 1622505600,
         "memberCount": 1,
         "messageCount": 1,
         "name": "第二群",
@@ -26,7 +26,7 @@
       },
       {
         "id": "u_12345",
-        "lastMessageAt": 2051222400,
+        "lastMessageAt": 1622505600,
         "messageCount": 2,
         "name": "李四他哥",
         "platform": "qq",

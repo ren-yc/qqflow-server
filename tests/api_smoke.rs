@@ -229,6 +229,34 @@ async fn stale_refresh_after_deregister_does_not_rewrite_names() {
     );
 }
 
+/// 令牌路径：句柄**没有**被 stop，但它的注册令牌已经失效（有更晚的注册接手）。
+/// 这条路径与上面的 `stopped` 路径是两道不同的闸：只测 stopped 时，把
+/// `registration_guard` 换成恒 true 的闭包、甚至整个删掉，测试依然是绿的。
+#[tokio::test]
+async fn stale_registration_token_discards_names_snapshot() {
+    let (state, _root) = real_test_state().await;
+    let stale = state.sync.snapshot().into_iter().next().expect("one account registered");
+    assert!(!stale.is_stopped(), "这条用例必须走令牌路径，不能靠 stopped 提前返回");
+
+    // 等价于「又发生了一次注册」：只推进注册计数，不 stop 句柄。
+    state.init.registration.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    // 放一个哨兵：令牌失效的句柄若真的写回名字表，整表会被替换、哨兵消失。
+    state
+        .store
+        .write()
+        .names
+        .uid_remark
+        .insert("sentinel".into(), "哨兵".into());
+    stale.refresh_names();
+    let store = state.store.read();
+    assert_eq!(
+        store.names.uid_remark.get("sentinel").map(String::as_str),
+        Some("哨兵"),
+        "令牌失效的句柄不得改写名字表"
+    );
+}
+
 /// Send a GET through `app` and return (status, json).
 async fn call(app: axum::Router, uri: &str) -> (StatusCode, Value) {
     let resp = app
@@ -2508,15 +2536,17 @@ mod golden {
     use super::*;
 
     /// 值易变、但键必须留下的字段。按**键名**匹配，因此清单不随端点增长。
+    ///
+    /// `nextCursor` **不在**这里：同名键装的是两种东西——`sync.nextCursor` 是不透明的
+    /// 进度游标（base64(generation + rowid)，generation 随注销计数变），`page.nextCursor`
+    /// 是确定的偏移量字符串。整名掩掉会把「排空后从 `null` 变成数字或字符串」这种回归
+    /// 一起吃掉，所以按父键区分，见 `mask`。
     const VOLATILE_KEYS: &[&str] = &[
         // 每次请求都不同
         "exportedAt",
         // 由 `chrono::Utc::now()` 派生
         "watermark",
         "nextSince",
-        // 不透明进度游标（pull 面 0.9.0）：base64(generation + rowid)，
-        // generation 随进程内注销计数变化 —— 值不确定，键必须留下。
-        "nextCursor",
         // 夹具的临时目录
         "db_path",
         "dir",
@@ -2543,26 +2573,46 @@ mod golden {
     /// 两侧传的**根不一样**，强度也就不同：weflow 传本次运行的私有目录
     /// （`target/test-tmp/golden-<pid>`），本文件传整个 `temp_dir()`——所以这里能拦到更多
     /// （任何源自临时目录的泄漏），weflow 只拦它自己那一个目录。别把两者当等价。
-    fn mask(value: &mut Value, tmp: &str) {
+    fn mask(value: &mut Value, tmp: &str, parent: &str) {
         match value {
             Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
-                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                    // `sync.nextCursor` 是每次运行都可能不同的进度游标：掩值之前先证明
+                    // 它确实是非空字符串，否则「游标返回 null / 数字」的回归会被掩码
+                    // 顺手盖掉，快照照样绿。`page.nextCursor` 是确定的偏移量，不掩，
+                    // 让它以真实值参与比对。
+                    let volatile = if key == "nextCursor" {
+                        match val {
+                            // 对象/数组位置上是 schema 形状，不是取值。
+                            Value::Object(_) | Value::Array(_) => false,
+                            _ if parent == "sync" => {
+                                assert!(
+                                    val.as_str().is_some_and(|s| !s.is_empty()),
+                                    "sync.nextCursor 必须是非空字符串，实际是 {val}"
+                                );
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        VOLATILE_KEYS.contains(&key.as_str())
+                    };
+                    if volatile {
                         // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
                         // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
                         // description 与类型一起从比对里抹掉——字段语义写反也不会红。
                         match val {
-                            Value::Object(_) | Value::Array(_) => mask(val, tmp),
+                            Value::Object(_) | Value::Array(_) => mask(val, tmp, key),
                             _ => *val = Value::String("<volatile>".into()),
                         }
                     } else {
-                        mask(val, tmp);
+                        mask(val, tmp, key);
                     }
                 }
             }
             Value::Array(items) => {
                 for it in items.iter_mut() {
-                    mask(it, tmp);
+                    mask(it, tmp, parent);
                 }
             }
             Value::String(s) => {
@@ -2781,7 +2831,7 @@ mod golden {
         let keys = key_order(&raw_body);
         let mut snapshot =
             serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
-        mask(&mut snapshot, tmp_root);
+        mask(&mut snapshot, tmp_root, "");
         assert_no_wall_clock(&snapshot, name);
         let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
@@ -2877,7 +2927,7 @@ mod golden {
             let keys = key_order(&raw_body);
             let mut snapshot =
                 serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
-            mask(&mut snapshot, &tmp_root);
+            mask(&mut snapshot, &tmp_root, "");
             assert_no_wall_clock(&snapshot, name);
             let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
