@@ -682,8 +682,8 @@ class Client:
         if response.status_code in (405, 501):
             raise ShapeError("server does not support mediaExportByMessage")
         exported = self._validate(gen.MediaExportResult, await self._decode(response, url))
+        # `fileName` 是展示名，`mediaId` 才是句柄：两者通常不相等，不能要求相等。
         if (not exported.success or not exported.media_id.strip()
-                or exported.file_name != exported.media_id
                 or exported.media_url != "/api/v1/media/" + exported.media_id):
             raise ShapeError("export did not return a valid media handle")
         return exported
