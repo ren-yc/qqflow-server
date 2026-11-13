@@ -248,6 +248,13 @@ pub fn resolve_local_path(local_path: &str, media_root: Option<&Path>) -> Option
 
 /// Resolve a contained source while preserving actual filesystem failures.
 pub fn resolve_local_path_checked(local_path: &str, media_root: Option<&Path>) -> std::io::Result<Option<PathBuf>> {
+    // QQ 把部分缓存原件写成 `::NTOSFull::<绝对路径>`。它是已知的无效值：`::` 让它不
+    // 算绝对路径，拼进 media root 后 canonicalize 必然报 InvalidFilename。按「没有可用
+    // 本地路径」处理，让调用方走缓存回退；把它当致命错误抛出去，会让整条回退链在第一个
+    // 候选处就断掉（回归：resolve_rejects_qq_ntosfull_marker）。
+    if local_path.starts_with("::NTOSFull::") {
+        return Ok(None);
+    }
     let raw = Path::new(local_path);
     let Some(root) = media_root else { return Ok(None) };
     let joined = if raw.is_absolute() {
