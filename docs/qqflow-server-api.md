@@ -395,16 +395,17 @@ curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/js
 **响应**
 
 ```json
-{"success":true,"mediaId":"<digest>.png","fileName":"<digest>.png","mediaUrl":"/api/v1/media/<digest>.png"}
+{"success":true,"mediaId":"<64-hex>.png","fileName":"fake_image_01.jpg","mediaUrl":"/api/v1/media/<64-hex>.png"}
 ```
 
-- 返回实际文件名和不含凭据的根相对地址；随后通过 `GET /api/v1/media/{id}` 取字节。接口不下载任意外链。
+- `mediaId` 是可取句柄：URL 安全单段 token，由落盘字节的摘要派生。`fileName` 是消息自带的展示名（取不到时为空串），**不能拿它取字节**，两者通常不相等。
+- `mediaUrl` 是不含凭据的根相对地址，末段就是 `mediaId`；随后通过 `GET /api/v1/media/{id}` 取字节。接口不下载任意外链。
 - 字段非法为 400、未鉴权为 401、目标或源文件缺失为 404、目标不唯一或注册切换为 409。
 - 无可导出的本地媒体为 422、读取或导出失败为 500、账号未就绪为 503。旧消息不受默认分页大小限制。
 
 ### GET `/api/v1/media/{id}` — 按 id 取媒体字节（唯一的字节面）
 
-`{id}` 是 store 键或导出文件名，也就是消息的 `media.fileName` 或 `mediaId`。
+`{id}` 是 store 键或导出产物文件名（消息的 `mediaId`）；消息面的 `media.fileName` 只在导出回填后才与产物名相同。
 
 **请求**：
 ```bash
@@ -416,7 +417,7 @@ curl -H "Authorization: Bearer <token>" \
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `id` | string(path) | 是 | store 键或导出文件名，即消息的 `media.fileName` / `mediaId` |
+| `id` | string(path) | 是 | store 键或导出产物文件名，即消息的 `mediaId` |
 
 **响应**：
 ```text

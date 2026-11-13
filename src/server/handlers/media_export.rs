@@ -76,7 +76,8 @@ async fn restore(
             .ok_or_else(|| ApiError::not_found("原始媒体已不可恢复"))?
             .publish().map_err(|_| ApiError::internal("媒体发布失败"))?;
         Ok(MediaExportResult {
-            file_name: result.file_name.clone(), media_id: result.file_name.clone(),
+            file_name: media.file_name.clone().unwrap_or_default(),
+            media_id: result.file_name.clone(),
             media_url: format!("/api/v1/media/{}", result.file_name), success: true,
         })
     }).await.map_err(|_| ApiError::internal("媒体导出任务异常"))?

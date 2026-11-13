@@ -85,7 +85,10 @@ async fn targeted_export_restores_old_media_with_actual_extension_and_handle() {
     assert_eq!(status, StatusCode::OK, "{first}");
     let id = first["mediaId"].as_str().unwrap();
     assert!(id.ends_with(".png"));
-    assert_eq!(first["fileName"], id);
+    let display = first["fileName"].as_str().unwrap();
+    assert!(!display.is_empty() && display.ends_with(".jpg"),
+        "fileName 是消息元数据里的展示名（本夹具是平台原名）：{first}");
+    assert_ne!(display, id, "fileName 是展示名、mediaId 才是句柄：{first}");
     assert_eq!(first["mediaUrl"], format!("/api/v1/media/{id}"));
     assert_eq!(fixture.bytes(id).await, b"\x89PNG\r\n\x1a\nactual bytes");
     std::fs::remove_file(fixture.root.join("export/10001/images").join(id)).unwrap();
