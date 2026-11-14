@@ -626,8 +626,9 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .collect();
     assert!(got.is_empty(), "end 过滤必须让本页为空");
     // 游标 v2 是 URL-safe base64（无填充），载荷 `v2.<nonce>.<账号8>.<注册代次>.
-    // <世代>.<会话8>.<rowid>`——rowid 在第 6 段。不解析其余字段：解析游标等于把
-    // 服务端的进度模型抄进测试，这里只需要「不是 0」这一个位。
+    // <世代>.<会话8>.<rowid>`——rowid 是第 7 段（零基索引 6）。不解析其余字段：
+    // 解析游标等于把服务端的进度模型抄进测试，这里只需要「不是 0」这一个位。
+    // 段缺失或解析失败必须响亮报错：回退值会让「编码 rowid 0」的回归静默过关。
     use base64::Engine as _;
     let c_empty_raw = v["sync"]["nextCursor"].as_str().unwrap();
     let decoded = String::from_utf8(
@@ -638,9 +639,10 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     .unwrap();
     let rid: i64 = decoded
         .split('.')
-        .nth(5)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(-1);
+        .nth(6)
+        .expect("游标 v2 载荷缺少 rowid 段")
+        .parse()
+        .expect("游标 rowid 段必须是整数");
     assert_ne!(rid, 0, "空页游标不得编码 rowid 0（从头拉取）：{decoded}");
     let c_empty = c_empty_raw.to_string();
     // 采纳空页游标续拉（不带时间过滤）：不得重放全历史。

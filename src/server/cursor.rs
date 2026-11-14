@@ -194,10 +194,15 @@ impl CursorContext {
         if nonce != self.nonce {
             return Err(CursorError::Reset("这条游标由另一个服务进程签发，重启后必须从头拉取"));
         }
-        if hex_from(account) != Some(self.account) {
+        // 身份字段**先验语法再比身份**：字段形态非法（非十六进制、长度不对）是
+        // 语法坏（400），不是「身份对不上」（409）。两档处置相反——把语法错判成
+        // 409 会让客户端对一条永远重试不成功的损坏游标执行全量重拉。
+        let account = hex_from(account).ok_or(CursorError::Malformed)?;
+        if account != self.account {
             return Err(CursorError::Reset("这条游标属于另一个账号"));
         }
-        if hex_from(session) != Some(self.session) {
+        let session = hex_from(session).ok_or(CursorError::Malformed)?;
+        if session != self.session {
             return Err(CursorError::Reset("这条游标属于另一个会话"));
         }
         let registration: u64 = registration.parse().map_err(|_| CursorError::Malformed)?;
@@ -233,6 +238,22 @@ mod tests {
     fn malformed_cursor_is_a_bad_request() {
         for bad in ["", "!!!", "AAAA", "djI", "djIu", "djIuYS5i"] {
             assert_eq!(ctx().decode(bad), Err(CursorError::Malformed), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn syntactically_broken_identity_fields_are_malformed_not_reset() {
+        let encode = |payload: &str| b64_url_no_pad(payload.as_bytes());
+        let c = ctx();
+        // nonce 正确、账号/会话字段形态非法：这是语法坏（400），不是身份不符（409）。
+        // 依次为：账号字段非 hex、会话字段非 hex、会话字段长度不足 16。
+        let cases = [
+            encode(&format!("v2.{}.xyz.3.7.{}.1", c.nonce, hex8(&[2u8; 8]))),
+            encode(&format!("v2.{}.{}.3.7.zz.1", c.nonce, hex8(&[1u8; 8]))),
+            encode(&format!("v2.{}.{}.3.7.aabbccdd.1", c.nonce, hex8(&[1u8; 8]))),
+        ];
+        for cursor in cases {
+            assert_eq!(c.decode(&cursor), Err(CursorError::Malformed), "{cursor}");
         }
     }
 
