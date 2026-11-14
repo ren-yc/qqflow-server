@@ -2,12 +2,13 @@
 
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.11.0] - 2026-11-14
 
 ### 新增
 
-- 新增 `POST /api/v1/media/export`，按完整消息身份恢复窗口外的本地媒体，返回实际摘要句柄；歧义、源缺失和导出失败保留不同错误状态。回归：`targeted_export_restores_old_media_with_actual_extension_and_handle`。
-- Rust 和 Python SDK 新增 `export_media_by_message`；媒体恢复最多触发一次定向导出。CLI 采用同一接口并按消息身份回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
+- 拉取面进度游标升级为**能自证身份的 v2**：载荷绑定进程 nonce、账号摘要、注册代次、数据源世代与会话摘要，续拉请求经 `cursor` 参数原样回传（给出时取代 `since`/`offset`）。游标按入库序（rowid）翻页，乱序行的时间序因此可能与入库序不同——这是「排空判据 = 入库进度」的直接后果。回归：`chatlab_pull_cursor_v2_reset_semantics`、`cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order`。
+- 新增数据源身份指纹（路径 + 创建时间 + salt 摘要）与逐轮采样：同步每轮 poll 与全量构建基线各采一次，身份变化才推进世代；定向媒体导出在发布产物前复查，变化即取消且不落产物。备份还原（同一库文件内容还原）检测不到——身份类线索的边界见 `docs/architecture.md`。回归：`targeted_export_cancels_when_the_source_identity_changes_midway`。
+- 接口契约 pin 升 `v0.11.0`：新增 `cursorReset` 能力与两条用例（语法坏 400、跨会话 409 + `reason`），随一致性套件执行（41/41）。
 
 ### 变更
 
@@ -15,11 +16,17 @@
 
 ### 破坏性变更
 
+- **游标失效语义**：旧 v1 游标不再被识别为「从头拉取」，改返回 409 加 `reason: "cursor_reset_required"`——客户端丢弃游标、从头拉一次，不要重试同一条；语法坏的游标返回 400。服务端绝不静默退回时间模式：静默会让客户端以为续上了，实际从头重放。迁移：捕获 409 + `reason` 后重新从头拉取（SDK 的游标续传方法随 v0.11.0 pin 同批规划，失效当前归入 `Status` 错误）。回归：`chatlab_pull_cursor_v2_reset_semantics`。
 - 定向导出响应的 `fileName` 改为消息自带的展示名（取不到时为空串），`mediaId` 才是可取句柄，两者通常不相等。迁移：取字节一律用 `mediaId`，不要拿 `fileName` 拼地址。回归：`targeted_export_restores_old_media_with_actual_extension_and_handle`。
 - 自动媒体恢复改用定向接口；旧服务缺少该能力时显式报错，源不可恢复时 CLI 导出返回失败。迁移：服务与 SDK/CLI 同步升级，调用方处理 404、409 和 422。回归：`targeted_export_reports_missing_server_capability`、`with_media_reports_an_unrecoverable_source`。
+- **换库处置**：轮询发现数据源身份变化时账号转 Error 待重注册（迁移：重注册即全量重建），索引基线绑定构建时的数据源、安装前复查指纹（构建期间换库丢弃本次索引）。回归：`source_replacement_flips_the_account_to_error`、`build_time_source_replacement_discards_the_index`。
 
 ### 修复
 
+- 排空页游标编码**已交付集合的最大 rowid**而不是页末行：回溯入库的行时间早、rowid 大，时间序把页末让给别人的时候，页末行不是已交付集合的最大值。回归：`cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order`。
+- 空页游标退到 `since` 界内最大 rowid：水位线界内无行时编 0 会让客户端重放全历史。回归：`cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order`（空页段）。
+- 游标的账号/会话字段**先验语法再比身份**：形态非法（非十六进制、长度不对）从 409 改 400——语法坏与身份不符的处置相反，判成失效会让客户端对一条重试必败的损坏游标全量重拉。回归：`syntactically_broken_identity_fields_are_malformed_not_reset`（`server::cursor` 单元测试）。
+- 定向导出复用自己发布的摘要副本：源缓存删除后再导出，此前按 store 键名（md5）找不到第一次发布的 64 位摘要句柄而 404。回归：`targeted_export_reuses_its_own_digest_copy_after_source_removal`。
 - 定向导出的候选循环跳过空串与非普通文件候选：空串 45812 此前把 media root 目录本身当成「源已找到」提前终结循环，缓存 fallback 明明可用却落 500。回归：`targeted_export_empty_local_path_falls_back_to_cache`。
 - 轮询发现数据源身份变化（换库）时账号转 Error 待重注册，不再带旧水位线继续增量：替换库中 rowid 不超过旧水位线的行会被永久滤掉。迁移：重注册即全量重建，无需额外操作。回归：`source_replacement_flips_the_account_to_error`。
 - 索引基线绑定构建时的数据源，安装前复查指纹：构建期间换库丢弃本次索引并转 Error，不再把替换后的文件当旧索引的基线装进账号。回归：`build_time_source_replacement_discards_the_index`。
