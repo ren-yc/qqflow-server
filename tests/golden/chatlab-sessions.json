@@ -1,6 +1,6 @@
 {
   "body": {
-    "count": 1,
+    "count": 3,
     "page": {
       "hasMore": false,
       "nextCursor": null
@@ -8,11 +8,29 @@
     "sessions": [
       {
         "id": "10001",
-        "lastMessageAt": 26481,
-        "messageCount": 2,
-        "name": "项目群",
+        "lastMessageAt": 1622505600,
+        "memberCount": 4,
+        "messageCount": 6,
+        "name": "测试群a",
         "platform": "qq",
         "type": "group"
+      },
+      {
+        "id": "20002",
+        "lastMessageAt": 1622505600,
+        "memberCount": 1,
+        "messageCount": 1,
+        "name": "第二群",
+        "platform": "qq",
+        "type": "group"
+      },
+      {
+        "id": "u_12345",
+        "lastMessageAt": 1622505600,
+        "messageCount": 2,
+        "name": "李四他哥",
+        "platform": "qq",
+        "type": "private"
       }
     ]
   },
@@ -22,6 +40,20 @@
     "hasMore",
     "nextCursor",
     "sessions",
+    "id",
+    "lastMessageAt",
+    "messageCount",
+    "name",
+    "platform",
+    "type",
+    "memberCount",
+    "id",
+    "lastMessageAt",
+    "messageCount",
+    "name",
+    "platform",
+    "type",
+    "memberCount",
     "id",
     "lastMessageAt",
     "messageCount",

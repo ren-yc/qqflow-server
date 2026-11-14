@@ -45,6 +45,10 @@ class Mock:
         self.pull_pages: list[dict] = []
         self.pull_queries: list[dict] = []
         self.media_calls: list[str] = []
+        self.export_calls: list[dict] = []
+        self.export_status = 200
+        self.export_response = {"success": True, "mediaId": "abc.exported.png",
+                                "fileName": "orig-name.jpg", "mediaUrl": "/api/v1/media/abc.exported.png"}
         self.media_hit_first = True
         # Status the media route answers with once the first miss is done.
         self.media_status: int = 200
@@ -154,6 +158,19 @@ class Mock:
                     return
                 mock.messages_query = query
                 body = mock.chatlab_page
+            elif path == "/api/v1/media/export":
+                assert scope["method"] == "POST"
+                raw = b""
+                while True:
+                    event = await receive()
+                    raw += event.get("body", b"")
+                    if not event.get("more_body", False):
+                        break
+                mock.export_calls.append(json.loads(raw))
+                await send({"type": "http.response.start", "status": mock.export_status,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": json.dumps(mock.export_response).encode()})
+                return
             elif path.startswith("/api/v1/media/"):
                 mock.media_calls.append(path.rsplit("/", 1)[-1])
                 if mock.media_hit_first:
@@ -374,7 +391,12 @@ async def test_media_bytes_exports_then_retries() -> None:
     mock = Mock()
     mock.chatlab_page = {
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-        "count": 0, "members": [], "messages": [],
+        "count": 1, "members": [],
+        "messages": [{
+            "accountName": "Alice DISPLAY", "content": "x", "groupNickname": "",
+            "media": {"type": "image", "fileName": "abc.exported.png", "md5": "z"},
+            "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+        }],
         "meta": {"groupId": "", "name": "", "ownerId": "",
                  "platform": "qq", "type": "chat"},
         "page": {"hasMore": False, "nextCursor": None},
@@ -389,8 +411,39 @@ async def test_media_bytes_exports_then_retries() -> None:
     })
     data = await client.media_bytes(message, "wxid_alice")
     assert data == b"png-bytes"
-    assert mock.media_calls == ["abc.png", "abc.png"]
-    assert mock.messages_query == {"talker": "wxid_alice", "media": "1"}
+    assert mock.media_calls == ["abc.png", "abc.exported.png"], (
+        "first GET uses the metadata name, the retry uses the name the export "
+        "response backfilled"
+    )
+    assert mock.export_calls == [{"talker": "wxid_alice", "platformMessageId": "1", "sender": "alice", "timestamp": 1}]
+    assert mock.messages_query is None
+    await client.aclose()
+
+
+async def test_media_bytes_with_ambiguous_export_rows_refuses_to_guess() -> None:
+    mock = Mock()
+    mock.export_status = 409
+    client = make_client(mock)
+    message = gen.ChatlabMessage.model_validate({
+        "accountName": "display", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "abc.png"},
+        "platformMessageId": "old-id", "sender": "alice", "timestamp": 1, "type": 1,
+    })
+    with pytest.raises(StatusError) as exc:
+        await client.media_bytes(message, "actual-session")
+    assert exc.value.status == 409
+    assert mock.media_calls == ["abc.png"]
+    assert len(mock.export_calls) == 1
+    await client.aclose()
+
+
+async def test_targeted_export_reports_missing_server_capability() -> None:
+    mock = Mock()
+    mock.export_status = 405
+    client = make_client(mock)
+    with pytest.raises(ShapeError, match="mediaExportByMessage"):
+        await client.export_media_by_message("session", "old-id", "sender", 1)
+    assert len(mock.export_calls) == 1
     await client.aclose()
 
 
@@ -405,7 +458,12 @@ async def test_media_bytes_rejects_redirect_like_statuses() -> None:
         mock = Mock()
         mock.chatlab_page = {
             "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
-            "count": 0, "members": [], "messages": [],
+            "count": 1, "members": [],
+            "messages": [{
+                "accountName": "alice", "content": "x", "groupNickname": "",
+                "media": {"type": "image", "fileName": "abc.exported.png", "md5": "z"},
+                "platformMessageId": "1", "sender": "alice", "timestamp": 1, "type": 1,
+            }],
             "meta": {"groupId": "", "name": "", "ownerId": "",
                      "platform": "qq", "type": "chat"},
             "page": {"hasMore": False, "nextCursor": None},
@@ -421,6 +479,10 @@ async def test_media_bytes_rejects_redirect_like_statuses() -> None:
         with pytest.raises(sdkmod.StatusError) as exc_info:
             await client.media_bytes(message, "wxid_alice")
         assert exc_info.value.status == status
+        assert exc_info.value.url.endswith("/api/v1/media/abc.exported.png"), (
+            "the failure names the retry URL that actually 404s-or-3xx's, "
+            "not the metadata-name URL that only triggered the export"
+        )
         await client.aclose()
 
 
@@ -1734,4 +1796,54 @@ async def test_watch_close_is_silent_even_when_the_stream_errors_during_cleanup(
     warned = [r.getMessage() for r in caplog.records]
     assert transport.connections == 1, "teardown must not reconnect"
     assert not warned, f"teardown must stay silent: {warned}"
+    await client.aclose()
+
+
+def test_sync_targeted_export_and_media_retry(monkeypatch) -> None:
+    mock = Mock()
+    message = gen.ChatlabMessage.model_validate({
+        "accountName": "display", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "abc.png"},
+        "platformMessageId": "old-id", "sender": "alice", "timestamp": 1, "type": 1,
+    })
+    with make_sync_client(mock, monkeypatch) as client:
+        result = client.export_media_by_message("session", "old-id", "alice", 1)
+        assert result.media_id == mock.export_response["mediaId"]
+        assert client.media_bytes(message, "session") == b"png-bytes"
+    assert len(mock.export_calls) == 2
+    assert mock.media_calls == ["abc.png", mock.export_response["mediaId"]]
+
+
+async def test_targeted_retry_is_bounded_and_preserves_source_missing() -> None:
+    mock = Mock()
+    mock.media_status = 404
+    client = make_client(mock)
+    message = gen.ChatlabMessage.model_validate({
+        "accountName": "display", "content": "x", "groupNickname": "",
+        "media": {"type": "image", "fileName": "abc.png"},
+        "platformMessageId": "old-id", "sender": "alice", "timestamp": 1, "type": 1,
+    })
+    with pytest.raises(StatusError) as exc:
+        await client.media_bytes(message, "session")
+    assert exc.value.status == 404
+    assert len(mock.media_calls) == 2
+    assert len(mock.export_calls) == 1
+    mock.export_status = 404
+    with pytest.raises(StatusError) as exc:
+        await client.export_media_by_message("session", "old-id", "alice", 1)
+    assert exc.value.status == 404
+    await client.aclose()
+
+
+@pytest.mark.parametrize("patch", [
+    {"success": False}, {"mediaId": ""},
+    {"mediaUrl": "https://example.test/media?token=secret"},
+])
+async def test_targeted_export_rejects_inconsistent_response(patch) -> None:
+    mock = Mock()
+    mock.export_response.update(patch)
+    client = make_client(mock)
+    with pytest.raises(ShapeError):
+        await client.export_media_by_message("session", "old-id", "alice", 1)
+    assert len(mock.export_calls) == 1
     await client.aclose()

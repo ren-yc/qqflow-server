@@ -36,6 +36,8 @@ from qqflow_sdk.generated.qqflow_sdk.models.health import Health
 from qqflow_sdk.generated.qqflow_sdk.models.index_progress_dto import IndexProgressDto
 from qqflow_sdk.generated.qqflow_sdk.models.media_brief import MediaBrief
 from qqflow_sdk.generated.qqflow_sdk.models.media_envelope import MediaEnvelope
+from qqflow_sdk.generated.qqflow_sdk.models.media_export_request import MediaExportRequest
+from qqflow_sdk.generated.qqflow_sdk.models.media_export_result import MediaExportResult
 from qqflow_sdk.generated.qqflow_sdk.models.media_info import MediaInfo
 from qqflow_sdk.generated.qqflow_sdk.models.message_out import MessageOut
 from qqflow_sdk.generated.qqflow_sdk.models.messages_native import MessagesNative

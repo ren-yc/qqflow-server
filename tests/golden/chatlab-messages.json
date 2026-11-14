@@ -5,8 +5,14 @@
       "generator": "qqflow-server",
       "version": "0.0.2"
     },
-    "count": 2,
+    "count": 6,
     "members": [
+      {
+        "accountName": "王五",
+        "avatar": "",
+        "groupNickname": "王五名片",
+        "platformId": "u_c"
+      },
       {
         "accountName": "李四",
         "avatar": "",
@@ -14,40 +20,76 @@
         "platformId": "u_b"
       },
       {
-        "accountName": "张三",
+        "accountName": "张三备注",
         "avatar": "",
-        "groupNickname": "",
+        "groupNickname": "张三群名片",
         "platformId": "u_a"
       }
     ],
     "messages": [
       {
-        "accountName": "张三",
-        "content": "你好",
-        "groupNickname": "",
-        "platformMessageId": "113737825845249",
+        "accountName": "张三备注",
+        "content": "你好，欢迎加入",
+        "groupNickname": "张三群名片",
+        "platformMessageId": "6968608489576857601",
         "sender": "u_a",
-        "timestamp": 26481,
+        "timestamp": 1622505600,
         "type": 0
       },
       {
         "accountName": "李四",
-        "content": "[image]",
+        "content": "收到",
         "groupNickname": "",
+        "platformMessageId": "6968608489576857602",
+        "sender": "u_b",
+        "timestamp": 1622505600,
+        "type": 0
+      },
+      {
+        "accountName": "张三备注",
+        "content": "李四撤回了一条消息\n你猜猜撤回了什么",
+        "groupNickname": "张三群名片",
+        "platformMessageId": "6968608489576857603",
+        "sender": "u_a",
+        "timestamp": 1622505600,
+        "type": 81
+      },
+      {
+        "accountName": "李四",
+        "content": "群主已将群名修改为「测试群a」",
+        "groupNickname": "",
+        "platformMessageId": "6968608489576857604",
+        "sender": "u_b",
+        "timestamp": 1622505600,
+        "type": 80
+      },
+      {
+        "accountName": "王五",
+        "content": "[image]",
+        "groupNickname": "王五名片",
+        "platformMessageId": "6968608489576857605",
+        "sender": "u_c",
+        "timestamp": 1622505600,
+        "type": 1
+      },
+      {
+        "accountName": "王五",
+        "content": "[image]",
+        "groupNickname": "王五名片",
         "media": {
-          "fileName": "aabb.png",
+          "fileName": "fake_image_01.jpg",
           "md5": "aabbccddeeff00112233445566778899",
           "type": "image"
         },
-        "platformMessageId": "113737825910786",
-        "sender": "u_b",
-        "timestamp": 26481,
+        "platformMessageId": "6968608489576857607",
+        "sender": "u_c",
+        "timestamp": 1622505600,
         "type": 1
       }
     ],
     "meta": {
       "groupId": "10001",
-      "name": "项目群",
+      "name": "测试群a",
       "ownerId": "10001",
       "platform": "qq",
       "type": "group"
@@ -73,7 +115,39 @@
     "avatar",
     "groupNickname",
     "platformId",
+    "accountName",
+    "avatar",
+    "groupNickname",
+    "platformId",
     "messages",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
+    "accountName",
+    "content",
+    "groupNickname",
+    "platformMessageId",
+    "sender",
+    "timestamp",
+    "type",
     "accountName",
     "content",
     "groupNickname",

@@ -49,6 +49,7 @@ rmcp = { version = "3.5", optional = true, default-features = false, features = 
 # 工具参数与输出的 JSON Schema。rmcp 用的是 schemars 1，而 derive 生成的代码按 crate 名解析
 # 路径，所以它必须是本包的直接依赖（不能只靠 rmcp 传递进来）。
 schemars = { version = "1", optional = true }
+sha2 = "0.10"
 
 [[bin]]
 name = "qqflow-server"
@@ -85,6 +86,9 @@ testing = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# 游标回归测试解码 sync.nextCursor（opaqueCursor，v1.<代次>.<rowid> 的 base64）
+# 以断言 rowid 非 0；与根包 dependencies 同版本，无新增 vendored 依赖。
+base64 = "0.22"
 
 [profile.dev]
 debug = "line-tables-only"

@@ -127,9 +127,11 @@ pub fn ensure_fake_media_file(nt_db_dir: &Path) -> std::path::PathBuf {
 /// plain group rows.
 pub fn seed_dataset(conn: &Connection, extra: u32) {
     // Groups: normal text, recall, system (群名修改), large media blob, miniapp JSON.
-    // seq = (ts << 32) | seqno (real QQ layout), ts ≈ 2026-07-01 (unix 1782864000).
+    // seq = (ts << 32) | seqno (real QQ layout), ts = 2021-06-01 (unix 1622505600).
+    // 取**历史**时刻：golden 的时钟哨兵把「距离现在 ±1 年」的时间戳判成墙钟泄漏，
+    // 取未来日期会在那天之后把固定夹具误判成 `Utc::now()`。
     // dir: u_a rows are self-sent (1), u_b/u_c other (0), rename row system (3).
-    let ts: i64 = 1782864000;
+    let ts: i64 = 1622505600;
     let g = |rowid: i64, group: &str, seq: i64, uid: &str, nick: &str, dir: i64, card: &str, blob: &[u8]| {
         conn.execute(
             "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -188,7 +190,7 @@ pub fn build_source_with_rows(nt_db_dir: &Path, rows: usize) -> std::path::PathB
 
     let per = rows / BULK_GROUPS;
     let last = rows - per * (BULK_GROUPS - 1);
-    let ts: i64 = 1782864000;
+    let ts: i64 = 1622505600;
     // 一个事务包住全部插入：十万级行数下逐条自动提交要慢一个量级，而造库在 CI 的
     // 关键路径上（`unchecked_transaction` 取 &Connection，与既有助手签名相容）。
     let tx = conn.unchecked_transaction().unwrap();
@@ -222,10 +224,27 @@ pub fn build_source_with_rows(nt_db_dir: &Path, rows: usize) -> std::path::PathB
 /// Append one group row into group 10001 (simulating a new QQ message
 /// written by the live client).
 pub fn append_group_row(conn: &Connection, n: i64, text: &str) {
-    let ts: i64 = 1782864000;
+    let ts: i64 = 1622505600;
     conn.execute(
         "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params!["10001", (ts << 32) | n, "u_a", "张三", text.as_bytes(), 1, ts, "张三群名片"],
+    )
+    .unwrap();
+}
+
+/// Append one group row whose business timestamp is **earlier** than the
+/// standard dataset while its row identity (rowid) is larger.
+///
+/// Why the fixture needs this: cursor continuation pages by row identity while
+/// the no-cursor time mode pages by timestamp. When the two orders diverge, a
+/// continuation that mixed the two keys would replay rows it already served
+/// (page-end row is not the largest rowid under time order) — this fixture is
+/// the divergence itself, so the out-of-order regression can pin the
+/// row-identity ordering.
+pub fn append_group_row_backdated(conn: &Connection, n: i64, seq_no: i64, ts: i64) {
+    conn.execute(
+        "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params!["10001", (ts << 32) | seq_no, "u_a", "张三", format!("回溯入库-{n}").as_bytes(), 1, ts, "张三群名片"],
     )
     .unwrap();
 }
@@ -248,7 +267,7 @@ pub fn seed_reply_rows(conn: &Connection) {
          UPDATE group_msg_table SET \"40003\" = rowid WHERE \"40003\" IS NULL;",
     )
     .unwrap();
-    let ts: i64 = 1782864000;
+    let ts: i64 = 1622505600;
     let reply = |n: i64, inner: i64, target: i64| {
         conn.execute(
             "INSERT INTO group_msg_table (\"40021\", \"40001\", \"40020\", \"40093\", \"40800\", \"40013\", \"40050\", \"40090\", \"40003\", \"40850\") \
@@ -335,13 +354,34 @@ pub fn image_blob(md5_hex: &str, local_path: &Path) -> Vec<u8> {
 pub fn append_image_row(conn: &Connection, n: i64, nt_db_dir: &Path) -> String {
     let md5 = "aabbccddeeff00112233445566778899";
     let blob = image_blob(md5, &fake_media_path(nt_db_dir));
-    let ts: i64 = 1782864000;
+    let ts: i64 = 1622505600;
     conn.execute(
         "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params!["10001", (ts << 32) | n, "u_c", "王五", blob, 0, ts, ""],
     )
     .unwrap();
     md5.to_string()
+}
+
+/// `image_blob` 的空 45812 变体：结构化媒体带的本地路径是**空串**（真库见过
+/// 这种形态——解析器原样保留），而缓存索引里登记着有效 fallback。定向导出的
+/// 候选循环若不跳过空串（`root.join("")` 解析出 media root 目录本身并以
+/// `is_some` 提前终结），导出会 500 而 fallback 明明可用。
+pub fn image_blob_empty_local(md5_hex: &str, file_name: &str) -> Vec<u8> {
+    let mut seg = Vec::new();
+    enc_varint_field(45001, 1, &mut seg);
+    enc_varint_field(45002, 2, &mut seg); // T_Image
+    enc_varint_field(45003, 1, &mut seg); // media subtype image
+    enc_bytes_field(45503, b"fake-uuid-0001", &mut seg);
+    enc_bytes_field(45402, file_name.as_bytes(), &mut seg);
+    enc_bytes_field(45424, md5_hex.as_bytes(), &mut seg);
+    enc_varint_field(45405, 12345, &mut seg);
+    enc_varint_field(45411, 640, &mut seg);
+    enc_varint_field(45412, 480, &mut seg);
+    enc_bytes_field(45812, b"", &mut seg);
+    let mut body = Vec::new();
+    enc_bytes_field(40800, &seg, &mut body);
+    body
 }
 
 /// Spec-shaped structured image blob WITHOUT the "45812" local path — the
@@ -367,7 +407,7 @@ pub fn image_blob_no_local(md5_hex: &str, file_name: &str) -> Vec<u8> {
 /// cache-fallback case). Returns the row's media key (md5 hex).
 pub fn append_image_row_no_local(conn: &Connection, n: i64, md5: &str, file_name: &str) -> String {
     let blob = image_blob_no_local(md5, file_name);
-    let ts: i64 = 1782864000;
+    let ts: i64 = 1622505600;
     conn.execute(
         "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params!["10001", (ts << 32) | n, "u_c", "王五", blob, 0, ts, ""],
@@ -415,9 +455,23 @@ pub fn materialize_source(nt_db_dir: &Path) -> std::path::PathBuf {
             // place), so the existing link stays valid — and a reader may
             // have it open/mapped, so removing it would fail on Windows
             // (ERROR_USER_MAPPED_FILE).
-            continue;
+            //
+            // EXCEPT an empty WAL link: a link whose inode was checkpointed
+            // to zero bytes by a previous test's writer-drop is a dead link —
+            // this round's writer wrote its frames to a NEW raw.db-wal inode,
+            // and a reader following the dead link sees an empty WAL over a
+            // one-page main file, failing sqlite_master verification
+            // (misdiagnosed as a key mismatch). Re-point dead links at the
+            // live inode; live links with frames keep the skip.
+            if ext == "db-wal" {
+                let dead = std::fs::metadata(&side).map(|m| m.len() == 0).unwrap_or(true);
+                if dead {
+                    let _ = std::fs::remove_file(&side);
+                }
+            }
         }
-        if raw_side.exists() {
+        let still_there = side.exists();
+        if !still_there && raw_side.exists() {
             std::fs::hard_link(&raw_side, &side).unwrap();
         }
     }

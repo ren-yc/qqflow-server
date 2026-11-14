@@ -16,6 +16,33 @@
 
 use serde::Serialize;
 
+/// Locate exactly one media-bearing message in the bound account.
+#[derive(Debug, serde::Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaExportRequest {
+    pub platform_message_id: String,
+    pub sender: String,
+    pub talker: String,
+    pub timestamp: i64,
+}
+
+/// 定向导出的结果：`mediaId` 是可按名取字节的句柄，`fileName` 只是展示名。
+///
+/// 两者分工与消息层的 `media.fileName` / `mediaId` 一致：名字说这条媒体叫什么，
+/// 句柄说这份字节现在取得到。它们通常不相等 —— 展示名来自消息元数据（原文件名或
+/// 平台原名），句柄由落盘字节的摘要派生。
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaExportResult {
+    /// 展示名（消息自带的元数据名，取不到时为空串）。**不是句柄**，不能拿它取字节。
+    pub file_name: String,
+    /// 可按名取字节的句柄：URL 安全单段 token，末段直接拼进 `mediaUrl`。
+    pub media_id: String,
+    /// 根相对的字节地址，末段就是 `mediaId`；不带凭据与查询串。
+    pub media_url: String,
+    pub success: bool,
+}
+
 // ── 健康检查 ──────────────────────────────────────────────
 
 /// `GET|POST /health` 与 `/api/v1/health`（**免鉴权**）。
@@ -336,6 +363,13 @@ pub struct PullSync {
     pub has_more: bool,
     pub next_offset: usize,
     pub next_since: i64,
+    /// 不透明进度游标（`opaqueCursor` 能力）：编码入库进度（账号代次 + 会话 +
+    /// 唯一行标识），客户端原样回传、不得解析。排空后仍在场且非空——进度游标
+    /// 不终结（与消息面 `page.nextCursor` 排空为 null 的约定不同），它是下一次
+    /// 增量请求的起点。时间游标的盲区（排空后同秒晚入库的行永远落在
+    /// `nextSince` 之后）由它补上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
     pub watermark: i64,
 }
 // ── 会话列表 ──────────────────────────────────────────────

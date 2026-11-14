@@ -82,6 +82,15 @@ pub struct MediaEntry {
     /// Local cache path ("45812") — absolute, or relative to `media_root`.
     pub local_path: String,
     pub file_name: Option<String>,
+    /// 本仓定向导出为这条媒体发布过的句柄（`<sha256>.<ext>`，导出根相对）。
+    ///
+    /// QQ 删掉源缓存后，`local_path` 解析不出任何文件，而 digest 句柄**无法从
+    /// 元数据重新推导**（它是对源字节的摘要，字节没了摘要就算不出来）——没有
+    /// 这条登记，`export_targeted` 的复用分支只认 store 键名，首次的 digest
+    /// 副本完整躺在导出目录里却对不上号，请求落 404。登记只在**真的发布成功**
+    /// 时写入（发布是请求驱动的真实链路，不是索引推测），进程内有效；进程重启
+    /// 后丢失属既定边界（与「不落中间数据」一致），见架构文档「导出与媒体」。
+    pub published_handle: Option<String>,
 }
 
 #[derive(Debug, Default)]

@@ -30,7 +30,7 @@ use crate::server::dto::{
 };
 use crate::server::error::{ApiError, EnvelopeQuery};
 use crate::server::{
-    begin_indexing, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
+    begin_indexing_with_source, bound_account, deregister_account, init_account, AccountStatus, BindOutcome,
     DeregisterOutcome,
 };
 use crate::server::AppState;
@@ -103,17 +103,13 @@ pub async fn list_handler(
 }
 
 /// Resolve `(qq, db_path)` to a `DbInfo`: an explicit path (nt_msg.db file
-/// or Tencent Files-style root dir) registers or overrides the account in
-/// the registry; without one, the startup scan must have found it.
+/// or Tencent Files-style root dir) is resolved without changing registration.
+/// Without one, the startup scan must have found it.
 fn resolve_db_path(state: &AppState, qq: &str, db_path: Option<&str>) -> Option<DbInfo> {
     let Some(p) = db_path.filter(|p| !p.is_empty()) else {
         return state.init.find_db(qq);
     };
-    // Resolve outside the registry lock (the stat calls are syscalls);
-    // only the find-or-insert needs the lock.
-    let info = scan::resolve_account(qq, Path::new(p))?;
-    state.init.upsert_db(info.clone());
-    Some(info)
+    scan::resolve_account(qq, Path::new(p))
 }
 
 pub async fn handler(
@@ -260,7 +256,7 @@ pub async fn handler(
     // serialize here, so a duplicate observes the new state instead of
     // spawning a second initialization, and a different qq loses the race
     // instead of overwriting the winner's index.
-    match begin_indexing(&state, qq) {
+    let registration_token = match begin_indexing_with_source(&state, qq, Some(info.clone())) {
         BindOutcome::SameQq(AccountStatus::Ready) => {
             return Ok(reply(
                 "already_ready",
@@ -280,8 +276,8 @@ pub async fn handler(
         BindOutcome::Occupied { qq: in_use, status } => {
             return Ok(conflict(&in_use, status, progress_of(&in_use)))
         }
-        BindOutcome::Bound => {}
-    }
+        BindOutcome::Bound(token) => token,
+    };
 
     // Build the reply BEFORE spawning: `begin_indexing` just set `indexing`,
     // and re-reading the state after the spawn would race the background
@@ -299,7 +295,10 @@ pub async fn handler(
     // Kick off the background build.
     let state_for_init = state.clone();
     let key_owned = key.to_string();
-    tokio::spawn(async move { init_account(&state_for_init, info, key_owned).await });
+    // 令牌来自 begin_indexing 的 Bound 分支（取得绑定的同一临界区内铸造），
+    // 后台任务带着它走到每个可见点复查。
+    let token = registration_token;
+    tokio::spawn(async move { init_account(&state_for_init, info, key_owned, token).await });
     Ok(out)
 }
 

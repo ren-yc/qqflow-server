@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{header, Request};
+use axum::response::IntoResponse;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -144,6 +145,73 @@ fn harness_router(
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 // 追加一条新消息：像运行中的 QQ 那样写进源库，再 materialize，
                 // 让活连接看得见（与 fs_watch_e2e 同一手法）。
+                // 游标相对追加（opaqueCursor 用例）：向 cursor 表达的入库进度
+                // **之后**追加一条新消息（seq 用递增序号保证唯一），回显新行的
+                // platformMessageId（QQFlow 侧即 seq 字符串）。cursor 本身编码
+                // rowid——入库进度之后 = rowid 更大，同一秒或更晚都可。
+                if v["action"].as_str() == Some("harness.append_message_at_cursor") {
+                    let usable = state.accounts.read().iter().any(|a| {
+                        a.state.is_ready()
+                            || a.state == qqflow_server::server::AccountStatus::Indexing
+                    });
+                    if !usable
+                        && let Some(info) =
+                            qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
+                    {
+                        // 恢复前提走**完整注册机器**：绑定（铸造令牌）→ await
+                        // init_account（直接 await 到 set_ready 完成，没有后台
+                        // 任务）→ 等 ready。等待超时即失败——前提没恢复时追加
+                        // 的消息没人索引，用例会在 SSE/续拉断言上以更难定位的
+                        // 形态红；这里直接失败并点名根因。
+                        state.init.upsert_db(info.clone());
+                        let token = match qqflow_server::server::begin_indexing(&state, common::FAKE_QQ) {
+                            qqflow_server::server::BindOutcome::Bound(t) => t,
+                            other => panic!("harness re-register must claim the binding, got {other:?}"),
+                        };
+                        let key = common::FAKE_KEY.to_string();
+                        qqflow_server::server::init_account(&state, info, key, token).await;
+                        let mut ready = false;
+                        for _ in 0..120 {
+                            if state.accounts.read().iter().any(|a| a.state.is_ready()) {
+                                ready = true;
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        }
+                        assert!(ready, "harness 重新注册后 30 秒内必须 ready");
+                    }
+                    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let new_seq = ((1622505600i64 + 120) << 32) | (9000 + seq);
+                    let writer = writer.clone();
+                    let ins = tokio::task::spawn_blocking(move || {
+                        let conn = writer.lock();
+                        conn.execute(
+                            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            rusqlite::params![
+                                "10001",
+                                new_seq,
+                                "u_a",
+                                "张三",
+                                b"cursor-boundary append".as_slice(),
+                                1,
+                                1622505600i64 + 120,
+                                "张三群名片"
+                            ],
+                        )
+                    })
+                    .await;
+                    if let Ok(Err(e)) = &ins {
+                        println!("[harness] 游标追加失败：{e}");
+                    }
+                    common::materialize_source(&nt_db);
+                    let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
+                    // 回显新行的 id（用例经 save 取回作为 appended_id 基准）。
+                    return axum::Json(serde_json::json!({
+                        "success": true,
+                        "id": new_seq.to_string()
+                    }))
+                    .into_response();
+                }
                 if v["action"].as_str() == Some("harness.append_message") {
                         // **前提恢复**：用例之间必须互相独立，而 `sse-deregister-replay` 会注销
                         // 账号 —— 它字母序在前，于是一部分用例在「没有账号」的环境里跑。
@@ -157,16 +225,27 @@ fn harness_router(
                             && let Some(info) =
                                 qqflow_server::db::scan::resolve_account(common::FAKE_QQ, &src)
                         {
-                            state.init.upsert_db(info);
-                            let _ = qqflow_server::server::begin_indexing(&state, common::FAKE_QQ);
+                            // 恢复前提走**完整注册机器**：绑定（铸造令牌）→ await
+                            // init_account（直接 await 到 set_ready 完成，没有
+                            // 后台任务）→ 等 ready。等待超时即失败——前提没恢复
+                            // 时追加的消息没人索引，用例会在 SSE 断言上以更难
+                            // 定位的形态红；这里直接失败并点名根因。
+                            state.init.upsert_db(info.clone());
+                            let token = match qqflow_server::server::begin_indexing(&state, common::FAKE_QQ) {
+                                qqflow_server::server::BindOutcome::Bound(t) => t,
+                                other => panic!("harness re-register must claim the binding, got {other:?}"),
+                            };
+                            let key = common::FAKE_KEY.to_string();
+                            qqflow_server::server::init_account(&state, info, key, token).await;
+                            let mut ready = false;
                             for _ in 0..120 {
-                                let ready =
-                                    state.accounts.read().iter().any(|a| a.state.is_ready());
-                                if ready {
+                                if state.accounts.read().iter().any(|a| a.state.is_ready()) {
+                                    ready = true;
                                     break;
                                 }
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             }
+                            assert!(ready, "harness 重新注册后 30 秒内必须 ready");
                             println!("[harness] 账号不在（前面的用例注销了它），已重新注册");
                         }
                         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -186,12 +265,12 @@ fn harness_router(
                                     // `seq` 的高 32 位是时间戳：**必须晚于夹具既有的行**，否则新行落在
                                     // 水位线之内，`poll_once` 返回 0 —— 症状又是「SSE 收不到事件」
                                     // （与 weflow 那边同一个坑：追加的时间戳要越过水位线）。
-                                    ((1782864000i64 + 60) << 32) | (99 + seq),
+                                    ((1622505600i64 + 60) << 32) | (99 + seq),
                                     "u_a",
                                     "张三",
                                     "一致性套件新增".as_bytes(),
                                     1,
-                                    1782864000i64 + 60,
+                                    1622505600i64 + 60,
                                     "张三群名片"
                                 ],
                             )
@@ -208,7 +287,7 @@ fn harness_router(
                         // 成为确定的事，而不是等 Watcher 的时序。
                         let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
                 }
-                axum::http::StatusCode::OK
+                axum::http::StatusCode::OK.into_response()
             }
         }),
     )
@@ -216,7 +295,7 @@ fn harness_router(
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.8.0";
+const CONTRACT_VERSION: &str = "0.11.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
@@ -246,6 +325,14 @@ async fn conformance_suite_passes() {
     // harness 追加消息时才写（注册时表还没出生），名册与群主全程为空，
     // `memberCount` 不出现（不变量允许缺席，于是「通过」却什么都没验）、群主断言拿 0 个。
     common::write_fake_group_info(&nt_db);
+    // 结构化图片行（40800 段带 45812 本地路径）：让真实索引登记媒体键
+    // aabbcc…——exported_media 槽位的句柄按它取字节（mediaId 承诺用例）。
+    // 不加这一行，nails-media-id-fetch-succeeds 会对一个从未登记的键拿到 404。
+    let _image_md5 = {
+        let conn = writer.lock();
+        common::append_image_row(&conn, 7, &nt_db)
+    };
+    common::materialize_source(&nt_db);
 
     let state = app_state(dir.join("export"));
     let app = build_router(state.clone()).merge(harness_router(writer.clone(), nt_db.clone(), state.clone()));
@@ -317,6 +404,10 @@ async fn conformance_suite_passes() {
             "harness": "/__harness",
             "group-members": "/api/v1/group-members",
             "health": "/health",
+            // 媒体字节端点（mediaById 能力的落点，契约用例
+            // nails-media-id-fetch-succeeds 按句柄取字节）。
+            "media": "/api/v1/media/{id}",
+            "media_export": "/api/v1/media/export",
             "messages": "/api/v1/messages",
             "messages_chatlab": "/chatlab/messages",
             "pull": "/chatlab/sessions/{id}/messages",
@@ -331,9 +422,23 @@ async fn conformance_suite_passes() {
             "private_with_messages": { "id": "u_12345", "expect": { "messages": 2 } },
             "same_second_burst": { "id": "10001", "expect": { "same_second": 5 } },
             "unknown": { "id": "999999999", "expect": {} },
+            // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
+            // 夹具造库时写入的 fake_image_01.jpg，句柄即 mediaId 本身。
+            "exported_media": { "id": "aabbccddeeff00112233445566778899", "expect": {} },
+            "targeted_media": {"id":"10001", "expect":{
+                "platformMessageId": ((1622505600i64 << 32) | 7).to_string(),
+                "sender":"u_c", "timestamp":1622505600i64}},
         },
         "capabilities": {
             "mediaById": true,
+            "mediaExportByMessage": true,
+            // 不透明进度游标（契约 0.9.0）：sync.nextCursor + cursor 参数已实现，
+            // 排空后同秒晚入库的行可经游标续拉到达。
+            "opaqueCursor": true,
+            // 游标失效语义（契约 0.11.0）：语法坏 400、身份不符 409 +
+            // reason: cursor_reset_required，绝不静默退回时间模式
+            // （cursor::CursorError 与 chatlab_pull_cursor_v2_reset_semantics）。
+            "cursorReset": true,
             // 本仓库没有回调面（SNS 是微信侧的），如实置 false。
             "sns": false,
                         // 名册来源是 `group_info.db` 的 `group_member3`（见 `store::group_meta`）。
@@ -387,4 +492,278 @@ async fn conformance_suite_passes() {
 
     serve.abort();
     assert!(out.status.success(), "一致性套件未通过（见上面的报告）");
+}
+
+/// 游标续拉的**行标识单调性**回归：入库序与业务时间序在乱序行上分叉时，
+/// cursor 模式的过滤、排序、页推进与游标编码必须全部只用行标识。
+///
+/// 修复前会踩中其中一段：
+///
+/// - **重放**（「单页排空 + 续拉」段）：排空按时间序一页交付全部行时，页末行的 rowid 不是已交付
+///   集合的最大值（回溯入库的行时间早、rowid 大，排序在最前、页末也轮不到它）。
+///   旧代码编码页末行 → 回传续拉用 `rowid > 页末值` 过滤 → 该行被再次交付。
+/// - **空页进度重置**（「空页游标语义」段）：空页旧代码编码 0 —— 那是「从头拉取」，带 `end`
+///   过滤的续拉把全历史重放一遍。
+/// - **页推进**（「同秒组续接」段）：cursor 模式按时间组扩展页边界，「已交付上界」不严格。
+///
+/// 健全域说明：混合链（时间模式多页 → 游标续接）在乱序行存在时**单点游标
+/// 本质上不可健全**——页 1 已交付大 rowid 的回溯行，小 rowid 的未交付行永远
+/// 无法经游标到达。游标链只在「采纳游标前已交付集合是 rowid 前缀」时健全，
+/// 单页全量排空保证这一点（契约用例 cursor-boundary-append-reachable 正是
+/// 此形态）。本测试钉住健全域内的全部判别性场景。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order() {
+    let dir = std::env::temp_dir().join(format!("qqflow_cursor_ooo_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nt_db = dir.join("nt_db");
+    // 写入必须走夹具那个持久连接（新开连接写 WAL 会变 salt，硬链接失效）；
+    // 写 raw.db 后必须 materialize，活连接才看得见（见 conformance_suite_passes 的注释）。
+    // `open_fake_source` 自带 seed_dataset（6 群行 + 2 c2c 行），不重复 seed。
+    let (writer, _main) = common::open_fake_source(&nt_db, 0);
+    let writer = Arc::new(parking_lot::Mutex::new(writer));
+    common::write_fake_group_info(&nt_db);
+    // 回溯入库在**注册之前**：时间戳早于标准数据集（1622505600 → 1622505500）、
+    // rowid 更大（插入顺序在后）。注册后的全量索引把它一并收进来。
+    {
+        let conn = writer.lock();
+        common::append_group_row_backdated(&conn, 990, 990, 1622505500);
+    }
+    common::materialize_source(&nt_db);
+    let src = nt_db.join("nt_msg.db");
+
+    let state = app_state(dir.join("export"));
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "qq": common::FAKE_QQ,
+        "key": common::FAKE_KEY,
+        "db_path": src.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", "10001");
+    let backdated = format!("{}", (1622505500i64 << 32) | 990);
+
+    // 段一：单页排空 + 一次续拉——无重放。
+    // limit 放大到能一页装下全部 6 行（5 行常规 + 回溯行）。全部常规行共享
+    // 同一时间戳、回溯行时间更早：时间序把回溯行排在最前、页末轮不到它——
+    // 旧代码编码页末行，续拉把回溯行再交付一次。
+    let v = json_of(&client, req("GET", &format!("{pull_url}?limit=5000"))).await;
+    let first_page: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(v["sync"]["hasMore"], json!(false), "必须单页排空");
+    assert!(first_page.contains(&backdated), "回溯行必须在排空页里");
+    assert_eq!(first_page.len(), 6, "排空页必须交付全部 6 行");
+
+    let c0 = v["sync"]["nextCursor"].as_str().unwrap();
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        got.is_empty(),
+        "排空后按游标续拉必须为空（重放判据），实际交付：{got:?}"
+    );
+
+    // 段二：空页游标语义。
+    //  - 带 cursor 的空页：进度保持（游标值不变，不回退为从头拉取）；
+    //  - 无 cursor 的空 time-filtered 页：游标编码「end 界内已确立的最大
+    //    rowid」——不是 0（从头拉取）。周期轮询的客户端（end=now）采纳空页
+    //    游标再丢掉时间过滤，必须不重放全历史。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end={}", 1622505550)),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(got.is_empty(), "end 过滤（早于回溯行）必须让本页为空");
+    let c1 = v["sync"]["nextCursor"].as_str().unwrap();
+    assert_eq!(c1, c0, "带 cursor 的空页必须保持进度（游标不变）");
+
+    // 无 cursor 的空 time-filtered 页：窗口 (1622505520, 1622505550] 内
+    // 无行，但「ts ≤ end 的行都已确立」——游标必须编码回溯行（ts=1622505500、
+    // rowid 最大），而不是 0（从头拉取）。周期轮询的客户端（end=now）采纳
+    // 空页游标再丢掉时间过滤，必须不重放全历史。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&since=1622505520&end=1622505550")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(got.is_empty(), "end 过滤必须让本页为空");
+    // 游标 v2 是 URL-safe base64（无填充），载荷 `v2.<nonce>.<账号8>.<注册代次>.
+    // <世代>.<会话8>.<rowid>`——rowid 是第 7 段（零基索引 6）。不解析其余字段：
+    // 解析游标等于把服务端的进度模型抄进测试，这里只需要「不是 0」这一个位。
+    // 段缺失或解析失败必须响亮报错：回退值会让「编码 rowid 0」的回归静默过关。
+    use base64::Engine as _;
+    let c_empty_raw = v["sync"]["nextCursor"].as_str().unwrap();
+    let decoded = String::from_utf8(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(c_empty_raw)
+            .unwrap(),
+    )
+    .unwrap();
+    let rid: i64 = decoded
+        .split('.')
+        .nth(6)
+        .expect("游标 v2 载荷缺少 rowid 段")
+        .parse()
+        .expect("游标 rowid 段必须是整数");
+    assert_ne!(rid, 0, "空页游标不得编码 rowid 0（从头拉取）：{decoded}");
+    let c_empty = c_empty_raw.to_string();
+    // 采纳空页游标续拉（不带时间过滤）：不得重放全历史。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c_empty}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        got.is_empty(),
+        "空页游标（end 界内已确立进度）续拉不得重放全历史，实际交付：{got:?}"
+    );
+
+    // 段三：排空后追加 → 游标续拉可达（沿用契约用例的形态）。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        let writer = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = writer.lock();
+            common::append_group_row(&conn, 991 + seq, "排空后追加");
+        })
+        .await
+        .unwrap();
+    }
+    common::materialize_source(&nt_db);
+    {
+        let state = state.clone();
+        let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
+    }
+    // 基准游标是段一的排空游标 c0（全量排空线，全部行在链内）；段二的空页
+    // 游标属于「end=1622505550 的时间过滤线」，拿它接无过滤链会跳过
+    // rowid 更小的常规行——那不是缺陷，是线语义。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c0}")),
+    )
+    .await;
+    let got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec![format!("{}", (1622505600i64 << 32) | (991 + seq))],
+        "排空后追加的行必须经排空游标可达（且只交付它）"
+    );
+
+    // 段四：同秒组 + 游标续接——页推进按 rowid。从段三的游标线继续（cursor
+    // 模式全链），limit=2：追加的三个同秒行被切成 2+1 两页。
+    let seq2 = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        let writer = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = writer.lock();
+            common::append_group_row(&conn, 992 + seq2, "同秒追加一");
+            common::append_group_row(&conn, 993 + seq2, "同秒追加二");
+        })
+        .await
+        .unwrap();
+    }
+    common::materialize_source(&nt_db);
+    let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
+    let mut cursor: Option<String> = Some(c0.to_string());
+    let mut pages: Vec<Vec<String>> = Vec::new();
+    loop {
+        let q = match &cursor {
+            Some(c) => format!("?limit=2&cursor={c}"),
+            None => unreachable!("cursor 模式排空链游标必须恒在场"),
+        };
+        let v = json_of(&client, req("GET", &format!("{pull_url}{q}"))).await;
+        let page_ids: Vec<String> = v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+            .collect();
+        let more = v["sync"]["hasMore"].as_bool().unwrap();
+        pages.push(page_ids);
+        cursor = Some(
+            v["sync"]["nextCursor"]
+                .as_str()
+                .expect("cursor 模式排空链上 nextCursor 必须在场")
+                .to_string(),
+        );
+        if !more {
+            break;
+        }
+    }
+    let all: Vec<String> = pages.iter().flatten().cloned().collect();
+    let mut sorted = all.clone();
+    sorted.sort();
+    let mut expected = [
+        // 本次循环交付的是 rowid 大于排空游标的三条同秒追加行（段三一条 + 这里
+        // 两条），按 rowid 序被 limit=2 切成 2+1 两页。
+        (1622505600i64 << 32) | (991 + seq),
+        (1622505600i64 << 32) | (992 + seq2),
+        (1622505600i64 << 32) | (993 + seq2),
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect::<Vec<_>>();
+    expected.sort();
+    // 页推进判别：修复前页推进按时间组——同秒行整体一页（页数=1）；修复后
+    // 按 rowid 推进，limit=2 把三条同秒行切成两页（2+1）。
+    assert_eq!(
+        pages.len(),
+        2,
+        "cursor 模式页推进必须按 rowid（limit=2 把三条同秒行切成两页），实际页数：{}",
+        pages.len()
+    );
+    assert_eq!(sorted, expected, "游标链（limit=2）交付集合必须与追加行逐条相等");
+    let mut dedup = all;
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), sorted.len(), "游标链不得重复交付（重放判据）");
 }

@@ -60,101 +60,46 @@ fn state_with_scanned(
 }
 
 fn test_state() -> Arc<AppState> {
-    let mut store = Store::default();
-    // A real temp file backing the image message's localPath, so the media
-    // endpoint test can serve actual bytes.
+    // **真实索引路径的夹具**：造假库（含一条可登记的媒体行）→ `build_with` 走生产
+    // 建索引路径 → 产出的 Store 原样放进 AppState。夹具纪律「只能造库，不能造索引」
+    // 的落地形态——消息、水位线、uid 名字表、群名片、群名册、媒体登记全部来自
+    // 生产代码；手搭 Conversation 的旧形态已整体移除。
     //
-    // It lives under a fake `nt_data` root, and the store carries that root
-    // exactly as `build_index` sets it in production. `resolve_local_path`
-    // contains its result to `media_root`, so a bare temp path with
-    // `media_root: None` resolves to nothing and no media would export.
-    let media_root = std::env::temp_dir()
-        .join(format!("qqflow_api_smoke_{}_{}", std::process::id(), unique_suffix()))
-        .join("nt_data");
-    std::fs::create_dir_all(&media_root).unwrap();
-    let media_file = media_root.join("fake_image.jpg");
-    std::fs::write(&media_file, b"\xFF\xD8 fake jpeg bytes \xFF\xD9").unwrap();
-    let media_local = media_file.to_string_lossy().into_owned();
-    store.media_root = Some(media_root);
-    // group 10001 with two messages
-    let conv = Conversation {
-        chat_type: ChatType::Group,
-        talker: "10001".into(),
-        name: "项目群".into(),
-        msgs: vec![
-            MessageRecord {
-                rowid: 1,
-                seq: 0x6771A6B50001,
-                ts: seq_to_time(0x6771A6B50001),
-                chat_type: ChatType::Group,
-                talker: "10001".into(),
-                from_uid: "u_a".into(),
-                from_nick: "张三".into(),
-                card: None,
-                direction: Some(1),
-                inner_seq: None,
-                reply_inner_seq: None,
-                parsed: ParsedMessage {
-                    msg_type: MsgType::Text,
-                    content: "你好".into(),
-                    media: None,
-                },
-            },
-            MessageRecord {
-                rowid: 2,
-                seq: 0x6771A6B60002,
-                ts: seq_to_time(0x6771A6B60002),
-                chat_type: ChatType::Group,
-                talker: "10001".into(),
-                from_uid: "u_b".into(),
-                from_nick: "李四".into(),
-                card: None,
-                direction: Some(0),
-                inner_seq: None,
-                reply_inner_seq: None,
-                parsed: ParsedMessage {
-                    msg_type: MsgType::Image,
-                    content: "[image]".into(),
-                    // Built through the parse-time conversion so the store
-                    // key is computed exactly like a decoded segment.
-                    media: Some(MediaInfo::from(
-                        qqflow_server::parser::proto::MediaSegment {
-                            uuid: Some("R020-test".into()),
-                            md5_hex: Some("aabbccddeeff00112233445566778899".into()),
-                            file_name: Some("aabb.png".into()),
-                            size: Some(1234),
-                            width: Some(640),
-                            height: Some(480),
-                            local_path: Some(media_local.clone()),
-                            urls: vec![],
-                        },
-                    )),
-                },
-            },
-        ],
-        dirty: false,
-    };
-    store.convs.insert(conv_key(ChatType::Group, "10001"), conv);
-    store.watermark_group = 2;
-    store.uid_names.insert("u_a".into(), "张三".into());
-    store.uid_names.insert("u_b".into(), "李四".into());
-    // Register the image's local path exactly like the index would — mediaId
-    // is only promised for keys the store can actually serve.
-    store.media.insert(
-        "aabbccddeeff00112233445566778899".into(),
-        qqflow_server::store::MediaEntry {
-            local_path: media_local,
-            file_name: Some("aabb.png".into()),
-        },
+    // 形状（见 `qqflow_server::testing::seed_dataset` 与 `append_image_row`）：
+    // 群 10001 六行（文本×2、撤回、系统改名、大媒体 blob、结构化图片），
+    // 群 20002 一行（miniapp），c2c u_12345 两条；媒体登记一条
+    // （aabbcc…, fake_image_01.jpg，文件在 nt_data 下真实存在）。
+    // 完整 HTTP 注册路径（init_account → SSE 基线 → watcher）由
+    // `real_test_state` 与 conformance_runner 覆盖，这里取同一段建索引产物
+    // 以保持 oneshot 测试的同步性。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "qqflow_real_store_{}_{}",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let nt_db = root.join("nt_db");
+    let (writer, _main) = common::open_fake_source(&nt_db, 0);
+    let _md5 = common::append_image_row(&writer, 7, &nt_db);
+    common::write_fake_group_info(&nt_db);
+    drop(writer); // WAL checkpointed
+    let _ = std::fs::create_dir_all(
+        qqflow_server::store::media::media_root_of(&nt_db).unwrap(),
     );
-    state_with(store, true)
+
+    let store = qqflow_server::store::index::open_and_build(
+        &nt_db.join("nt_msg.db"),
+        common::FAKE_KEY,
+    )
+    .expect("fake fixture must build");
+    state_with_scanned(store, true, vec![qqflow_server::db::scan::DbInfo {
+        qq: common::FAKE_QQ.into(),
+        path: nt_db.join("nt_msg.db"),
+    }])
 }
 
-/// `test_state` 的 `indexing` 态变体：账号还没建完，且计数器有已知值。
-///
-/// 为什么必须是独立计数器：真实构建在这份夹具上是毫秒级，抓不到「构建进行中」这个
-/// 窗口；而进度字段的全部意义就在那个窗口里。这里直接给一份 1/2 张表、8 条消息的
-/// 计数，快照里的三个数才能一眼看出对应关系。
 fn test_state_indexing() -> Arc<AppState> {
     let state = test_state();
     let progress = Arc::new(qqflow_server::store::index::IndexProgress::default());
@@ -174,6 +119,142 @@ fn test_state_indexing() -> Arc<AppState> {
             progress: Some(progress),
         });
     state
+}
+
+/// 每次真实夹具独立目录：并发测试互不共享（nt_db / 导出根 / 媒体根都从它派生）。
+static REAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **真实索引路径的夹具**：造假库 → 真实 HTTP 注册 → 等待索引就绪。
+///
+/// `test_state` 手工把 Conversation/水位线/名字表/媒体登记写进 store（夹具纪律
+/// 禁止的「造索引」形态——生产索引若漏登记媒体或错映射字段，这些 HTTP 测试照样
+/// 绿），本助手让端到端数据全部走 `init_account → build_with` 的生产路径：
+/// 消息、水位线、uid 名字表、群名片、群名册、媒体登记都来自真实建索引。
+///
+/// 夹具形状（见 `qqflow_server::testing::seed_dataset`）：群 10001 六行（文本/
+/// 撤回/系统改名/大媒体/miniapp）、群 20002 一行、c2c 一对（u_12345 两条）——
+/// 合计 8 条消息、三个会话；名字映射与群名册/群主来自 `nt_uid_mapping_table`
+/// 与 `group_info.db`。依赖旧手搭形状的断言（消息数/内容/发送者）随替换逐个
+/// 校正到真实形状。
+async fn real_test_state() -> (Arc<AppState>, std::path::PathBuf) {
+    let seq = REAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "qqflow_real_smoke_{}_{}",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let nt_db = root.join("nt_db");
+    // 持久写入连接必须保留（追加新行要用它）——smoke 测试不用追加，drop 掉即可，
+    // drop 会让 WAL 自动 checkpoint 进主文件。
+    let (_writer, main) = common::open_fake_source(&nt_db, 0);
+    common::write_fake_group_info(&nt_db);
+
+    let state = state_with(Store::default(), false);
+    let app = build_router(state.clone());
+    let (s, v) = common::post_json(
+        app,
+        "/api/v1/accounts?access_token=test-token-123456",
+        &[],
+        json!({
+            "qq": common::FAKE_QQ,
+            "key": common::FAKE_KEY,
+            "db_path": main.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "注册失败: {v}");
+    assert_eq!(v["state"], "accepted", "注册必须被受理: {v}");
+    // 诊断：3 秒后打印一次账号状态（定位 indexing 卡住）。
+    {
+        let diag_app = build_router(state.clone());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let (_, dv) = common::get_json(
+            diag_app,
+            "/api/v1/accounts",
+            &[("authorization", "Bearer test-token-123456")],
+        )
+        .await;
+        println!("[real_test_state] t+3s: {dv}");
+    }
+    let v = common::wait_account_state(
+        &build_router(state.clone()),
+        "test-token-123456",
+        common::FAKE_QQ,
+        "ready",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let count = common::account_entry(&v, common::FAKE_QQ)["message_count"]
+        .as_u64()
+        .unwrap_or(0);
+    if count == 0 {
+        println!("[real_test_state] NOT ready with count 0: {v}");
+    }
+    assert!(count > 0, "真实索引必须产出消息: {v}");
+    (state, root)
+}
+
+/// 退场账号的最终写入不得覆盖当前 store：注销后对旧句柄调 refresh_names，
+/// 名字表必须保持注销后的空态而不被旧账号的数据回写（写锁内复查注册身份）。
+/// 修复前的机制：sync_all 只在账号处理开始前查一次 stopped，注销发生在扫描
+/// 完成与应用之间时，旧句柄的名字表会落进（可能已属于新账号的）store。
+#[tokio::test]
+async fn stale_refresh_after_deregister_does_not_rewrite_names() {
+    let (state, _root) = real_test_state().await;
+    // 旧句柄：注销后 Arc 仍存活（sync_all 的快照、或调用方持有的任何引用）。
+    let stale = state.sync.snapshot().into_iter().next().expect("one account registered");
+    assert!(!stale.is_stopped());
+
+    // 注销：停 sync、清 store、移除绑定。
+    let outcome = qqflow_server::server::deregister_account(&state, common::FAKE_QQ, false);
+    assert!(matches!(
+        outcome,
+        qqflow_server::server::DeregisterOutcome::Deregistered { .. }
+    ));
+    assert!(stale.is_stopped(), "注销会停掉引擎句柄");
+    assert!(state.store.read().names.uid_remark.is_empty(), "注销清空名字表");
+
+    // 旧句柄仍可被调用（Arc 存活），但它的最终写入必须被写锁内的注册身份
+    // 复查丢弃：names 保持空，媒体回退也不会被重建。
+    stale.refresh_names();
+    stale.refresh_media_fallback();
+    assert!(
+        state.store.read().names.uid_remark.is_empty(),
+        "退场句柄不得把旧名字表写回 store"
+    );
+    assert!(
+        state.store.read().media_fallback.is_none(),
+        "退场句柄不得重建媒体回退索引"
+    );
+}
+
+/// 令牌路径：句柄**没有**被 stop，但它的注册令牌已经失效（有更晚的注册接手）。
+/// 这条路径与上面的 `stopped` 路径是两道不同的闸：只测 stopped 时，把
+/// `registration_guard` 换成恒 true 的闭包、甚至整个删掉，测试依然是绿的。
+#[tokio::test]
+async fn stale_registration_token_discards_names_snapshot() {
+    let (state, _root) = real_test_state().await;
+    let stale = state.sync.snapshot().into_iter().next().expect("one account registered");
+    assert!(!stale.is_stopped(), "这条用例必须走令牌路径，不能靠 stopped 提前返回");
+
+    // 等价于「又发生了一次注册」：只推进注册计数，不 stop 句柄。
+    state.init.registration.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    // 放一个哨兵：令牌失效的句柄若真的写回名字表，整表会被替换、哨兵消失。
+    state
+        .store
+        .write()
+        .names
+        .uid_remark
+        .insert("sentinel".into(), "哨兵".into());
+    stale.refresh_names();
+    let store = state.store.read();
+    assert_eq!(
+        store.names.uid_remark.get("sentinel").map(String::as_str),
+        Some("哨兵"),
+        "令牌失效的句柄不得改写名字表"
+    );
 }
 
 /// Send a GET through `app` and return (status, json).
@@ -471,10 +552,17 @@ async fn sessions_with_token() {
     let (s, v) = get("/api/v1/sessions?access_token=test-token-123456", false).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["success"], true);
-    assert_eq!(v["count"], 1);
-    assert_eq!(v["sessions"][0]["username"], "10001");
-    assert_eq!(v["sessions"][0]["displayName"], "项目群");
-    assert_eq!(v["sessions"][0]["type"], 2);
+    // 真实夹具三个会话：群 10001（测试群a）、群 20002（第二群）、c2c u_12345。
+    assert_eq!(v["count"], 3);
+    let ids: Vec<&str> = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["username"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"10001"), "群会话在列: {ids:?}");
+    assert!(ids.contains(&"20002"), "第二个群在列: {ids:?}");
+    assert!(ids.contains(&"u_12345"), "c2c 会话在列: {ids:?}");
 }
 
 /// Every error a client can provoke carries the same envelope.
@@ -530,8 +618,9 @@ async fn boundary_errors_carry_the_envelope() {
 /// normal account.
 #[tokio::test]
 async fn chatlab_sessions_page_reports_more() {
-    // Two conversations, so a page of one is genuinely truncated.
-    let app = build_router(state_with_names());
+    // Three conversations in the real fixture, so a page of one is genuinely truncated.
+    let (state, _root) = real_test_state().await;
+    let app = build_router(state);
 
     let (s, v) = call(
         app.clone(),
@@ -554,8 +643,8 @@ async fn chatlab_sessions_page_reports_more() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["count"], 1);
-    assert_eq!(v["page"]["hasMore"], false);
-    assert!(v["page"]["nextCursor"].is_null(), "no cursor once drained");
+    // 三个会话翻两页仍在截断中（第三页留给 cursor=2）。
+    assert_eq!(v["page"]["hasMore"], true);
 
     // A page that already covers everything reports completion immediately.
     let (_, v) = call(
@@ -563,8 +652,9 @@ async fn chatlab_sessions_page_reports_more() {
         "/chatlab/sessions?limit=50&access_token=test-token-123456",
     )
     .await;
-    assert_eq!(v["count"], 2);
+    assert_eq!(v["count"], 3);
     assert_eq!(v["page"]["hasMore"], false);
+    assert!(v["page"]["nextCursor"].is_null(), "no cursor once drained");
 
     // **分面回归**：老面只认 offset、发现面认 cursor。这不是可有可无的差别 ——
     // 若老面「照旧接受」cursor，调用方以为自己在翻页，实际每次都拿到第一页，
@@ -639,8 +729,8 @@ async fn chatlab_message_face_envelope_and_cursor() {
         v["messages"][0]["platformMessageId"], v2["messages"][0]["platformMessageId"],
         "跨页不得重复（游标是排他的）"
     );
-    assert_eq!(v2["page"]["hasMore"], false);
-    assert!(v2["page"]["nextCursor"].is_null(), "排空后没有游标");
+    // 六行的会话 limit=1 要翻六页才排空；第二页仍在截断中。
+    assert_eq!(v2["page"]["hasMore"], true);
 
     // 一页装得下时立刻报完成；同时钉住**升序**（原生面是降序）。
     let (_, v3) = call(
@@ -648,7 +738,7 @@ async fn chatlab_message_face_envelope_and_cursor() {
         "/chatlab/messages?talker=10001&limit=5000&access_token=test-token-123456",
     )
     .await;
-    assert_eq!(v3["count"], 2);
+    assert_eq!(v3["count"], 6);
     assert_eq!(v3["page"]["hasMore"], false);
     let ts: Vec<i64> = v3["messages"]
         .as_array()
@@ -663,8 +753,6 @@ async fn chatlab_message_face_envelope_and_cursor() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
-const SEQ2: i64 = 0x6771A6B60002;
-
 #[tokio::test]
 async fn messages_pagination_and_filter() {
     let (s, v) = get(
@@ -675,10 +763,16 @@ async fn messages_pagination_and_filter() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["messages"].as_array().unwrap().len(), 1);
     assert_eq!(v["hasMore"], true);
-    // newest first → rowid 2
-    assert_eq!(v["messages"][0]["localId"], 2);
-    assert_eq!(v["messages"][0]["serverId"], SEQ2.to_string());
-    assert_eq!(v["messages"][0]["createTime"], seq_to_time(SEQ2));
+    // newest first → 最后一条（图片行 rowid 7，append_image_row 追加）。
+    // seq 的高 32 位是时间戳：serverId 是 seq 的字符串化，createTime 应与它自洽。
+    assert_eq!(v["messages"][0]["localId"], 7);
+    let server_id = v["messages"][0]["serverId"].as_str().unwrap();
+    let seq: i64 = server_id.parse().unwrap();
+    assert_eq!(
+        v["messages"][0]["createTime"],
+        qqflow_server::parser::types::seq_to_time(seq),
+        "createTime must equal the seq high word"
+    );
 }
 
 /// A bare `YYYYMMDD` passed as `end` must cover that whole day.
@@ -728,7 +822,14 @@ async fn messages_end_date_covers_the_whole_day() {
 #[tokio::test]
 async fn messages_media_enabled_v1() {
     // 一个 app 走完全程：导出写进**这个** state 的导出根，取字节也必须命中同一个根。
-    let app = build_router(test_state());
+    let state = test_state();
+    let cached_path = state.store.read()
+        .media
+        .get("aabbccddeeff00112233445566778899")
+        .expect("real index registered the image")
+        .local_path
+        .clone();
+    let app = build_router(state);
     let (s, v) = common::get_json(
         app.clone(),
         "/api/v1/messages?talker=10001&media=1&access_token=test-token-123456",
@@ -757,7 +858,10 @@ async fn messages_media_enabled_v1() {
     // 导出的文件确实在盘上，且**按名取字节拿到的就是同一份** —— 这是「出现即可取」的
     // 端到端钉子：句柄由内容摘要派生，所以跨会话按名解析是安全的。
     let exported = std::fs::read(m0["mediaLocalPath"].as_str().unwrap()).unwrap();
-    assert_eq!(exported, b"\xFF\xD8 fake jpeg bytes \xFF\xD9");
+    // 导出源是真实索引登记的 nt_data 缓存文件（夹具造的最小合法 JPEG）——
+    // 导出物与缓存逐字节一致。
+    let cached = std::fs::read(&cached_path).expect("nt_data cache file exists");
+    assert_eq!(exported, cached);
     let (s, _) = common::get_json(
         app.clone(),
         &format!("/api/v1/media/{exported_name}?access_token=test-token-123456"),
@@ -767,7 +871,7 @@ async fn messages_media_enabled_v1() {
     assert_eq!(s, StatusCode::OK, "导出的文件必须能按名取回");
     // Structured metadata + mediaId direct-serve survive alongside export.
     assert_eq!(m0["media"]["md5"], "aabbccddeeff00112233445566778899");
-    assert_eq!(m0["media"]["uuid"], "R020-test");
+    assert_eq!(m0["media"]["uuid"], "fake-uuid-0001");
     assert_eq!(m0["mediaId"], "aabbccddeeff00112233445566778899");
     // 未请求导出的那一次：信封照旧（enabled 与媒体计数还在），但**没有 exportPath** ——
     // 「没导出」与「导出到空路径」在下游是两件事。
@@ -785,11 +889,12 @@ async fn messages_media_enabled_v1() {
     );
     assert_eq!(v2["media"]["count"], 1, "media metadata still counted");
     assert!(v2["messages"][0]["mediaFileName"].is_null(), "no export fields without media=1");
-    assert!(v2["messages"][1]["media"].is_null(), "text message has no media");
+    // [1] 是 miniapp 行（Ark 段 → Other），不是文本，但它也不携带 media 对象。
+    assert!(v2["messages"][1]["media"].is_null(), "miniapp row has no media object");
     // is_send: self-sent (40013=1) vs other (40013=0) — from the no-media
     // response so both responses' shapes are verified.
-    assert_eq!(v2["messages"][0]["isSend"], 0, "rowid 2 is others' image");
-    assert_eq!(v2["messages"][1]["isSend"], 1, "rowid 1 is self-sent");
+    assert_eq!(v2["messages"][0]["isSend"], 0, "newest is others' image (u_c)");
+    assert_eq!(v2["messages"][1]["isSend"], 0, "the 70KB media-blob row is also u_c (other)");
 }
 
 /// 新消息面的 `media=1` **真的执行导出**，并把落盘那条的 `fileName` 回填成实际导出名。
@@ -850,7 +955,8 @@ async fn chatlab_messages_face_runs_the_media_export() {
         .iter()
         .find(|m| m["media"].is_object())
         .unwrap();
-    assert_eq!(img2["media"]["fileName"], "aabb.png", "没导出 ⇒ 只给元数据");
+    // 真实索引登记的 file_name 来自 45402 字段（fake_image_01.jpg）。
+    assert_eq!(img2["media"]["fileName"], "fake_image_01.jpg", "没导出 ⇒ 只给元数据");
 }
 
 #[tokio::test]
@@ -1007,10 +1113,12 @@ async fn media_by_id_serves_store_keys_and_exported_names() {
     let export_root = state.export_root.as_ref().clone();
     let dir = export_root.join("10001").join("images");
     std::fs::create_dir_all(&dir).unwrap();
-    let name = "aabbccddeeff00112233445566778899.jpg";
+    // 导出回落用一个**不同于** store 键的名字：store 键（md5）已被真实索引登记、
+    // 直服 nt_data 缓存，同名会先被 store 分支命中而走不到导出回落。
+    let name = "ccddeeff001122334455667788990000.jpg";
     let bytes: &[u8] = b"exported bytes";
     std::fs::write(dir.join(name), bytes).unwrap();
-    let app = build_router(state);
+    let app = build_router(state.clone());
 
     async fn get_bytes(app: axum::Router, uri: String) -> (StatusCode, Vec<u8>) {
         let resp = app
@@ -1022,14 +1130,25 @@ async fn media_by_id_serves_store_keys_and_exported_names() {
         (status, b.to_vec())
     }
 
-    // ① store 键：直服本地缓存里的文件。
+    // ① store 键：直服本地缓存里的文件（真实索引登记的是 nt_data 下的
+    //    fake_image_01.jpg，内容是夹具造的最小合法 JPEG）。
     let (s, b) = get_bytes(
         app.clone(),
         "/api/v1/media/aabbccddeeff00112233445566778899?access_token=test-token-123456".into(),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(&b[..], b"\xFF\xD8 fake jpeg bytes \xFF\xD9", "store 键直服本地缓存");
+    // 真实索引登记的 local_path 指向 nt_data 下的夹具文件；store 键直服的就是它。
+    let local = state
+        .store
+        .read()
+        .media
+        .get("aabbccddeeff00112233445566778899")
+        .expect("real index registered the image")
+        .local_path
+        .clone();
+    let nt_data_jpeg = std::fs::read(&local).expect("nt_data cache file exists");
+    assert_eq!(b, nt_data_jpeg, "store 键直服本地缓存");
 
     // ② 导出根回落：{id} 是导出文件名（不带会话，按名在四个类型目录下解析）。
     let uri = format!("/api/v1/media/{name}?access_token=test-token-123456");
@@ -1137,93 +1256,62 @@ async fn read_endpoints_reject_post() {
     assert_eq!(s, StatusCode::OK, "/health 免鉴权且保留 POST");
 }
 
-/// `test_state` plus the three name sources that compete for `senderName`,
-/// all set to different values so priority is observable rather than
-/// coincidental: u_a gets a group card in 10001 AND a global remark; u_b gets
-/// only a remark. A c2c conversation with u_a mirrors the group so the card's
-/// scope can be checked — the same uid must NOT show its card there.
-fn state_with_names() -> Arc<AppState> {
-    let state = test_state();
-    {
-        let mut store = state.store.write();
-        store
-            .group_cards
-            .entry(conv_key(ChatType::Group, "10001"))
-            .or_default()
-            .insert("u_a".into(), "张三群名片".into());
-        store.names.uid_remark.insert("u_a".into(), "张三备注".into());
-        store.names.uid_remark.insert("u_b".into(), "李四备注".into());
-        // Same sender, private chat, no card in scope.
-        let c2c = Conversation {
-            chat_type: ChatType::C2c,
-            talker: "u_a".into(),
-            name: "张三".into(),
-            msgs: vec![MessageRecord {
-                rowid: 3,
-                seq: 0x6771A6B70003,
-                ts: seq_to_time(0x6771A6B70003),
-                chat_type: ChatType::C2c,
-                talker: "u_a".into(),
-                from_uid: "u_a".into(),
-                from_nick: "张三".into(),
-                card: None,
-                direction: Some(0),
-                inner_seq: None,
-                reply_inner_seq: None,
-                parsed: ParsedMessage {
-                    msg_type: MsgType::Text,
-                    content: "私聊".into(),
-                    media: None,
-                },
-            }],
-            dirty: false,
-        };
-        store.convs.insert(conv_key(ChatType::C2c, "u_a"), c2c);
-    }
-    state
-}
-
 /// `senderName` rides on every message so clients never rebuild the name
 /// mapping from /api/v1/contacts + /api/v1/group-members. Priority is card >
-/// remark > nick, and the card is scoped to its own group.
+/// remark > nick，且群名片不跨会话泄漏——三个名字源全部来自真实索引
+/// （群名片 40090 列、备注 `nt_uid_mapping_table`、消息里的昵称）。
+///
+/// 真实夹具的形状：群 10001 五条（u_a 两条带卡、u_b 两条无卡、u_c 一条带卡），
+/// c2c 只有 u_12345（remark「李四他哥」、nick「王五」、无任何名片）。
 #[tokio::test]
 async fn messages_carry_resolved_sender_name() {
-    let app = build_router(state_with_names());
+    let (state, _root) = real_test_state().await;
+    let app = build_router(state);
     let (s, v) = call(
         app.clone(),
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    // newest first: rowid 2 (u_b, remark only), rowid 1 (u_a, card + remark).
-    assert_eq!(v["messages"][1]["senderUsername"], "u_a");
+    // newest first: [0]=seq5 u_c（card 王五名片，无 remark），
+    // [1]=seq4 u_b（无卡无备注 → 昵称）、[4]=seq1 u_a（card + remark）。
+    assert_eq!(v["messages"][0]["senderUsername"], "u_c");
     assert_eq!(
-        v["messages"][1]["senderName"], "张三群名片",
-        "in a group the card (40090) outranks the global remark"
+        v["messages"][0]["senderName"], "王五名片",
+        "in a group the card (40090) outranks the message nick"
     );
     assert_eq!(
-        v["messages"][0]["senderName"], "李四备注",
-        "no card -> remark (20009) outranks the message nick"
+        v["messages"][1]["senderName"], "李四",
+        "no card, no remark -> the message nick"
+    );
+    assert_eq!(v["messages"][4]["senderUsername"], "u_a");
+    assert_eq!(
+        v["messages"][4]["senderName"], "张三群名片",
+        "the card (40090) outranks the global remark"
     );
 
-    // Same uid in a private chat: the group's card must not follow it.
+    // 私聊用另一名成员：remark（李四他哥）压过昵称（王五），
+    // 且 10001 的名片绝不会跟着 u_a/u_c 之外的人出现。
     let (s, v) = call(
         app,
-        "/api/v1/messages?talker=u_a&access_token=test-token-123456",
+        "/api/v1/messages?talker=u_12345&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(
-        v["messages"][0]["senderName"], "张三备注",
+        v["messages"][1]["senderName"], "李四他哥",
         "c2c falls back to the remark — a group card never leaks out of its group"
     );
 }
 
 /// The card is a display name, not an identity: `senderName` may change per
 /// conversation but `senderUsername` is the stable key clients dedupe on.
+///
+/// 同一 uid（u_a）在两个群里的展示名都来自各自的名片列；跨会话对照用
+/// u_12345（c2c 里 remark 生效）——同一套名字映射，不同会话不同来源。
 #[tokio::test]
 async fn sender_name_is_per_conversation_but_username_is_stable() {
-    let state = state_with_names();
+    let (state, _root) = real_test_state().await;
     let store = state.store.read();
     let group = query_messages(
         &store,
@@ -1232,12 +1320,15 @@ async fn sender_name_is_per_conversation_but_username_is_stable() {
     .0;
     let private = query_messages(
         &store,
-        &MessageQuery { talker: "u_a", limit: 10, offset: 0, start: None, end: None, keyword: None },
+        &MessageQuery { talker: "u_12345", limit: 10, offset: 0, start: None, end: None, keyword: None },
     )
     .0;
     let g = group.iter().find(|m| m.sender_username == "u_a").unwrap();
+    // 同一发送者在本会话内出现多次（seq1 与 seq3 都是 u_a）：username 稳定。
+    let g2 = group.iter().filter(|m| m.sender_username == "u_a").nth(1).unwrap();
+    assert_eq!(g.sender_username, g2.sender_username, "identity is stable within a conversation");
     let c = &private[0];
-    assert_eq!(g.sender_username, c.sender_username, "identity is stable");
+    assert_ne!(g.sender_username, c.sender_username, "different conversations, different senders");
     assert_ne!(g.sender_name, c.sender_name, "display name is per conversation");
 }
 
@@ -1248,7 +1339,8 @@ async fn sender_name_is_per_conversation_but_username_is_stable() {
 /// `accountName` — that is the whole point of having two keys.
 #[tokio::test]
 async fn chatlab_splits_account_name_from_group_nickname() {
-    let app = build_router(state_with_names());
+    let (state, _root) = real_test_state().await;
+    let app = build_router(state);
     let (_, native) = call(
         app.clone(),
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
@@ -1260,8 +1352,8 @@ async fn chatlab_splits_account_name_from_group_nickname() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    // chatlab is chronological, the native shape newest-first: both [0]/[1]
-    // below are u_a, who holds a card AND a remark.
+    // chatlab is chronological: [0] 是 seq1 的 u_a —— 夹具里他同时持有名片
+    // （40090 列）与备注（nt_uid_mapping_table），两个键必须分开。
     let msg = &chatlab["messages"][0];
     assert_eq!(msg["sender"], "u_a");
     assert_eq!(msg["accountName"], "张三备注", "account name is the remark, not the card");
@@ -1271,7 +1363,7 @@ async fn chatlab_splits_account_name_from_group_nickname() {
         "the two keys must not be the same value"
     );
     // The native surface keeps the merged, card-wins meaning downstream pins.
-    assert_eq!(native["messages"][1]["senderName"], "张三群名片");
+    assert_eq!(native["messages"][4]["senderName"], "张三群名片");
 
     let members = chatlab["members"].as_array().unwrap();
     let member = members
@@ -1280,41 +1372,50 @@ async fn chatlab_splits_account_name_from_group_nickname() {
         .expect("u_a in members");
     assert_eq!(member["accountName"], "张三备注", "members agree with messages");
     assert_eq!(member["groupNickname"], "张三群名片");
-    // u_b has a remark but no card: groupNickname is empty rather than a
-    // duplicate of accountName.
+    // u_b 没有名片也没有备注：accountName 回落昵称，groupNickname 是空串
+    // 而不是 accountName 的复制品。
     let b = members.iter().find(|m| m["platformId"] == "u_b").expect("u_b in members");
-    assert_eq!(b["accountName"], "李四备注");
+    assert_eq!(b["accountName"], "李四");
     assert_eq!(b["groupNickname"], "");
-    // One entry per sender, not one per message.
-    assert_eq!(members.len(), 2, "members are deduped: {members:?}");
+    // One entry per sender, not one per message（发言人是 u_a/u_b/u_c）。
+    assert_eq!(members.len(), 3, "members are deduped: {members:?}");
 
-    // A group card never leaks into the private chat with the same uid.
-    let app = build_router(state_with_names());
+    // 私聊（另一名成员 u_12345）：名片不跨会话泄漏，remark 生效。
+    let (state2, _root2) = real_test_state().await;
+    let app2 = build_router(state2);
     let (s, c2c) = call(
-        app,
-        "/chatlab/messages?talker=u_a&access_token=test-token-123456",
+        app2,
+        "/chatlab/messages?talker=u_12345&access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(c2c["messages"][0]["accountName"], "张三备注");
+    assert_eq!(c2c["messages"][0]["accountName"], "李四他哥");
     assert_eq!(c2c["messages"][0]["groupNickname"], "", "c2c has no card");
 }
 
 #[tokio::test]
 async fn contacts_and_group_members() {
+    // 真实夹具：uid 名字映射 4 人（u_a/u_b/u_c/u_12345），联系人面给 4。
     let (s, v) = get("/api/v1/contacts?access_token=test-token-123456", false).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["count"], 2);
+    assert_eq!(v["count"], 4);
 
+    // 名册 ∪ 发言人：group_member3 有 4 行（u_a/u_b/u_c/u_d），全部在列；
+    // u_d 是刻意留的潜水成员（0 条发言），用于区分「名册 ∪ 发言人」与「只列发言人」。
     let (s, v) = get(
         "/api/v1/group-members?chatroomId=10001&includeMessageCounts=1&access_token=test-token-123456",
         false,
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["count"], 2);
-    assert_eq!(v["members"][0]["wxid"], "u_a");
-    assert_eq!(v["members"][0]["messageCount"], 1);
+    assert_eq!(v["count"], 4);
+    let members = v["members"].as_array().unwrap();
+    let mut uids: Vec<&str> = members.iter().map(|m| m["wxid"].as_str().unwrap()).collect();
+    uids.sort();
+    assert_eq!(uids, vec!["u_a", "u_b", "u_c", "u_d"], "roster union senders: {members:?}");
+    // u_a 在 10001 发了 2 条（seq1 文本、seq3 撤回）。
+    let a = members.iter().find(|m| m["wxid"] == "u_a").unwrap();
+    assert_eq!(a["messageCount"], 2);
 }
 
 #[tokio::test]
@@ -1326,7 +1427,7 @@ async fn chatlab_pull_sync_block() {
     .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["meta"]["platform"], "qq");
-    assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 6);
     assert!(v["sync"]["watermark"].as_i64().unwrap() > 0);
 }
 
@@ -1335,16 +1436,20 @@ async fn chatlab_pull_sync_block() {
 /// (text is 0 in both, but an image is 1 in ChatLab and 3 natively).
 #[tokio::test]
 async fn chatlab_type_is_the_chatlab_code_space_not_local_type() {
-    let app = build_router(state_with_names());
+    let (state, _root) = real_test_state().await;
+    let app = build_router(state);
     let (s, pull) = call(
         app.clone(),
         "/api/v1/sessions/10001/messages?access_token=test-token-123456",
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    // Chronological: row 1 text, row 2 image.
+    // Chronological (real fixture): seq1 text, seq2 text, seq3 recall(81),
+    // seq4 system-rename(80), seq5 image.
     assert_eq!(pull["messages"][0]["type"], 0, "text is 0 in the ChatLab space");
-    assert_eq!(pull["messages"][1]["type"], 1, "image is 1 in the ChatLab space");
+    assert_eq!(pull["messages"][2]["type"], 81, "recall is 81 in the ChatLab space");
+    assert_eq!(pull["messages"][3]["type"], 80, "system is 80 in the ChatLab space");
+    assert_eq!(pull["messages"][4]["type"], 1, "image is 1 in the ChatLab space");
     // Same rows through the chatlab branch of /api/v1/messages agree...
     let (_, envelope) = call(
         app.clone(),
@@ -1352,16 +1457,16 @@ async fn chatlab_type_is_the_chatlab_code_space_not_local_type() {
     )
     .await;
     assert_eq!(envelope["messages"][0]["type"], 0);
-    assert_eq!(envelope["messages"][1]["type"], 1);
+    assert_eq!(envelope["messages"][4]["type"], 1);
     // ...while the native face keeps the platform code downstream pins: the
-    // same image row is localType 3 there, not 1.
+    // newest row is the image, localType 3 natively, not 1.
     let (_, native) = call(
         app,
         "/api/v1/messages?talker=10001&access_token=test-token-123456",
     )
     .await;
     assert_eq!(native["messages"][0]["localType"], 3, "newest first: the image row");
-    assert_eq!(native["messages"][1]["localType"], 0);
+    assert_eq!(native["messages"][1]["localType"], 7, "next: the system-rename row");
 }
 
 /// WeFlow's Pull contract has no 400 semantics for pagination, so malformed
@@ -1375,7 +1480,11 @@ async fn chatlab_pull_tolerates_malformed_pagination() {
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{q} must not 400");
-        assert_eq!(v["messages"].as_array().unwrap().len(), 2, "{q} served the page");
+        assert_eq!(
+            v["messages"].as_array().unwrap().len(),
+            6,
+            "{q} served the page (real fixture: 6 rows in group 10001)"
+        );
     }
 }
 
@@ -1384,7 +1493,8 @@ async fn chatlab_pull_tolerates_malformed_pagination() {
 /// the point is that the key exists and both faces agree.
 #[tokio::test]
 async fn chatlab_meta_carries_owner_id_on_both_faces() {
-    let app = build_router(state_with_names());
+    let (state, _root) = real_test_state().await;
+    let app = build_router(state);
     let (_, pull) = call(
         app.clone(),
         "/api/v1/sessions/10001/messages?access_token=test-token-123456",
@@ -1513,7 +1623,11 @@ fn query_messages_keyword() {
     };
     let (items, _) = query_messages(&store, &q);
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].content, "你好");
+    assert!(
+        items[0].content.starts_with("你好"),
+        "keyword 命中的是欢迎行: {:?}",
+        items[0].content
+    );
 }
 
 #[test]
@@ -1743,6 +1857,71 @@ async fn chatlab_pull_drains_when_client_echoes_both_cursors() {
     assert_eq!(ids.len(), 7, "every row served exactly once, got {ids:?}");
     let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
     assert_eq!(unique.len(), 7, "no duplicates across pages: {ids:?}");
+}
+
+/// 进度游标 v2 的失效语义：同一个游标必须能用，语法坏是 400，v1 旧形态、
+/// 跨会话一律 409 且响应体带 `reason: "cursor_reset_required"`。
+///
+/// 服务端**绝不静默退回时间模式**：退回会让客户端以为续上了，实际从头重放。
+/// 旧行为（v1 认不出 → None → 时间模式；跨代次 → Some(0) → 从头拉）正是这两条
+/// 失败模式，本测试把它们钉死在错误信封上。
+#[tokio::test]
+async fn chatlab_pull_cursor_v2_reset_semantics() {
+    let app = build_router(test_state());
+    let pull = "/api/v1/sessions/10001/messages";
+
+    // 第一页拿到 v2 游标；同一个游标能用（回传后仍 200，且能拿到第二页游标）。
+    let (s1, v1) = call(app.clone(), &format!("{pull}?limit=2&access_token=test-token-123456")).await;
+    assert_eq!(s1, StatusCode::OK);
+    let c0 = v1["sync"]["nextCursor"].as_str().expect("v2 游标必须在场").to_string();
+    let (s2, v2) = call(app.clone(), &format!("{pull}?limit=2&cursor={c0}&access_token=test-token-123456")).await;
+    assert_eq!(s2, StatusCode::OK, "服务端签发的游标原样回传必须可用");
+    assert!(v2["sync"]["nextCursor"].as_str().is_some(), "续页仍要给出游标");
+
+    // 语法坏 → 400（不是退回时间模式）。
+    for bad in ["", "!!!", "AAAA"] {
+        let uri = if bad.is_empty() {
+            format!("{pull}?cursor=&access_token=test-token-123456")
+        } else {
+            format!("{pull}?cursor={bad}&access_token=test-token-123456")
+        };
+        let (s, v) = call(app.clone(), &uri).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "语法坏的游标 {bad:?} 必须 400: {v}");
+        assert!(v["reason"].is_null(), "400 不是失效，不得带 reason: {v}");
+    }
+
+    // 伪造的 v1 旧形态 → 409 + reason。v1 是本服务签发过的历史形态，所以是
+    // 「需要重拉」信号，不是垃圾输入。
+    let v1_cursor = "djEuMC41"; // base64("v1.0.5")，URL-safe 变体
+    let (s, v) = call(app.clone(), &format!("{pull}?cursor={v1_cursor}&access_token=test-token-123456")).await;
+    assert_eq!(s, StatusCode::CONFLICT, "v1 旧游标必须 409: {v}");
+    assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+
+    // 跨会话 → 409 + reason：把群会话的游标拿到 c2c 会话上续拉。两个会话的
+    // 摘要不同，解码必须判「跨会话」而不是沿用。
+    let (s, v) = call(
+        app.clone(),
+        &format!("/api/v1/sessions/u_12345/messages?cursor={c0}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "跨会话的游标必须 409: {v}");
+    assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+
+    // 游标模式的空页：进度保持（游标值不变），不回退为从头拉取。
+    // `watermark` 是易变值（VOLATILE_KEYS），用绝对 `end` 钉死它，让两次
+    // `nextCursor` 逐字可比。
+    let (s, v) = call(
+        app.clone(),
+        &format!("{pull}?limit=2&cursor={c0}&end=1622505700&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 0, "end 过滤让本页为空");
+    assert_eq!(
+        v["sync"]["nextCursor"].as_str(),
+        Some(c0.as_str()),
+        "带 cursor 的空页必须保持进度（游标不变，不回退为从头拉取）"
+    );
 }
 
 #[tokio::test]
@@ -2410,6 +2589,168 @@ async fn deregister_post_alias_is_gone_and_delete_still_works() {
     assert!(qqflow_server::server::bound_account(&state.accounts.read()).is_none());
 }
 
+/// 轮询发现数据源身份变化（换库）时，账号必须转 Error 待重注册——而不是
+/// 带着旧水位线继续增量：替换库中 rowid 不超过旧水位线的行会被
+/// 「`rowid > 水位线`」永久滤掉，且现有连接可能仍指向旧文件。处置回调由
+/// activate_account 注入，watch 与手动同步两条路径共用。
+///
+/// 手动同步路径直接经 `POST /api/v1/sync` 驱动（watch 任务的触发链已在
+/// `sync_once` 共用同一判别，此处不需要单独的时序编排）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_replacement_flips_the_account_to_error() {
+    let (state, root) = real_test_state().await;
+    let _app = build_router(state.clone());
+    let nt_db = root.join("nt_db");
+
+    // 换库：写一份 salt 不同的合法 QQ 形状 nt_msg.db。**不动** raw.db 与存活
+    // writer——真实换库（删库重建/备份还原）也不会动运行中 QQ 进程外的东西。
+    // 此时索引已建成（ready），换库发现走轮询采样路径。
+    let db = nt_db.join("nt_msg.db");
+    let mut bytes = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
+    bytes.extend_from_slice(&[0xEEu8; 16]);
+    bytes.extend_from_slice(&[0u8; 4096]);
+    std::fs::write(&db, bytes).expect("写替换库");
+
+    // 手动同步触发一轮 poll：采样发现身份变化 → 账号转 Error。
+    let app = build_router(state.clone());
+    let (s, v) = common::post_json(
+        app,
+        "/api/v1/sync?access_token=test-token-123456",
+        &[],
+        json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // 轮询到 error 态（不能经 `wait_account_state`：它把 error 一律当意外失败）。
+    let mut reason = String::new();
+    let mut reached = false;
+    for _ in 0..100 {
+        let (_, dv) = common::get_json(
+            build_router(state.clone()),
+            "/api/v1/accounts",
+            &[("authorization", "Bearer test-token-123456")],
+        )
+        .await;
+        let entry = common::account_entry(&dv, common::FAKE_QQ);
+        if entry["state"] == "error" {
+            reason = entry["error"].as_str().unwrap_or_default().to_string();
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(reached, "账号必须在换库后转 Error");
+    assert!(
+        reason.contains("数据源已被替换"),
+        "错误原因必须说明换库与恢复方式: {reason}"
+    );
+
+    // 收尾：注销清场（error 态账号允许注销）。
+    let app = build_router(state.clone());
+    let (s, _) = common::delete_json(
+        app,
+        &format!("/api/v1/accounts/{}?access_token=test-token-123456", common::FAKE_QQ),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+/// 构建期换库（索引从旧文件建成、安装前文件被替换）必须**丢弃本次索引**，
+/// 不能把替换后的文件当旧索引的基线装进账号——否则 store 里是 A 的数据、
+/// 基线记成 B，后续采样永不推进世代，换库被整个吞掉。基线绑定构建时文件、
+/// 安装前在同一临界区内复查；身份变化丢弃后账号转 Error 待重注册。
+///
+/// 编排用**构建闸门**（`init_account_with_build_gate`，testing feature）：闸门
+/// 在「基线已采、解密建索引未开始」的窗口阻塞后台构建线程，测试在闸门里覆写
+/// 文件——覆写必然落在基线采样之后、install 复查之前，不依赖构建时长与时序
+/// 运气（大语料编排在本机绿、在 CI 的 Windows 机器上覆写晚于 install，回归
+/// 超时）。替换文件保持**可被旧密钥解开**（独立造一份同密钥 fake 库）——否则
+/// 走的是解密报错路径，而不是本回归要钉的「构建期身份变化」丢弃。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn build_time_source_replacement_discards_the_index() {
+    let seq = REAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "qqflow_build_swap_{}_{}",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let nt_db = root.join("nt_db");
+    let (writer, main) = common::open_fake_source(&nt_db, 0);
+    common::write_fake_group_info(&nt_db);
+
+    let state = state_with(Store::default(), false);
+    let qqflow_server::server::BindOutcome::Bound(token) = qqflow_server::server::begin_indexing(&state, common::FAKE_QQ)
+    else {
+        panic!()
+    };
+
+    // 换库目标库**提前**在测试线程上造好（SQLCipher 建库不该发生在构建线程的
+    // 闸门里——跨进程并行时它与另一 exe 的 SQLCipher 并发初始化有干扰，表现为
+    // 对方的共享夹具读出「解密失败」）。闸门闭包只做纯文件拷贝覆写。
+    let swap_dir = root.join("swap_src");
+    {
+        let (conn, _raw) = qqflow_server::testing::open_fake_writer(&swap_dir);
+        qqflow_server::testing::seed_dataset(&conn, 2);
+        drop(conn);
+    }
+    let swap_raw = std::fs::read(swap_dir.join("raw.db")).unwrap();
+
+    // 闸门闭包在构建线程上运行（基线已采、建索引未开始）：纯文件拷贝覆写，
+    // 再放行构建——覆写必然先于 install 复查，不依赖任何时序。
+    let gate_main = main.clone();
+    let gate_handle = Box::new(move || {
+        let mut all = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
+        all[0..8].copy_from_slice(b"QQNTDB!1");
+        all.extend_from_slice(&swap_raw);
+        std::fs::write(&gate_main, all).expect("覆写 nt_msg.db 为新身份库");
+    });
+    // 直接调 init_account（begin_indexing 已受理、状态已翻 indexing）：闸门
+    // 保证覆写精确落在「基线已采、install 未跑」的窗口里。
+    qqflow_server::server::init_account_with_build_gate(
+        &state,
+        qqflow_server::db::scan::DbInfo { qq: common::FAKE_QQ.into(), path: main },
+        common::FAKE_KEY.into(),
+        token,
+        gate_handle,
+    )
+    .await;
+    drop(writer); // 换库写场景下原 writer 已无意义
+
+    let detail = common::wait_account_state(
+        &build_router(state.clone()),
+        "test-token-123456",
+        common::FAKE_QQ,
+        "error",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let entry = common::account_entry(&detail, common::FAKE_QQ);
+    let reason = entry["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("数据源被替换"),
+        "构建期换库必须转 Error 并说明原因: {reason}"
+    );
+    // 索引没有装进去：store 是空的。
+    assert!(
+        state.store.read().convs.is_empty(),
+        "被丢弃的索引不得进入 store"
+    );
+
+    // 收尾。
+    let app = build_router(state.clone());
+    let (s, _) = common::delete_json(
+        app,
+        &format!("/api/v1/accounts/{}?access_token=test-token-123456", common::FAKE_QQ),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Golden 快照：每个 JSON 响应的**逐字节**护栏（含状态码）。
 ///
 /// 为什么必须在 DTO 化**之前**有它：DTO 是重写每一个响应构造，而「断言几个字段」的测试
@@ -2422,6 +2763,11 @@ mod golden {
     use super::*;
 
     /// 值易变、但键必须留下的字段。按**键名**匹配，因此清单不随端点增长。
+    ///
+    /// `nextCursor` **不在**这里：同名键装的是两种东西——`sync.nextCursor` 是不透明的
+    /// 进度游标（base64(generation + rowid)，generation 随注销计数变），`page.nextCursor`
+    /// 是确定的偏移量字符串。整名掩掉会把「排空后从 `null` 变成数字或字符串」这种回归
+    /// 一起吃掉，所以按父键区分，见 `mask`。
     const VOLATILE_KEYS: &[&str] = &[
         // 每次请求都不同
         "exportedAt",
@@ -2454,26 +2800,46 @@ mod golden {
     /// 两侧传的**根不一样**，强度也就不同：weflow 传本次运行的私有目录
     /// （`target/test-tmp/golden-<pid>`），本文件传整个 `temp_dir()`——所以这里能拦到更多
     /// （任何源自临时目录的泄漏），weflow 只拦它自己那一个目录。别把两者当等价。
-    fn mask(value: &mut Value, tmp: &str) {
+    fn mask(value: &mut Value, tmp: &str, parent: &str) {
         match value {
             Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
-                    if VOLATILE_KEYS.contains(&key.as_str()) {
+                    // `sync.nextCursor` 是每次运行都可能不同的进度游标：掩值之前先证明
+                    // 它确实是非空字符串，否则「游标返回 null / 数字」的回归会被掩码
+                    // 顺手盖掉，快照照样绿。`page.nextCursor` 是确定的偏移量，不掩，
+                    // 让它以真实值参与比对。
+                    let volatile = if key == "nextCursor" {
+                        match val {
+                            // 对象/数组位置上是 schema 形状，不是取值。
+                            Value::Object(_) | Value::Array(_) => false,
+                            _ if parent == "sync" => {
+                                assert!(
+                                    val.as_str().is_some_and(|s| !s.is_empty()),
+                                    "sync.nextCursor 必须是非空字符串，实际是 {val}"
+                                );
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        VOLATILE_KEYS.contains(&key.as_str())
+                    };
+                    if volatile {
                         // 只掩**标量**。对象/数组位置上的同名键装的是形状而非取值：
                         // /openapi.json 里 `updatedAt` 的值就是整个 schema，整值替换会把
                         // description 与类型一起从比对里抹掉——字段语义写反也不会红。
                         match val {
-                            Value::Object(_) | Value::Array(_) => mask(val, tmp),
+                            Value::Object(_) | Value::Array(_) => mask(val, tmp, key),
                             _ => *val = Value::String("<volatile>".into()),
                         }
                     } else {
-                        mask(val, tmp);
+                        mask(val, tmp, key);
                     }
                 }
             }
             Value::Array(items) => {
                 for it in items.iter_mut() {
-                    mask(it, tmp);
+                    mask(it, tmp, parent);
                 }
             }
             Value::String(s) => {
@@ -2692,7 +3058,7 @@ mod golden {
         let keys = key_order(&raw_body);
         let mut snapshot =
             serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
-        mask(&mut snapshot, tmp_root);
+        mask(&mut snapshot, tmp_root, "");
         assert_no_wall_clock(&snapshot, name);
         let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 
@@ -2788,7 +3154,7 @@ mod golden {
             let keys = key_order(&raw_body);
             let mut snapshot =
                 serde_json::json!({ "status": status.as_u16(), "keys": keys, "body": body });
-            mask(&mut snapshot, &tmp_root);
+            mask(&mut snapshot, &tmp_root, "");
             assert_no_wall_clock(&snapshot, name);
             let actual = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
 

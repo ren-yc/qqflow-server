@@ -26,10 +26,16 @@ pub struct Params {
     pub end: Option<String>,
     pub limit: Option<String>,
     pub offset: Option<String>,
+    /// 不透明进度游标（`opaqueCursor` 能力）：原样回传由本端点编出的
+    /// `sync.nextCursor`。给出时覆盖 `since`/`offset`——进度游标是权威起点。
+    pub cursor: Option<String>,
     #[serde(default)]
     pub access_token: Option<String>,
 }
 
+/// 编码/解码一律走 `crate::server::cursor`（v2）：它把「进程 / 账号 / 会话 /
+/// 注册代次 / 数据源世代」绑进载荷，失效时返回 409 + `reason`，而不是静默
+/// 退回时间模式。本文件不再保留 v1 的编解码助手。
 pub async fn handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -63,15 +69,66 @@ pub async fn handler(
     let chat_type = conv.chat_type;
     let talker = conv.talker.clone();
 
+    // 游标上下文：本进程 + 本账号 + 本会话 + (注册代次, 数据源世代)。会话摘要
+    // 绑**解析后的** `(chat_type, talker)` 而不是裸 `id`：两个不同的裸 id 落到
+    // 同一个会话（`find_conversation` 的回退）时必须编出同一条线，而不是互相
+    // 误判成跨会话。注册代次用注册令牌的二元组序数（注销与重注册都推进它），
+    // 数据源世代来自该账号同步句柄的指纹采样（库身份变化才推进）。
+    let registration = state.init.registration.load(std::sync::atomic::Ordering::SeqCst);
+    // 绑定账号（与下面 `ownerId` 的取法同源）：store 没有账号维度，注册表里
+    // 唯一的绑定条目就是它。
+    let bound_qq = state
+        .accounts
+        .read()
+        .iter()
+        .find(|a| a.state.is_ready())
+        .map(|a| a.qq.clone())
+        .unwrap_or_default();
+    let source_generation = state
+        .sync
+        .snapshot()
+        .iter()
+        .find(|a| a.qq == bound_qq)
+        .map(|a| a.generation_handle().load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(0);
+    let session_key = crate::store::conv_key(chat_type, &talker);
+    let cursor_ctx = crate::server::cursor::CursorContext::for_session(
+        &bound_qq,
+        &session_key,
+        registration,
+        source_generation,
+    );
+    // 解码失败分两种——语法坏是 400，身份/代次不符是 409 + `reason:
+    // cursor_reset_required`；两者都不退回时间模式：静默退回等于让客户端以为
+    // 续上了、实际从头重放。
+    let cursor_rowid = match params.cursor.as_deref() {
+        Some(raw) => Some(cursor_ctx.decode(raw).map_err(|e| e.into_api_error())?),
+        None => None,
+    };
+
     // Chronological messages within (since, end] — `since` is exclusive, so
     // a client resuming with `nextSince` never re-fetches the boundary
     // second and can neither loop nor see duplicates.
+    // 进度游标模式（cursor 给出）下整个分页只用行标识（rowid）：过滤用
+    // 「rowid > 游标值」的排他下界，排序与页推进都按 rowid 单调——入库序与
+    // 时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行的 messages
+    // 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。无 cursor
+    // 的时间模式保持规范原行为：(ts, rowid) 复合键升序、页不跨秒推进。
     let mut idx: Vec<usize> = conv.msgs.iter().enumerate().map(|(i, _)| i).collect();
-    idx.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
+    if cursor_rowid.is_some() {
+        idx.sort_by_key(|&i| conv.msgs[i].rowid);
+    } else {
+        idx.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
+    }
     let filtered: Vec<usize> = idx
         .into_iter()
         .filter(|&i| {
             let m = &conv.msgs[i];
+            // 进度游标是权威起点：给出时忽略 since/offset（时间只是元数据，
+            // 入库进度才是增量判据）。排空后同秒晚入库的行由 rowid 排他性覆盖。
+            if let Some(rid) = cursor_rowid {
+                return m.rowid > rid && end.is_none_or(|e| m.ts <= e);
+            }
             since.is_none_or(|s| m.ts > s) && end.is_none_or(|e| m.ts <= e)
         })
         .collect();
@@ -79,16 +136,31 @@ pub async fn handler(
     let total = filtered.len();
     // Page from `offset`, extending to the end of the last second's ts
     // group: pages never split a second, so `nextSince` strictly advances.
-    let start = offset.min(total);
+    // 进度游标模式下 offset 无意义（游标已定位到行），恒从 0 开始。
+    let start = if cursor_rowid.is_some() { 0 } else { offset.min(total) };
     let mut page_end = start;
-    let mut prev_ts = None;
-    while page_end < total {
-        let ts_j = conv.msgs[filtered[page_end]].ts;
-        if prev_ts.is_some_and(|p| p != ts_j) && page_end - start >= limit {
-            break;
+    if cursor_rowid.is_some() {
+        // 游标模式：页推进按 rowid 组——与排序键一致，页边界不切断单调序，
+        // 页末 rowid 是严格的「已交付上界」。
+        let mut prev_rid = None;
+        while page_end < total {
+            let rid = conv.msgs[filtered[page_end]].rowid;
+            if prev_rid.is_some_and(|p| p != rid) && page_end - start >= limit {
+                break;
+            }
+            prev_rid = Some(rid);
+            page_end += 1;
         }
-        prev_ts = Some(ts_j);
-        page_end += 1;
+    } else {
+        let mut prev_ts = None;
+        while page_end < total {
+            let ts_j = conv.msgs[filtered[page_end]].ts;
+            if prev_ts.is_some_and(|p| p != ts_j) && page_end - start >= limit {
+                break;
+            }
+            prev_ts = Some(ts_j);
+            page_end += 1;
+        }
     }
     let page = &filtered[start..page_end];
     let has_more = page_end < total;
@@ -197,6 +269,48 @@ pub async fn handler(
         .unwrap_or_default();
 
     let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
+    // 进度游标编码「**已交付集合**」的进度上界——不是页末行：
+    //
+    // - cursor 模式：排序按 rowid 单调，页末行就是已交付集合的最大 rowid，
+    //   两者重合；空页时以本次游标值为准（进度不回退）。
+    // - 时间模式非空页：排序按时间复合键，页末行 rowid **可能不是已交付集合
+    //   里最大的**（回溯入库的行：时间早、rowid 大）。编码页末行会让后续游标
+    //   链重放它；必须编码「本次响应已交付的行里最大的 rowid」。
+    // - 时间模式空页：本响应没有交付任何行，但请求窗口 (since, end] 为空本身
+    //   就是进度陈述——窗口内无行，则一切 ts ≤ end 的行都已确立。游标编码
+    //   「end 界内已确立的最大 rowid」（end 缺省时水位线=now 覆盖全部行）。
+    //   编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤就会重放
+    //   全历史。
+    let last_rowid = if cursor_rowid.is_some() {
+        page.iter()
+            .map(|&i| conv.msgs[i].rowid)
+            .max()
+            .or(cursor_rowid)
+            .unwrap_or(0)
+    } else if page.is_empty() {
+        // 水位线内找不到任何行时**不能**退回 0：那种情况下客户端已经拉过一批
+        // （否则它的 `since` 从哪来），编码 0 等于让它从头重放。改为退到
+        // 「`since` 界内已确立的最大 rowid」——`since` 之前的行客户端见过。
+        // 两者都空（首次请求就没有行）才编码 0，那才是真正的「从头拉」。
+        conv.msgs
+            .iter()
+            .filter(|m| m.ts <= watermark)
+            .map(|m| m.rowid)
+            .max()
+            .or_else(|| {
+                since.and_then(|s| {
+                    conv.msgs
+                        .iter()
+                        .filter(|m| m.ts <= s)
+                        .map(|m| m.rowid)
+                        .max()
+                })
+            })
+            .unwrap_or(0)
+    } else {
+        page.iter().map(|&i| conv.msgs[i].rowid).max().unwrap_or(0)
+    };
+    let next_cursor = cursor_ctx.encode(last_rowid);
     let body = serde_json::to_value(PullEnvelope {
         chatlab: crate::server::chatlab::header(),
         members,
@@ -209,6 +323,7 @@ pub async fn handler(
         ),
         sync: PullSync {
             has_more,
+            next_cursor: Some(next_cursor),
             next_since: if has_more { next_since } else { watermark },
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the

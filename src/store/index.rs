@@ -305,11 +305,17 @@ fn register_media(store: &mut Store, m: &MediaInfo, msg_type: MsgType) {
         None => true,
     };
     if replace {
+        // 保留既有的 published_handle：换库/重索引重建整张表时，登记的句柄仍然
+        // 指向导出目录里真实存在的文件（发布是请求驱动的，索引推测不出它）。
+        // `replace` 为真意味着旧条目的 local_path 已失效，但句柄的有效性由导出
+        // 目录的存在性决定，不随 local_path 一起失效。
+        let published = store.media.get(key).and_then(|e| e.published_handle.clone());
         store.media.insert(
             key.to_string(),
             MediaEntry {
                 local_path,
                 file_name: m.file_name.clone(),
+                published_handle: published,
             },
         );
     }

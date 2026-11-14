@@ -243,26 +243,42 @@ pub fn media_root_of(db_dir: &Path) -> Option<PathBuf> {
 /// a root there is nothing to contain against, and silently accepting an
 /// absolute path there would reinstate exactly the branch being removed.
 pub fn resolve_local_path(local_path: &str, media_root: Option<&Path>) -> Option<PathBuf> {
+    resolve_local_path_checked(local_path, media_root).ok().flatten()
+}
+
+/// Resolve a contained source while preserving actual filesystem failures.
+pub fn resolve_local_path_checked(local_path: &str, media_root: Option<&Path>) -> std::io::Result<Option<PathBuf>> {
+    // QQ 把部分缓存原件写成 `::NTOSFull::<绝对路径>`。它是已知的无效值：`::` 让它不
+    // 算绝对路径，拼进 media root 后 canonicalize 必然报 InvalidFilename。按「没有可用
+    // 本地路径」处理，让调用方走缓存回退；把它当致命错误抛出去，会让整条回退链在第一个
+    // 候选处就断掉（回归：resolve_rejects_qq_ntosfull_marker）。
+    if local_path.starts_with("::NTOSFull::") {
+        return Ok(None);
+    }
     let raw = Path::new(local_path);
-    let root = media_root?;
+    let Some(root) = media_root else { return Ok(None) };
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
         if raw.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            return None;
+            return Ok(None);
         }
         root.join(raw)
     };
-    let resolved = joined.canonicalize().ok()?;
+    let resolved = match joined.canonicalize() {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     // The lexical `..` check above is not enough on its own: it cannot see a
     // symlink or junction inside the cache, and it does not cover the absolute
     // branch at all. `canonicalize` has already run, so compare the resolved
     // file itself against the canonical root.
-    if !crate::pathsafe::is_contained_resolved(root, &resolved) {
+    if !resolved.starts_with(root.canonicalize()?) {
         tracing::debug!("[media] local path outside media root, ignored: {local_path:?}");
-        return None;
+        return Ok(None);
     }
-    Some(resolved)
+    Ok(Some(resolved))
 }
 
 #[cfg(test)]

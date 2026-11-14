@@ -189,7 +189,7 @@ curl -X DELETE -H "Authorization: Bearer <token>" \
 
 - `deregistered`——已注销；`previous_status` 是注销前状态，`index_cleared` 表示内存索引确有内容被清空。
 - `not_registered`——本就没有绑定账号，幂等。`wxid_mismatch` 对偶的 `qq_mismatch`——路径里的 qq 不是在位账号，附 `occupied_by` / `occupied_status`，在位账号毫发无损。
-- 允许在 `indexing` 中途注销；正在跑的全量构建会看到退场标志并丢弃结果。注销时清掉 SSE 重放条目并推进 `generation`。
+- 允许在 `indexing` 中途注销；尚未提交的构建结果会被丢弃。注销后旧任务不能重新置为 `ready`、挂接 watcher 或撤销同账号的新注册。注销时清掉 SSE 重放条目并推进 `generation`。
 - `purge_media=1` 只删已知布局，仅在会话目录已空时删它；导出根目录永不触碰。
 
 ### GET `/api/v1/messages` — 消息查询（原生/富数据形状）
@@ -287,6 +287,7 @@ curl -H "Authorization: Bearer <token>" \
 | `end` | string | 否 | 上界，Unix 秒或 `YYYYMMDD`（含当天 23:59:59） |
 | `limit` | integer | 否 | 单页条数，默认与上限均为 5000 |
 | `offset` | integer | 否 | 页内偏移，默认 0 |
+| `cursor` | string | 否 | 不透明进度游标，原样回传 `sync.nextCursor`；给出时取代 `since` / `offset` |
 
 **响应**：
 ```json
@@ -296,7 +297,7 @@ curl -H "Authorization: Bearer <token>" \
   "messages": [ { "sender": "<qq>", "accountName": "<昵称>", "groupNickname": "<群名片>",
     "timestamp": 1700000103, "type": 0, "content": "大家好", "platformMessageId": "8200000000000000000",
     "media": { "type": "image", "fileName": "<md5>.jpg", "md5": "<md5>" } } ],
-  "sync": { "hasMore": true, "nextSince": 1700000103, "nextOffset": 0, "watermark": 1700000200 } }
+  "sync": { "hasMore": true, "nextCursor": "<opaque>", "nextSince": 1700000103, "nextOffset": 0, "watermark": 1700000200 } }
 ```
 
 `messages[].mediaId` 是「此刻取得到字节」的承诺：出现时按它去 `GET /api/v1/media/{id}` 必须成功。判据是本仓的句柄来自 **QQ 本地缓存的登记路径**，不需要先执行导出；缺一个就整个键省略。
@@ -308,6 +309,9 @@ curl -H "Authorization: Bearer <token>" \
 - `since` 排他（`create_time > since`），`end` 包含（`<= end`）。
 - 页面按时间戳整秒组补齐：达到 `limit` 后仍会把当前秒的剩余消息取完，故一页可能略多于 `limit`。这保证 `nextSince` 一定能前进。
 - `nextSince` 是本页最后一条的时间戳，不是整个会话的最大时间戳。`nextOffset` 常为 `0`；两个游标都应原样回传，叠加会二次跳过同一批行。`watermark` 是本次拉取的时间上界；排空后 `nextSince` 停在该上界。
+- `nextCursor` 是不透明进度游标：原样回传给 `cursor`，不要解析，也不要自己按 `nextSince` / `offset` 续拉。游标按入库序（rowid）翻页，乱序行的时间序因此可能与入库序不同——这是「排空判据 = 入库进度」的直接后果。排空后它仍在场，是下一次增量请求的起点。
+- 它绑定进程、账号、会话、注册代次与数据源世代。语法坏或版本未知返回 400；旧格式游标、跨进程 / 账号 / 会话、代次不符一律返回 409，响应体带 `reason: "cursor_reset_required"`。此时丢弃游标、从头拉一次，不要重试同一条。
+- 失效判据只到数据源身份（换库、删库重建）；同一库文件的备份还原检测不到，边界见 `docs/architecture.md`。
 
 ### GET `/api/v1/contacts` — 联系人列表
 
@@ -369,9 +373,43 @@ curl -H "Authorization: Bearer <token>" \
 - `isOwner` 由群详情解析；群主不在本页时全为 `false`。`isFriend` 在本仓**恒为 `false`**（v1 不解析好友关系）。
 - `fromCache` 恒为 `false`：本请求既不读盘、也不触发同步。`updatedAt` 是索引构建/更新完成时刻，毫秒。
 
+### POST `/api/v1/media/export` — 定向导出消息媒体
+
+在当前账号整个会话中唯一定位目标，并导出可取的本地字节。
+
+**请求**
+
+```bash
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"talker":"<session-id>","platformMessageId":"<message-id>","sender":"<sender-id>","timestamp":1700000000}' \
+  "http://127.0.0.1:5032/api/v1/media/export"
+```
+
+将 `<session-id>`、`<message-id>` 和 `<sender-id>` 替换为消息所在会话、消息 ID 和发送者 ID。
+
+**参数**
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `talker` | string | 是 | 会话 ID |
+| `platformMessageId` | string | 是 | 平台消息 ID |
+| `sender` | string | 是 | 发送者 ID |
+| `timestamp` | integer | 是 | 发送时刻，Unix 秒 |
+
+**响应**
+
+```json
+{"success":true,"mediaId":"<64-hex>.png","fileName":"fake_image_01.jpg","mediaUrl":"/api/v1/media/<64-hex>.png"}
+```
+
+- `mediaId` 是可取句柄：URL 安全单段 token，由落盘字节的摘要派生。`fileName` 是消息自带的展示名（取不到时为空串），**不能拿它取字节**，两者通常不相等。
+- `mediaUrl` 是不含凭据的根相对地址，末段就是 `mediaId`；随后通过 `GET /api/v1/media/{id}` 取字节。接口不下载任意外链。
+- 字段非法为 400、未鉴权为 401、目标或源文件缺失为 404、目标不唯一或注册切换为 409。
+- 无可导出的本地媒体为 422、读取或导出失败为 500、账号未就绪为 503。旧消息不受默认分页大小限制。
+
 ### GET `/api/v1/media/{id}` — 按 id 取媒体字节（唯一的字节面）
 
-`{id}` 是 store 键或导出文件名，也就是消息的 `media.fileName` 或 `mediaId`。
+`{id}` 是 store 键或导出产物文件名（消息的 `mediaId`）；消息面的 `media.fileName` 只在导出回填后才与产物名相同。
 
 **请求**：
 ```bash
@@ -383,7 +421,7 @@ curl -H "Authorization: Bearer <token>" \
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `id` | string(path) | 是 | store 键或导出文件名，即消息的 `media.fileName` / `mediaId` |
+| `id` | string(path) | 是 | store 键或导出产物文件名，即消息的 `mediaId` |
 
 **响应**：
 ```text
@@ -609,7 +647,9 @@ curl -N "http://127.0.0.1:5032/chatlab/push/messages?access_token=<token>"
 
 - 一页语义 vs 取尽语义：`pull_page` / `list_messages` / `chatlab_messages` / `contacts` 只取一页；`drain_session` / `list_all_sessions` 内部翻页到 `hasMore=false`。
 - 游标必须原样回传：`pull_page` 的 `nextSince` / `nextOffset` 叠加会二次跳过同一批行。
+- 拉取面的游标失效（409 + `reason: "cursor_reset_required"`）当前归入 `Status`：两个 SDK 的游标续传方法（`pull_page_cursor` / `drain_session_cursor`）随契约 v0.11.0 的 pin 升级同批补齐，见仓库计划。
 - `group_members` 的计数开关关闭时不发参数（不是发 `0`）；`list_all_sessions` 的 `page_size` 上限 10000。`media_bytes` 在 404 后按「先 `media=1` 导出再取」自动重试一次；`media_bytes_by_id` 不触发导出。
+- 重试时导出行按（平台消息 id、sender、timestamp）三元组定位：恰好一行用它的落盘名重试，零行报「导出页不含目标」，多行报「无法确定哪一行才是本条」。
 - `watch()` 的游标只在帧被消费时推进；只有 `id:` 没有 `data:` 的悬空帧不推进。类型与操作客户端由 `/openapi.json` 生成（`cargo run -p qqflow-regen` / `python scripts/regen.py`），生成物入库、CI 断言无 diff；不要手改生成物。
 - 行为层手写：`clients/rust/src/client.rs` 与 `clients/python/src/qqflow_sdk/client.py`。Python 另有 `SyncClient`，方法面与 `Client` 一一对应，内部跑专属事件循环线程。
 - 错误按性质分派：HTTP 非 2xx → `Status`；连接/超时/重置/URL 解析失败 → `Transport`；JSON 合法但不合承诺形状 → `Shape`。

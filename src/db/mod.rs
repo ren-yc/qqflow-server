@@ -4,4 +4,5 @@
 pub mod decrypt;
 pub mod live;
 pub mod scan;
+pub mod source_identity;
 pub mod vfs;

@@ -20,7 +20,7 @@ pub mod watch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::Result;
 use parking_lot::{Mutex, RwLock};
@@ -33,6 +33,24 @@ use crate::store::Store;
 use crate::sync::history::EventBus;
 
 pub use events::Event;
+
+/// 同步轮的**判别性**失败：换库后不能继续增量（见 `poll_once`），调用方必须
+/// 把账号转 Error 待重注册，而不是按普通读失败无限重试。
+#[derive(Debug)]
+pub struct SourceReplaced;
+
+impl std::fmt::Display for SourceReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "数据源已被替换（库文件身份变化），增量续读无法保证不漏：需要重新注册以全量重建")
+    }
+}
+
+impl std::error::Error for SourceReplaced {}
+
+/// 下游（watch / sync_all）判别「这轮失败是换库」用。
+pub fn is_source_replaced(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SourceReplaced>().is_some()
+}
 
 /// One account's sync machinery: the live reader (mutex-guarded so the
 /// manual sync endpoint and the poll loop can share it) plus everything
@@ -58,8 +76,24 @@ pub struct AccountSync {
     /// awaiting task is aborted — so the flag is what stops it from writing
     /// into a store that no longer belongs to this account.
     stopped: AtomicBool,
+    /// 一次注册的身份复查闭包（由 init_account 注入，持注册令牌）：最终写入
+    /// 点在 **Store 写锁内**调用它——`sync_all` 只在账号处理开始前查一次
+    /// stopped，注销发生在扫描完成与应用之间的窗口由这里封住。旧句柄在注销
+    /// 后仍可被调用（Arc 存活），没有这层复查时旧账号的名字表/媒体回退会把
+    /// 新注册的 store 覆盖掉。None = 未注入（嵌入者直接构造的句柄），复查
+    /// 退化为只看 stopped。
+    registration_guard: Mutex<Option<Box<dyn Fn() -> bool + Send>>>,
+    /// 数据源被替换时的**账号侧处置**回调（由服务层注入，持注册令牌与 AppState
+    /// 的 Weak）：换库后增量续读无法保证不漏（旧水位线属于旧文件的行号空间），
+    /// 账号必须转 Error 待重注册。None = 未注入（嵌入者直接构造的句柄），换库
+    /// 只推进游标世代并按错误终止本轮——处置责任在调用方。
+    on_source_replaced: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Source main db path — derives the `-wal` path the fallback stats.
-    db_path: PathBuf,
+    ///
+    /// 只读暴露给定向导出：发布前的身份复查要在**导出自己**的阻塞任务里再采一次
+    /// 指纹（轮询采样在整个导出期间被 `reader`/`store` 的锁挡住，世代计数必然
+    /// 不动），采样的输入就是这条路径。
+    pub db_path: PathBuf,
     /// `nt_db` directory — sibling group-info databases live here (name maps).
     db_dir: PathBuf,
     /// SQLCipher key — sibling databases share it (name maps).
@@ -67,6 +101,22 @@ pub struct AccountSync {
     /// Last observed (mtime-millis, size) of the source WAL; the fallback
     /// poll compares against it to detect changes the watcher missed.
     last_wal: Mutex<Option<(u64, u64)>>,
+    /// 数据源世代：库文件**身份**（路径、创建时间、salt）变化时递增。
+    ///
+    /// 游标 v2 把它编进载荷：身份换了（删库重建、还原成另一份文件），旧游标
+    /// 的行标识在新文件上毫无意义，续拉等于按旧表的位置读新表。与指纹基线
+    /// `source_digest` 配对，每轮同步前采样一次。
+    ///
+    /// 共享句柄经 [`AccountSync::generation_handle`] 交给 HTTP 层：读路径不能
+    /// 去拿 reader/store 的锁（见 `poll_locked` 的临界区），交出去的必须是 `Arc`。
+    generation: Arc<AtomicU32>,
+    /// 上一次采样到的指纹摘要（基线）。`None` = 尚未采样成功过。
+    source_digest: Mutex<Option<[u8; 32]>>,
+    /// 换库已发现的持久失效标志。置位后本句柄的每次 `poll_once` 都直接返回
+    /// [`SourceReplaced`]，不再进入读阶段——只拒绝一轮的话，下一轮对替换库的
+    /// 采样返回「无变化」，旧的连接与水位线就又被拿去增量了。句柄的余生都是
+    /// 这个状态；只有重注册（全量重建出的新句柄）才重新开始。
+    source_replaced: AtomicBool,
 }
 
 impl AccountSync {
@@ -87,10 +137,89 @@ impl AccountSync {
             bus,
             retry: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            registration_guard: Mutex::new(None),
+            on_source_replaced: Mutex::new(None),
             db_path,
             db_dir,
             key,
             last_wal: Mutex::new(None),
+            generation: Arc::new(AtomicU32::new(0)),
+            source_digest: Mutex::new(None),
+            source_replaced: AtomicBool::new(false),
+        }
+    }
+
+    /// 注入注册身份复查闭包（生产路径由 init_account 在公开句柄前调用）。
+    /// 闭包返回 false = 该句柄所属的注册已失效。
+    pub fn set_registration_guard(&self, guard: Box<dyn Fn() -> bool + Send>) {
+        *self.registration_guard.lock() = Some(guard);
+    }
+
+    /// 注入「数据源被替换」的处置回调（生产路径由 activate_account 注入）。
+    /// 回调在 watch 任务 / 手动同步的上下文里执行，必须自己拿注册令牌校验，
+    /// 不得借助本句柄的锁。
+    pub fn set_on_source_replaced(&self, on_replace: Box<dyn Fn() + Send>) {
+        *self.on_source_replaced.lock() = Some(on_replace);
+    }
+
+    /// 触发换库处置（回调存在且注入时）。返回是否已触发。
+    pub(crate) fn notify_source_replaced(&self) -> bool {
+        match self.on_source_replaced.lock().as_ref() {
+            Some(f) => {
+                f();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 这个句柄还允许写共享 Store 吗？stopped（注销停机）与注册令牌复查
+    /// （旧注册借新注册名义写回）任一失败即否。
+    fn may_write_store(&self) -> bool {
+        !self.is_stopped()
+            && self
+                .registration_guard
+                .lock()
+                .as_ref()
+                .is_none_or(|g| g())
+    }
+
+    /// 数据源世代的共享句柄，给 HTTP 层编游标用。
+    ///
+    /// 与 `reader`/`store` 的锁同理：读世代是一次原子加载，HTTP 侧不应为此排队
+    /// 等一个可能正持锁数秒的同步轮次——交出去的必须是 `Arc` 的克隆。
+    pub fn generation_handle(&self) -> Arc<AtomicU32> {
+        self.generation.clone()
+    }
+
+    /// 采一次数据源指纹；身份类线索变化时推进世代并返回 `true`。
+    ///
+    /// 只比对库路径、创建时间与 SQLCipher salt（页 1 明文前缀，在 QQ 的 1024
+    /// 字节自定义头之后）——**追加写入不会改变它们**，所以正常的新消息入库不会
+    /// 让游标失效。采样失败时**不推进**世代：一次读失败（文件被 QQ 短暂占用、
+    /// 权限抖动）不能把所有在用游标判死，下一轮重试即可；失败本身记警告，不静默吞掉。
+    fn sample_source(&self) -> bool {
+        match crate::db::source_identity::fingerprint(&self.db_path) {
+            Ok(fp) => {
+                let mut baseline = self.source_digest.lock();
+                match *baseline {
+                    None => {
+                        *baseline = Some(fp.digest);
+                        false
+                    }
+                    Some(previous) if previous != fp.digest => {
+                        *baseline = Some(fp.digest);
+                        self.generation.fetch_add(1, Ordering::SeqCst);
+                        tracing::warn!("数据源身份发生变化：旧游标与进行中的导出将失效");
+                        true
+                    }
+                    Some(_) => false,
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "数据源指纹采样失败，本轮不推进世代");
+                false
+            }
         }
     }
 
@@ -119,6 +248,12 @@ impl AccountSync {
         };
         let maps = crate::store::names::load_names(conn, &self.db_dir, &self.key, &known);
         let mut guard = self.store.write();
+        // 最终写入在写锁内复查注册身份：耗时读取在锁外做完之后，注销与重注册
+        // 都可能已经发生——旧账号的名字表不能落进（可能已属于）新账号的 store。
+        if !self.may_write_store() {
+            tracing::debug!("[names] refresh discarded: registration no longer current");
+            return;
+        }
         guard.names = maps;
     }
 
@@ -141,8 +276,21 @@ impl AccountSync {
         };
         let index = crate::store::media::scan_cache_index(&root);
         let mut guard = self.store.write();
+        // 复查必须包住 reapply_media_registration 整段：它按旧账号的缓存索引
+        // 改写**当前** store 已有行的媒体登记——只复查 media_fallback 赋值时，
+        // 注销后的旧账号仍能借 reapply 把新账号的行改写掉。
+        if !self.may_write_store() {
+            tracing::debug!("[media-fallback] refresh discarded: registration no longer current");
+            return;
+        }
         guard.media_fallback = index;
         crate::store::index::reapply_media_registration(&mut guard);
+    }
+
+    /// 建索引完成后、对外可用之前的一次基线采样（见 `init_account` 的调用注释）。
+    /// 失败只告警：下一轮 `poll_once` 会重试，基线缺失不判死任何游标。
+    pub fn sample_source_baseline(&self) {
+        self.sample_source();
     }
 
     /// Cheap change detection (no data IO — at most one metadata stat):
@@ -188,7 +336,24 @@ impl AccountSync {
     /// filter applied). Safe to call concurrently — the reader mutex and
     /// the store write lock serialize overlapping passes (the second one
     /// finds nothing new).
+    ///
+    /// 数据源身份变化（换库）时返回
+    /// [`SyncError::SourceReplaced`]：此刻**不能**继续增量——旧水位线属于旧
+    /// 文件的行号空间，替换库中 rowid 不超过它的行会被「`rowid > 水位线`」
+    /// 永久滤掉，且现有连接可能仍指向旧文件。调用方据此时账号转 Error、
+    /// 待重注册恢复（重注册 = 全量重建，是唯一能兑现「新库、新水位线」的路径）。
     pub fn poll_once(&self) -> Result<Vec<MessageOut>> {
+        // 换库发现是**句柄的终态**：置位后每一轮都在读阶段之前拒绝（见
+        // `source_replaced` 字段的说明）。
+        if self.source_replaced.load(Ordering::SeqCst) {
+            return Err(anyhow::Error::new(SourceReplaced));
+        }
+        // 每轮同步前采一次数据源指纹：换了库就在这里推进世代。放在读阶段之前
+        // ——本轮读出的行如果来自新文件，游标也必须从这一代开始算。
+        if self.sample_source() {
+            self.source_replaced.store(true, Ordering::SeqCst);
+            return Err(anyhow::Error::new(SourceReplaced));
+        }
         let mut reader = self.reader.lock();
         let result = self.poll_locked(&mut reader);
         if result.is_err() {
@@ -218,7 +383,7 @@ impl AccountSync {
         // cache-index fallback must advertise the same fetchable id in its
         // own event), then build the SSE events and response rows (the
         // records are borrowed — see apply_records), advance watermarks.
-        let (events, outs): (Vec<Event>, Vec<MessageOut>) = {
+        let outs: Vec<MessageOut> = {
             let mut guard = self.store.write();
             // Deregistration check, deliberately the first thing inside the
             // critical section rather than at `poll_once`'s entry: the read
@@ -227,7 +392,7 @@ impl AccountSync {
             // this account's rows (and watermarks) into the cleared store —
             // resurrecting data the operator just removed. Checking under the
             // same lock deregistration takes makes the two mutually exclusive.
-            if self.is_stopped() {
+            if !self.may_write_store() {
                 tracing::debug!(qq = %self.qq, "sync pass discarded: account deregistered");
                 return Ok(Vec::new());
             }
@@ -296,11 +461,13 @@ impl AccountSync {
                 .chain(&new_c)
                 .map(|r| crate::store::query::shape_record(&guard, r))
                 .collect();
-            (events, outs)
+            // Keep events before a deregistration reset: clearing the store and
+            // resetting history cannot overtake this publication.
+            for ev in events {
+                self.bus.publish(ev);
+            }
+            outs
         };
-        for ev in events {
-            self.bus.publish(ev);
-        }
         Ok(outs)
     }
 }
@@ -309,48 +476,83 @@ impl AccountSync {
 /// the manual-sync endpoint. Accounts are registered as their indexes
 /// finish building.
 pub struct SyncEngine {
-    accounts: Mutex<Vec<Arc<AccountSync>>>,
-    /// Per-account watch task handles, so deregistration can abort the task
-    /// that would otherwise keep the source database and its directory
-    /// handle open for the rest of the process's life. Previously the handle
-    /// was dropped at spawn time, which detached the task permanently.
-    watchers: Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<Result<()>>>>,
+    registry: Mutex<SyncRegistry>,
+}
+
+#[derive(Default)]
+struct SyncRegistry {
+    accounts: Vec<Arc<AccountSync>>,
+    watchers: std::collections::HashMap<String, tokio::task::JoinHandle<Result<()>>>,
 }
 
 impl SyncEngine {
     pub fn new() -> Self {
-        Self { accounts: Mutex::new(Vec::new()), watchers: Mutex::new(Default::default()) }
+        Self { registry: Mutex::new(SyncRegistry::default()) }
     }
 
-    pub fn register(&self, account: Arc<AccountSync>) {
-        self.accounts.lock().push(account);
+    /// Validate and publish under the same registry lock used by removal.
+    /// Server callers also hold the lifecycle gate while changing the token.
+    pub fn register_if_current(&self, account: Arc<AccountSync>, token_ok: &dyn Fn() -> bool) -> bool {
+        let mut registry = self.registry.lock();
+        if !token_ok() || account.is_stopped()
+            || registry.accounts.iter().any(|a| a.qq == account.qq)
+        {
+            return false;
+        }
+        registry.accounts.push(account);
+        true
     }
 
-    /// Track one account's watch task (replacing any previous handle, which a
-    /// re-registration after a failure produces).
-    pub fn attach_watcher(&self, qq: &str, handle: tokio::task::JoinHandle<Result<()>>) {
-        if let Some(old) = self.watchers.lock().insert(qq.to_string(), handle) {
+    /// Attach only to the exact registered handle. A rejected task must be
+    /// aborted explicitly: dropping a JoinHandle would detach it permanently.
+    pub fn attach_watcher_if_current(
+        &self,
+        account: &Arc<AccountSync>,
+        handle: tokio::task::JoinHandle<Result<()>>,
+        token_ok: &dyn Fn() -> bool,
+    ) -> bool {
+        let mut registry = self.registry.lock();
+        if !token_ok() || account.is_stopped()
+            || !registry.accounts.iter().any(|a| Arc::ptr_eq(a, account))
+        {
+            handle.abort();
+            return false;
+        }
+        if let Some(old) = registry.watchers.insert(account.qq.clone(), handle) {
             old.abort();
         }
+        true
     }
 
-    /// Remove `qq` from the registry and return its sync handle plus its
-    /// watch task, if it was registered. The caller stops them — this only
-    /// detaches them from the engine so no later pass can pick them up.
+    /// Remove the current account and watcher together. Callers stop the
+    /// returned handle before clearing the index under its write lock.
     pub fn unregister(
         &self,
         qq: &str,
     ) -> (Option<Arc<AccountSync>>, Option<tokio::task::JoinHandle<Result<()>>>) {
-        let account = {
-            let mut accs = self.accounts.lock();
-            accs.iter().position(|a| a.qq == qq).map(|i| accs.remove(i))
-        };
-        let watcher = self.watchers.lock().remove(qq);
+        let mut registry = self.registry.lock();
+        let account = registry.accounts.iter().position(|a| a.qq == qq)
+            .map(|i| registry.accounts.remove(i));
+        let watcher = registry.watchers.remove(qq);
         (account, watcher)
     }
 
+    /// A stale initialization may retire itself, never a later registration
+    /// of the same account. The identity check and removal are indivisible.
+    pub fn unregister_if(&self, account: &Arc<AccountSync>) -> bool {
+        let mut registry = self.registry.lock();
+        let Some(i) = registry.accounts.iter().position(|a| Arc::ptr_eq(a, account)) else {
+            return false;
+        };
+        registry.accounts.remove(i).stop();
+        if let Some(watcher) = registry.watchers.remove(&account.qq) {
+            watcher.abort();
+        }
+        true
+    }
+
     pub fn snapshot(&self) -> Vec<Arc<AccountSync>> {
-        self.accounts.lock().clone()
+        self.registry.lock().accounts.clone()
     }
 
     /// Manual sync: run a full pass on every registered account and return
@@ -387,7 +589,14 @@ impl SyncEngine {
                     }
                     account.refresh_names();
                 }
-                Err(e) => tracing::warn!("manual sync error: {e:#}"),
+                Err(e) => {
+                    // 换库在手动同步路径同样不能「等下一轮」：处置回调已把账号转
+                    // Error（watch 与手动同步共用同一注入），这里只记日志说明本轮
+                    // 没有产出。未注入时按普通失败记日志（处置责任在调用方）。
+                    if !(is_source_replaced(&e) && account.notify_source_replaced()) {
+                        tracing::warn!("manual sync error: {e:#}");
+                    }
+                }
             }
         }
         (new_count, revoke_count)

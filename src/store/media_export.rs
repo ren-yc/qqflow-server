@@ -83,14 +83,16 @@ pub struct ExportOut {
     pub handle_ok: bool,
 }
 
-/// 名字是否由**内容摘要**派生：32 位十六进制（大小写都算）＋ 可选扩展名。
+/// 名字是否由**内容摘要**派生：32 位（md5/store 键）或 64 位（定向导出的
+/// SHA-256）十六进制 ＋ 可选扩展名。
 ///
 /// 判据是「按名取字节是跨会话解析的」：路由只看名字、不看会话，而别的会话里可能躺着一个
 /// 同名但内容不同的文件。摘要派生的名字按内容唯一，所以可以承诺「出现即可取」；平台给的
 /// 文件名（QQ 的原始名、语音的服务端序号名）不满足这一点，只作元数据。
 pub fn name_is_content_digest(name: &str) -> bool {
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+    let is_hex = stem.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hex && (stem.len() == 32 || stem.len() == 64)
 }
 
 /// Safe export file name: `<key>.<source ext>` when a store key exists
@@ -222,6 +224,160 @@ fn out(file_name: &str, dest: &Path, key_named: bool) -> ExportOut {
         digest_named,
         handle_ok,
     }
+}
+
+/// Staged bytes are private until the registration is revalidated.
+pub struct PreparedExport {
+    root: PathBuf,
+    temp: Option<PathBuf>,
+    result: ExportOut,
+}
+
+impl PreparedExport {
+    pub fn publish(mut self) -> anyhow::Result<ExportOut> {
+        let dest = Path::new(&self.result.local_path);
+        anyhow::ensure!(crate::pathsafe::is_contained(&self.root, dest), "export target escaped root");
+        if let Some(temp) = &self.temp {
+            anyhow::ensure!(crate::pathsafe::is_contained(&self.root, temp), "staging directory escaped root");
+            std::fs::rename(temp, dest)?;
+            self.temp = None;
+        } else {
+            anyhow::ensure!(dest.is_file(), "existing export disappeared");
+        }
+        Ok(self.result.clone())
+    }
+}
+
+impl Drop for PreparedExport {
+    fn drop(&mut self) {
+        if let Some(temp) = &self.temp { let _ = std::fs::remove_file(temp); }
+    }
+}
+
+/// Export one target with a name derived from the actual bytes. Missing source
+/// is distinct from I/O failure; ordinary platform filenames never become IDs.
+///
+/// `published_handle` 是本仓上次为这条媒体发布过的 digest 句柄（来自 store 登记，
+/// 见 `MediaEntry::published_handle`）：QQ 删源缓存后源字节没了，digest 名**无法
+/// 重新推导**（它是对字节的摘要），没有登记就找不到已发布的副本，请求落 404。
+pub fn export_targeted(
+    ctx: &ExportContext,
+    media: &MediaInfo,
+    kind_dir: &str,
+    media_root: Option<&Path>,
+    fallback: Option<&str>,
+    published_handle: Option<&str>,
+) -> anyhow::Result<Option<PreparedExport>> {
+    use std::io::{Read, Write};
+    use sha2::{Digest, Sha256};
+    anyhow::ensure!(crate::pathsafe::safe_segment(&ctx.talker), "invalid conversation path");
+    anyhow::ensure!(["images", "voices", "videos"].contains(&kind_dir), "unsupported media kind");
+    // The legacy exporter already guarantees uniqueness for store-key names.
+    // Reuse a correctly typed copy even when QQ has removed its source cache.
+    if let Some(hint) = media.local_path.as_deref().or(fallback) {
+        let (name, key_named) = export_file_name(media, Path::new(hint));
+        if key_named && crate::pathsafe::safe_segment(&name) {
+            let path = ctx.root.join(&ctx.talker).join(kind_dir).join(&name);
+            if path.is_file() {
+                anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &path), "existing export escaped root");
+                let mut file = std::fs::File::open(&path)?;
+                let mut prefix = [0; 16];
+                let count = file.read(&mut prefix)?;
+                let ext = Path::new(&name).extension().and_then(|s| s.to_str()).unwrap_or("");
+                if count > 0 && detected_extension(&prefix[..count]).is_some_and(|actual| actual == ext) {
+                    return Ok(Some(PreparedExport { root: ctx.root.clone(), temp: None, result: out(&name, &path, true) }));
+                }
+            }
+        }
+    }
+    // 源还在时永远走「重导」而不是登记：登记指向的文件可能已被清理，而源的
+    // 字节是此刻的权威——重导会算出同一个 digest 名，内容必然一致（同名即同内容）。
+    //
+    // 候选逐个判定：**空串跳过**（`root.join("")` 解析出的是 media root 目录
+    // 本身，它会以 `is_some` 提前终结循环，让后面的 fallback 失去机会），候选
+    // **不是普通文件也跳过**（目录/悬空都救不了这条媒体）。其余解析错误照常
+    // 上报——静默吞掉会掩盖越界等真实边界问题。
+    let mut source = None;
+    for path in [media.local_path.as_deref(), fallback].into_iter().flatten() {
+        if path.is_empty() {
+            continue;
+        }
+        let resolved = crate::store::media::resolve_local_path_checked(path, media_root)?;
+        match resolved {
+            Some(p) if p.is_file() => {
+                source = Some(p);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let Some(source) = source else {
+        // 源缓存没了：唯一还能兑现「按消息身份取字节」的是上次发布的 digest 副本。
+        // 句柄形态在发布侧已验证（摘要名 + 已含导出根 containment），这里只按
+        // 文件存在性复用——文件不在（被清理）就照旧返回 None（404），不猜。
+        if let Some(handle) = published_handle.filter(|h| crate::pathsafe::safe_segment(h)) {
+            let path = ctx.root.join(&ctx.talker).join(kind_dir).join(handle);
+            if path.is_file() {
+                anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &path), "published copy escaped root");
+                return Ok(Some(PreparedExport { root: ctx.root.clone(), temp: None, result: out(handle, &path, true) }));
+            }
+        }
+        return Ok(None);
+    };
+    anyhow::ensure!(crate::pathsafe::safe_segment(&ctx.talker), "invalid conversation path");
+    anyhow::ensure!(["images", "voices", "videos"].contains(&kind_dir), "unsupported media kind");
+    let dir = ctx.root.join(&ctx.talker).join(kind_dir);
+    std::fs::create_dir_all(&dir)?;
+    let pending = ctx.root.join(".pending");
+    std::fs::create_dir_all(&pending)?;
+    let temp = pending.join(format!("{}-{}.tmp", std::process::id(), rand::random::<u64>()));
+    anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &temp), "export directory escaped root");
+    let mut input = match std::fs::File::open(&source) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    let result = (|| -> anyhow::Result<PreparedExport> {
+        let mut buffer = [0u8; 64 * 1024];
+        let mut hash = Sha256::new();
+        let mut first = true;
+        let mut ext = source.extension().and_then(|s| s.to_str()).unwrap_or("bin").to_ascii_lowercase();
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 { break; }
+            if first {
+                let bytes = &buffer[..count];
+                if let Some(actual) = detected_extension(bytes) { ext = actual.into(); }
+                first = false;
+            }
+            hash.update(&buffer[..count]);
+            output.write_all(&buffer[..count])?;
+        }
+        anyhow::ensure!(!first, "empty media source");
+        if ext.is_empty() || ext.len() > 8 || !ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            ext = "bin".into();
+        }
+        output.flush()?;
+        drop(output);
+        let name = format!("{:x}.{ext}", hash.finalize());
+        let dest = dir.join(&name);
+        anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &dest), "export target escaped root");
+        Ok(PreparedExport { root: ctx.root.clone(), temp: Some(temp.clone()), result: out(&name, &dest, true) })
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result.map(Some)
+}
+
+fn detected_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG") { Some("png") }
+    else if bytes.starts_with(b"\xff\xd8\xff") { Some("jpg") }
+    else if bytes.starts_with(b"GIF8") { Some("gif") }
+    else if bytes.starts_with(b"#!SILK") || bytes.starts_with(b"\x02#!SILK") { Some("silk") }
+    else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") { Some("webp") }
+    else if bytes.get(4..8) == Some(b"ftyp") { Some("mp4") }
+    else if bytes.starts_with(b"BM") { Some("bmp") }
+    else { None }
 }
 
 /// Export a whole page of messages (the `media=1` / `meiti` path): each
@@ -409,9 +565,10 @@ mod tests {
         let e2 = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
-        // 判据本身：32 位十六进制（大小写都算）＋ 可选扩展名。
+        // 判据本身：32 位（md5/store 键）或 64 位（定向导出 SHA-256）十六进制 ＋ 可选扩展名。
         assert!(name_is_content_digest("aabbccddeeff00112233445566778899.png"));
         assert!(name_is_content_digest("AABBCCDDEEFF00112233445566778899"));
+        assert!(name_is_content_digest(&format!("{}.png", "a".repeat(64))), "定向导出的 SHA-256 名也是内容摘要");
         assert!(!name_is_content_digest("photo.png"), "平台给的原名不派生自内容");
         assert!(!name_is_content_digest("voice_123.silk"));
         assert!(!name_is_content_digest("aabbccddeeff0011223344556677889.jpg"));

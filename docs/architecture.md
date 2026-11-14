@@ -337,10 +337,38 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 
 ### 增量同步
 
+- 账号绑定、索引安装、同步句柄与 watcher 登记、ready 提交和注销共用生命周期锁；慢速扫描留在锁外。锁序为生命周期锁 → 注册表、账号或 Store → 事件历史，不反向获取。
+- watcher 绑定具体句柄，拒绝时显式取消；旧任务仅能回滚自身。回归：`stale_cleanup_and_watcher_cannot_remove_new_registration`。
+- 注销必须等最终提交结束，新注册必须等注销清理结束；消息发布与 Store 更新同锁，避免旧事件落在 reset 之后。回归：`lifecycle_commit_excludes_deregister_through_watcher_and_ready`。
+- 排队中的旧初始化即使在新账号就绪后才执行，也不能替换索引、事件基线或 ready 状态。回归：`queued_initialization_cannot_replace_a_new_account_index`。
+
 - **水位是 SQLite 行号**（weflow 是三元组）：`generation` 变化后的补拉语义因此是「整会话重排空」，而不是按行续传。事件类型的唯一出处是 `sync/events.rs`，SSE 载荷与总线共用。
 - **`sync/watch.rs` 只决定何时再轮询**，不解析内容；真正的增量来自水位线。改 watch 的判据时不要顺手把它变成内容感知——那是另一条路径的职责。
 
 ### 导出与媒体
+
+- 定向导出以会话、消息 ID、发送者及时间唯一定位，耗时工作在阻塞池执行，在不对外服务的临时目录写完后，持生命周期锁复查注册身份，再发布文件。实际字节摘要形成可取句柄，非唯一平台文件名不能成为全局地址。
+- 发布前还要复查**数据源身份**：请求开始时采一次指纹（库路径 + 创建时间 + 偏移 1024 起的 salt），发布前再采一次。
+  - 不一致返回 409 加 `reason: "cursor_reset_required"`。只比世代计数不够：它只在同步路径采样时推进，导出的阻塞任务可能持锁让轮询停摆。
+  - 起始采样失败时退回世代比较（尽力检测）；起始采到、发布前采不到，按「无法证明」处理，不发布。回归：`targeted_export_cancels_when_the_source_identity_changes_midway`。
+- 这条复查是**尽力检测**，盲区必须说清：同一库文件的备份还原可能连指纹都不变（salt 与创建时间都可保持不变）。要闭合它得把文件身份做到卷级，本仓不做。
+
+### 拉取面的进度游标
+
+游标是**不透明的身份绑定串**：客户端原样回传，失效时响亮失败，绝不静默退回时间模式。
+
+- 载荷是本进程 nonce、账号摘要、注册代次、数据源世代、会话摘要与最后交付的 rowid。
+  - 会话摘要绑**解析后**的 `(chat_type, talker)` 而不是裸 id：`find_conversation` 的类型回退让两个裸 id 落到同一个会话，它们必须编出同一条线。回归 `chatlab_pull_cursor_v2_reset_semantics`。
+- 失效分两档：语法坏或版本未知是 400；v1 旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
+  - 判据只看身份不看内容：QQ 的追加写入与 WAL checkpoint 都不改变身份线索，放进判据等于让游标每次新消息都失效。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
+- 数据源世代由同步侧每轮采样推进（`db/source_identity.rs`），基线在建索引完成后立一次——没有基线时首个新消息触发的采样会把「建索引时的文件」当首次 sighting，换库窗口被吞掉。回归 `replacing_the_database_changes_the_fingerprint`。
+- 换库（轮询采样发现身份变化）后**增量续读必须停止**：旧水位线属于旧文件的行号空间，替换库中 rowid 不超过它的行会被永久滤掉，且现有连接可能仍指向旧文件。账号转 Error 待重注册——重注册即全量重建，是唯一能兑现「新库、新水位线」的路径。回归 `source_replacement_flips_the_account_to_error`。
+- 构建期换库同样不能装：基线绑定**构建时**的文件，安装前在同一临界区内复查指纹，不一致（或采样失败=无法证明未变）丢弃本次索引、账号转 Error。基线若在构建完成后才采，构建期间换库时 store 里是 A 的数据、基线却记成 B，换库被整个吞掉。回归 `build_time_source_replacement_discards_the_index`。
+- 账号切换时清理本次临时文件，不发布旧任务结果。已有可取副本优先复用；新产物按实际字节摘要命名。
+- 定向导出发布成功时把 digest 句柄登记进 store 的媒体登记表（进程内，不落盘）。
+  - 源缓存被 QQ 清掉后 digest 名无法从元数据重新推导（它是对字节的摘要），没有登记就找不到已发布的副本。
+  - 登记在源不可解析时按文件存在性复用；进程重启后丢失属既定边界。回归：`targeted_export_reuses_its_own_digest_copy_after_source_removal`。
+- SDK 在取字节 404 后只触发一次定向导出，并使用实际返回句柄；CLI 对缺失句柄逐消息恢复，以消息 ID、发送者和时间关联回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
 
 - **子集导出的文件名是按本轮输入算的，撞名要按归属拒绝**：非续跑轮的去重集合从空开始，本轮某个会话可以算出与一个未在本轮的会话已交付产物同名的文件名，`.part` 收尾 rename 直接把它盖掉。
 - 而新清单没有那个条目：交付物被换掉、下一轮也无从自愈。判据必须是归属（既有产物登记在别的会话名下，或没被任何清单认领），不是「本轮有没有写过这个路径」——后者会把同会话有意重导一并拒掉。
