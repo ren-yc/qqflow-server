@@ -363,6 +363,9 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
   - 判据只看身份不看内容：QQ 的追加写入与 WAL checkpoint 都不改变身份线索，放进判据等于让游标每次新消息都失效。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
 - 数据源世代由同步侧每轮采样推进（`db/source_identity.rs`），基线在建索引完成后立一次——没有基线时首个新消息触发的采样会把「建索引时的文件」当首次 sighting，换库窗口被吞掉。回归 `replacing_the_database_changes_the_fingerprint`。
 - 账号切换时清理本次临时文件，不发布旧任务结果。已有可取副本优先复用；新产物按实际字节摘要命名。
+- 定向导出发布成功时把 digest 句柄登记进 store 的媒体登记表（进程内，不落盘）。
+  - 源缓存被 QQ 清掉后 digest 名无法从元数据重新推导（它是对字节的摘要），没有登记就找不到已发布的副本。
+  - 登记在源不可解析时按文件存在性复用；进程重启后丢失属既定边界。回归：`targeted_export_reuses_its_own_digest_copy_after_source_removal`。
 - SDK 在取字节 404 后只触发一次定向导出，并使用实际返回句柄；CLI 对缺失句柄逐消息恢复，以消息 ID、发送者和时间关联回填。回归：`media_bytes_exports_then_retries_once_after_404`、`targeted_media_restores_each_missing_message_once`。
 
 - **子集导出的文件名是按本轮输入算的，撞名要按归属拒绝**：非续跑轮的去重集合从空开始，本轮某个会话可以算出与一个未在本轮的会话已交付产物同名的文件名，`.part` 收尾 rename 直接把它盖掉。

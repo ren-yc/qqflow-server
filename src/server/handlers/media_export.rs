@@ -36,7 +36,7 @@ async fn restore(
     if request.talker.is_empty() || request.platform_message_id.is_empty() || request.sender.is_empty() {
         return Err(ApiError::bad_request("talker、platformMessageId 和 sender 不能为空"));
     }
-    let (registration, qq, media, root, fallback, kind) = {
+    let (registration, qq, media, media_key, root, fallback, published, kind) = {
         let _lifecycle = state.init.lifecycle.lock();
         if !state.ready.load(Ordering::SeqCst) { return Err(ApiError::not_ready()); }
         let token = RegistrationToken {
@@ -68,11 +68,13 @@ async fn restore(
             _ => return Err(unexportable()),
         };
         let media = target.parsed.media.clone().ok_or_else(unexportable)?;
-        let fallback = media.key().and_then(|key| store.media.get(key)).map(|m| m.local_path.clone());
+        let media_key: Option<String> = media.key().map(str::to_string);
+        let fallback = media_key.as_deref().and_then(|key| store.media.get(key)).map(|m| m.local_path.clone());
         if media.local_path.is_none() && fallback.is_none() && !media.urls.is_empty() {
             return Err(unexportable());
         }
-        (token, qq, media, store.media_root.clone(), fallback, kind)
+        let published = media_key.as_deref().and_then(|key| store.media.get(key)).and_then(|m| m.published_handle.clone());
+        (token, qq, media, media_key, store.media_root.clone(), fallback, published, kind)
     };
     let context = ExportContext {
         root: state.export_root.as_ref().clone(), base_url: String::new(), talker: request.talker,
@@ -87,7 +89,7 @@ async fn restore(
     let fingerprint = crate::db::source_identity::fingerprint(&account.db_path).ok();
     let account_for_task = account.clone();
     tokio::task::spawn_blocking(move || {
-        let result = export_targeted(&context, &media, kind, root.as_deref(), fallback.as_deref());
+        let result = export_targeted(&context, &media, kind, root.as_deref(), fallback.as_deref(), published.as_deref());
         before_publish();
         let _lifecycle = state.init.lifecycle.lock();
         if registration.is_cancelled(&state.init) { return Err(conflict("导出期间账号注册发生切换")); }
@@ -106,6 +108,16 @@ async fn restore(
         let result = result.map_err(|_| ApiError::internal("媒体读取或导出失败"))?
             .ok_or_else(|| ApiError::not_found("原始媒体已不可恢复"))?
             .publish().map_err(|_| ApiError::internal("媒体发布失败"))?;
+        // 发布成功才登记句柄（store 内、进程内）：下次源缓存被 QQ 清掉时，
+        // `export_targeted` 靠它找到这份 digest 副本（发布失败/取消不登记——
+        // 登记一个不存在的句柄等于把 404 藏进登记表）。写动作发生在 store 锁内，
+        // 与「发布是请求驱动的真实链路」一致。
+        if let Some(key) = media_key {
+            let mut store = state.store.write();
+            if let Some(entry) = store.media.get_mut(&key) {
+                entry.published_handle = Some(result.file_name.clone());
+            }
+        }
         Ok(MediaExportResult {
             file_name: media.file_name.clone().unwrap_or_default(),
             media_id: result.file_name.clone(),

@@ -189,3 +189,36 @@ async fn targeted_export_reuses_existing_copy_after_source_removal() {
     assert_eq!(exported["mediaId"], previous);
     assert_eq!(fixture.bytes(previous).await, b"\xff\xd8\xffjpeg bytes");
 }
+
+/// 定向导出的 digest 副本在源缓存被删后必须仍可复用。
+///
+/// 首次**定向**导出落盘的是 `<sha256>.<ext>`（对源字节的摘要），而复用分支此前
+/// 只查 `<md5>.<ext>`（store 键名）——摘要名无法从元数据重新推导（字节没了摘要
+/// 就算不出来），没有「消息身份 → 已发布句柄」的登记，第二次导出落 404。
+/// 既有回归 `targeted_export_reuses_existing_copy_after_source_removal` 的首次
+/// 导出走 `media=1` 路径（md5 键名），从未覆盖定向导出自己的 digest 形态。
+/// 登记在发布成功时写入 store（进程内，见 `MediaEntry::published_handle`）。
+#[tokio::test]
+async fn targeted_export_reuses_its_own_digest_copy_after_source_removal() {
+    let fixture = Fixture::new(false).await;
+    // 首次定向导出：source 还在，走 digest 分支，产物名是 32 位 hex。
+    let (status, first) = fixture.export(Fixture::target()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let digest_name = first["mediaId"].as_str().unwrap().to_string();
+    let (stem, ext) = digest_name.rsplit_once('.').unwrap_or((digest_name.as_str(), ""));
+    // 定向导出的名字是 **SHA-256**（64 位 hex）摘要 + 检测出的扩展名；比 store 键
+    // （md5 hex，32 位）长一倍，这也是它与复用分支的键名对不上的原因。
+    assert_eq!(stem.len(), 64, "首次定向导出必须落 SHA-256 digest 句柄: {digest_name}");
+    assert!(stem.bytes().all(|b| b.is_ascii_hexdigit()), "digest 名是 hex: {digest_name}");
+    assert_eq!(ext, "png");
+    assert!(fixture.bytes(&digest_name).await == b"\x89PNG\r\n\x1a\nactual bytes");
+
+    // QQ 删掉源缓存：45812 指向的文件没了。
+    std::fs::remove_file(common::fake_media_path(&fixture.root.join("nt_db"))).unwrap();
+
+    // 再次定向导出：源没了，digest 名算不出来，必须靠登记复用已发布副本。
+    let (status, again) = fixture.export(Fixture::target()).await;
+    assert_eq!(status, StatusCode::OK, "删源后的定向导出必须复用 digest 副本而不是 404: {again}");
+    assert_eq!(again["mediaId"], digest_name, "复用的必须是同一份 digest 副本: {again}");
+    assert_eq!(fixture.bytes(&digest_name).await, b"\x89PNG\r\n\x1a\nactual bytes");
+}

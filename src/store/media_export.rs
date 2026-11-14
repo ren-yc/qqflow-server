@@ -83,14 +83,16 @@ pub struct ExportOut {
     pub handle_ok: bool,
 }
 
-/// 名字是否由**内容摘要**派生：32 位十六进制（大小写都算）＋ 可选扩展名。
+/// 名字是否由**内容摘要**派生：32 位（md5/store 键）或 64 位（定向导出的
+/// SHA-256）十六进制 ＋ 可选扩展名。
 ///
 /// 判据是「按名取字节是跨会话解析的」：路由只看名字、不看会话，而别的会话里可能躺着一个
 /// 同名但内容不同的文件。摘要派生的名字按内容唯一，所以可以承诺「出现即可取」；平台给的
 /// 文件名（QQ 的原始名、语音的服务端序号名）不满足这一点，只作元数据。
 pub fn name_is_content_digest(name: &str) -> bool {
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    stem.len() == 32 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+    let is_hex = stem.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hex && (stem.len() == 32 || stem.len() == 64)
 }
 
 /// Safe export file name: `<key>.<source ext>` when a store key exists
@@ -254,12 +256,17 @@ impl Drop for PreparedExport {
 
 /// Export one target with a name derived from the actual bytes. Missing source
 /// is distinct from I/O failure; ordinary platform filenames never become IDs.
+///
+/// `published_handle` 是本仓上次为这条媒体发布过的 digest 句柄（来自 store 登记，
+/// 见 `MediaEntry::published_handle`）：QQ 删源缓存后源字节没了，digest 名**无法
+/// 重新推导**（它是对字节的摘要），没有登记就找不到已发布的副本，请求落 404。
 pub fn export_targeted(
     ctx: &ExportContext,
     media: &MediaInfo,
     kind_dir: &str,
     media_root: Option<&Path>,
     fallback: Option<&str>,
+    published_handle: Option<&str>,
 ) -> anyhow::Result<Option<PreparedExport>> {
     use std::io::{Read, Write};
     use sha2::{Digest, Sha256};
@@ -283,12 +290,26 @@ pub fn export_targeted(
             }
         }
     }
+    // 源还在时永远走「重导」而不是登记：登记指向的文件可能已被清理，而源的
+    // 字节是此刻的权威——重导会算出同一个 digest 名，内容必然一致（同名即同内容）。
     let mut source = None;
     for path in [media.local_path.as_deref(), fallback].into_iter().flatten() {
         source = crate::store::media::resolve_local_path_checked(path, media_root)?;
         if source.is_some() { break; }
     }
-    let Some(source) = source else { return Ok(None) };
+    let Some(source) = source else {
+        // 源缓存没了：唯一还能兑现「按消息身份取字节」的是上次发布的 digest 副本。
+        // 句柄形态在发布侧已验证（摘要名 + 已含导出根 containment），这里只按
+        // 文件存在性复用——文件不在（被清理）就照旧返回 None（404），不猜。
+        if let Some(handle) = published_handle.filter(|h| crate::pathsafe::safe_segment(h)) {
+            let path = ctx.root.join(&ctx.talker).join(kind_dir).join(handle);
+            if path.is_file() {
+                anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &path), "published copy escaped root");
+                return Ok(Some(PreparedExport { root: ctx.root.clone(), temp: None, result: out(handle, &path, true) }));
+            }
+        }
+        return Ok(None);
+    };
     anyhow::ensure!(crate::pathsafe::safe_segment(&ctx.talker), "invalid conversation path");
     anyhow::ensure!(["images", "voices", "videos"].contains(&kind_dir), "unsupported media kind");
     let dir = ctx.root.join(&ctx.talker).join(kind_dir);
@@ -530,9 +551,10 @@ mod tests {
         let e2 = export_media(&ctx, &m, "images", true, Some(&src_dir), None).expect("idempotent");
         assert_eq!(e2.local_path, e.local_path);
         assert_eq!(dest.metadata().unwrap().modified().unwrap(), mtime, "same-size skip preserves mtime");
-        // 判据本身：32 位十六进制（大小写都算）＋ 可选扩展名。
+        // 判据本身：32 位（md5/store 键）或 64 位（定向导出 SHA-256）十六进制 ＋ 可选扩展名。
         assert!(name_is_content_digest("aabbccddeeff00112233445566778899.png"));
         assert!(name_is_content_digest("AABBCCDDEEFF00112233445566778899"));
+        assert!(name_is_content_digest(&format!("{}.png", "a".repeat(64))), "定向导出的 SHA-256 名也是内容摘要");
         assert!(!name_is_content_digest("photo.png"), "平台给的原名不派生自内容");
         assert!(!name_is_content_digest("voice_123.silk"));
         assert!(!name_is_content_digest("aabbccddeeff0011223344556677889.jpg"));
