@@ -34,7 +34,8 @@ use tower::ServiceExt;
 mod common;
 use common::{FAKE_KEY, FAKE_QQ};
 
-/// Fake DB location, **per-test isolated** (`qqflow_fake/<tag>/...`).
+/// Fake DB location, **per-process and per-test isolated**
+/// (`qqflow_fake/<pid>/<tag>/...`).
 ///
 /// 每个测试一个独立目录：共享目录（旧形态）靠 FAKE_DB_LOCK 串行 + 跨测试复用
 /// 同一组 WAL hard-link——link 指向的 inode 在上一测试的 writer drop（checkpoint）
@@ -44,9 +45,15 @@ use common::{FAKE_KEY, FAKE_QQ};
 /// 进程内/跨进程的运行顺序变化都会让这个窗口显形（同一份改动下时序不同，
 /// 结果从全绿变稳定红）。每测试独立目录后 hard-link 只在**本测试的**
 /// writer/reader 之间共享，生命周期一起开始结束，窗口不存在。
+///
+/// pid 层隔离**测试进程**：两个测试进程并发跑同一个测试时，固定 tag 会给出
+/// 同一路径，后启动进程的 `build_fake_db` 会 `remove_dir_all` 先启动进程
+/// 正在读的库与 WAL（文件缺失或被误诊成解密失败）。pid 层让每个进程拿到
+/// 自己的根，`build_fake_db` 的重建只落在本进程的目录里。
 pub fn fake_db_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join("qqflow_fake")
+        .join(std::process::id().to_string())
         .join(tag)
         .join(FAKE_QQ)
         .join("nt_qq")
@@ -54,11 +61,25 @@ pub fn fake_db_path(tag: &str) -> std::path::PathBuf {
         .join("nt_msg.db")
 }
 
-/// 重建某一测试自己的 fake DB 夹具（目录随 tag 隔离，无需进程内互斥）。
-fn build_fake_db(tag: &str) -> std::path::PathBuf {
-    let fake_root = fake_db_path(tag).ancestors().nth(3).unwrap().to_path_buf();
-    let _ = std::fs::remove_dir_all(&fake_root);
-    common::write_fake_source(fake_db_path(tag).parent().unwrap(), 0)
+/// 一个测试夹具目录的**生命周期守卫**：drop 时清理本进程根下自己的 tag 目录。
+/// 目录路径在进程根之下，删除不会越界到别的进程（pid 层隔离）。
+struct FixtureGuard(std::path::PathBuf);
+
+impl Drop for FixtureGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 重建某一测试自己的 fake DB 夹具（目录随 pid+tag 隔离，无需进程内互斥）。
+/// 返回守卫，drop 时清理——必须绑定到变量（`let _guard = …`），绑到 `let _ =`
+/// 会在语句末提前 drop、删掉还在用的夹具。
+fn build_fake_db(tag: &str) -> (std::path::PathBuf, FixtureGuard) {
+    // 祖先层级：nt_msg.db → nt_db → nt_qq → FAKE_QQ → <tag>（第 4 层）。
+    let tag_root = fake_db_path(tag).ancestors().nth(4).unwrap().to_path_buf();
+    let _ = std::fs::remove_dir_all(&tag_root);
+    let path = common::write_fake_source(fake_db_path(tag).parent().unwrap(), 0);
+    (path, FixtureGuard(tag_root))
 }
 
 /// [GT] per-column value statistics for one table — the arbitration data
@@ -134,7 +155,7 @@ fn probe_columns(conn: &rusqlite::Connection, table: &str) {
 /// reader + direct row counts). The behavioral-repro procedure depends on it.
 #[test]
 fn fake_db_for_behavioral_repro() {
-    let path = build_fake_db("fake_db_for_behavioral_repro");
+    let (path, _guard) = build_fake_db("fake_db_for_behavioral_repro");
     let mut reader = LiveReader::new(path.clone(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
@@ -157,7 +178,7 @@ fn fake_db_for_behavioral_repro() {
 /// rows.flatten()). Now a permanent guard: both c2c rows must be indexed.
 #[test]
 fn fake_db_indexes_c2c_rows() {
-    let path = build_fake_db("fake_db_indexes_c2c_rows");
+    let (path, _guard) = build_fake_db("fake_db_indexes_c2c_rows");
     let mut reader = LiveReader::new(path, FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
@@ -184,7 +205,7 @@ fn fake_db_indexes_c2c_rows() {
 /// `group_info.db` (headed — exercises the offset VFS on a non-nt_msg file).
 #[test]
 fn fake_db_names_loaded() {
-    let path = build_fake_db("fake_db_names_loaded");
+    let (path, _guard) = build_fake_db("fake_db_names_loaded");
     let nt_db = path.parent().unwrap().to_path_buf();
     common::write_fake_group_info_headed(&nt_db);
     common::write_fake_profile_info(&nt_db);
@@ -298,7 +319,7 @@ fn fake_db_names_loaded() {
 async fn fake_db_group_members_is_roster_union_senders() {
     // 显式重建夹具：别的用例会往同一个库里追加行（图片行是 u_c 发的），
     // 不重建的话「u_d 没发过言」这个前提取决于执行顺序。
-    build_fake_db("fake_db_group_members_is_roster_union_senders");
+    let (_path, _guard) = build_fake_db("fake_db_group_members_is_roster_union_senders");
     let nt_db = fake_db_path("fake_db_group_members_is_roster_union_senders").parent().unwrap().to_path_buf();
     common::write_fake_group_info(&nt_db);
 
@@ -871,7 +892,7 @@ fn failed_sync_leaves_store_untouched() {
 // would rebuild the shared file underneath the in-flight initialization.
 #[allow(clippy::await_holding_lock)]
 async fn client_registers_account_with_key_and_db_path() {
-    let path = build_fake_db("client_registers_account_with_key_and_db_path");
+    let (path, _guard) = build_fake_db("client_registers_account_with_key_and_db_path");
     let db_path = path.to_string_lossy().to_string();
 
     let state = Arc::new(AppState {
