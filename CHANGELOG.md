@@ -20,6 +20,7 @@
 
 ### 修复
 
+- 定向导出的候选循环跳过空串与非普通文件候选：空串 45812 此前把 media root 目录本身当成「源已找到」提前终结循环，缓存 fallback 明明可用却落 500。回归：`targeted_export_empty_local_path_falls_back_to_cache`。
 - 轮询发现数据源身份变化（换库）时账号转 Error 待重注册，不再带旧水位线继续增量：替换库中 rowid 不超过旧水位线的行会被永久滤掉。迁移：重注册即全量重建，无需额外操作。回归：`source_replacement_flips_the_account_to_error`。
 - 索引基线绑定构建时的数据源，安装前复查指纹：构建期间换库丢弃本次索引并转 Error，不再把替换后的文件当旧索引的基线装进账号。回归：`build_time_source_replacement_discards_the_index`。
 - 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_export_cancels_staged_bytes_after_account_switch`。

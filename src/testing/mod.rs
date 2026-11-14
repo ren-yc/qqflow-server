@@ -363,6 +363,27 @@ pub fn append_image_row(conn: &Connection, n: i64, nt_db_dir: &Path) -> String {
     md5.to_string()
 }
 
+/// `image_blob` 的空 45812 变体：结构化媒体带的本地路径是**空串**（真库见过
+/// 这种形态——解析器原样保留），而缓存索引里登记着有效 fallback。定向导出的
+/// 候选循环若不跳过空串（`root.join("")` 解析出 media root 目录本身并以
+/// `is_some` 提前终结），导出会 500 而 fallback 明明可用。
+pub fn image_blob_empty_local(md5_hex: &str, file_name: &str) -> Vec<u8> {
+    let mut seg = Vec::new();
+    enc_varint_field(45001, 1, &mut seg);
+    enc_varint_field(45002, 2, &mut seg); // T_Image
+    enc_varint_field(45003, 1, &mut seg); // media subtype image
+    enc_bytes_field(45503, b"fake-uuid-0001", &mut seg);
+    enc_bytes_field(45402, file_name.as_bytes(), &mut seg);
+    enc_bytes_field(45424, md5_hex.as_bytes(), &mut seg);
+    enc_varint_field(45405, 12345, &mut seg);
+    enc_varint_field(45411, 640, &mut seg);
+    enc_varint_field(45412, 480, &mut seg);
+    enc_bytes_field(45812, b"", &mut seg);
+    let mut body = Vec::new();
+    enc_bytes_field(40800, &seg, &mut body);
+    body
+}
+
 /// Spec-shaped structured image blob WITHOUT the "45812" local path — the
 /// exact case the cache-index fallback must rescue. `file_name` is the 45402
 /// value.

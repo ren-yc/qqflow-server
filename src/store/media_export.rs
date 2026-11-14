@@ -292,10 +292,24 @@ pub fn export_targeted(
     }
     // 源还在时永远走「重导」而不是登记：登记指向的文件可能已被清理，而源的
     // 字节是此刻的权威——重导会算出同一个 digest 名，内容必然一致（同名即同内容）。
+    //
+    // 候选逐个判定：**空串跳过**（`root.join("")` 解析出的是 media root 目录
+    // 本身，它会以 `is_some` 提前终结循环，让后面的 fallback 失去机会），候选
+    // **不是普通文件也跳过**（目录/悬空都救不了这条媒体）。其余解析错误照常
+    // 上报——静默吞掉会掩盖越界等真实边界问题。
     let mut source = None;
     for path in [media.local_path.as_deref(), fallback].into_iter().flatten() {
-        source = crate::store::media::resolve_local_path_checked(path, media_root)?;
-        if source.is_some() { break; }
+        if path.is_empty() {
+            continue;
+        }
+        let resolved = crate::store::media::resolve_local_path_checked(path, media_root)?;
+        match resolved {
+            Some(p) if p.is_file() => {
+                source = Some(p);
+                break;
+            }
+            _ => continue,
+        }
     }
     let Some(source) = source else {
         // 源缓存没了：唯一还能兑现「按消息身份取字节」的是上次发布的 digest 副本。

@@ -50,6 +50,40 @@ impl Fixture {
             "sender":"u_c", "timestamp":1622505500i64})
     }
 
+    /// 空 45812 变体：结构化媒体带空本地路径 + 缓存索引里有有效 fallback。
+    /// 定向导出必须跳过空候选落到 fallback（回归
+    /// `targeted_export_empty_local_path_falls_back_to_cache`）。
+    async fn empty_local() -> Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!("qqflow_target_media_empty_{}_{}",
+            std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        let nt_db = root.join("nt_db");
+        let (writer, _) = common::open_fake_source(&nt_db, 180);
+        // 与 Fixture::target() 对齐的行号 7 / sender u_c / 时间 1622505500，
+        // 但 45812 是**空串**：候选循环必须跳过它而不是把 media root 目录
+        // 当成「源已找到」。
+        let md5 = "aabbccddeeff00112233445566778899";
+        let blob = common::image_blob_empty_local(md5, "fake_image_01.jpg");
+        writer.execute("INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params!["10001", (1622505600i64 << 32) | 7, "u_c", "王五", blob, 0, 1622505500i64, ""]).unwrap();
+        let path = common::materialize_source(&nt_db);
+        // fallback：缓存索引按文件名登记的候选（write_fake_cache_file 落的固定字节）。
+        common::write_fake_cache_file(&nt_db, "Pic/2026-08/fake_image_01.jpg");
+        let (shutdown, rx) = tokio::sync::watch::channel(false);
+        let state = Arc::new(AppState {
+            store: Arc::new(RwLock::new(Store::default())),
+            bus: sync::history::EventBus::new(32), accounts: Arc::new(RwLock::new(Vec::new())),
+            ready: Arc::new(AtomicBool::new(false)), token: Arc::new("target-token".into()),
+            sync: Arc::new(sync::SyncEngine::new()),
+            init: server::AccountRegistry::new(Vec::new(), sync::watch::WatchConfig::default(), rx),
+            export_root: Arc::new(root.join("export")), base_url: Arc::new("http://localhost".into()), shutdown,
+        });
+        let server::BindOutcome::Bound(token) = server::begin_indexing(&state, common::FAKE_QQ) else { panic!() };
+        server::init_account(&state, qqflow_server::db::scan::DbInfo { qq: common::FAKE_QQ.into(), path }, common::FAKE_KEY.into(), token).await;
+        assert!(state.ready.load(std::sync::atomic::Ordering::SeqCst));
+        Self { root, writer: Some(writer), state }
+    }
+
     async fn export(&self, target: Value) -> (StatusCode, Value) {
         common::post_json(server::build_router(self.state.clone()), "/api/v1/media/export",
             &[("authorization", "Bearer target-token")], target).await
@@ -161,6 +195,22 @@ async fn targeted_export_cancels_when_the_source_identity_changes_midway() {
     assert_eq!(error.reason, Some("cursor_reset_required"), "409 带机器可读 reason: {:?}", error.reason);
     assert_eq!(std::fs::read_dir(fixture.root.join("export/10001/images")).unwrap().count(), 0, "不落产物");
     assert_eq!(std::fs::read_dir(fixture.root.join("export/.pending")).unwrap().count(), 0, "无残留 pending");
+}
+
+/// 定向导出的候选循环必须**跳过空串与目录候选**，让后面的 fallback 有机会。
+///
+/// 真库见过结构化媒体带**空串 45812** 的形态（解析器原样保留）：空串经
+/// `root.join("")` 解析出 media root 目录本身，此前循环以 `source.is_some()`
+/// 提前终结——后续打开目录报非 NotFound 错，端点 500，而缓存里的 fallback
+/// 明明可用。回归：`targeted_export_empty_local_path_falls_back_to_cache`。
+#[tokio::test]
+async fn targeted_export_empty_local_path_falls_back_to_cache() {
+    let fixture = Fixture::empty_local().await;
+    let (status, out) = fixture.export(Fixture::target()).await;
+    assert_eq!(status, StatusCode::OK, "空 45812 必须落到缓存 fallback 而不是 500: {out}");
+    let id = out["mediaId"].as_str().unwrap();
+    // fallback 缓存文件是 write_fake_cache_file 写的固定内容。
+    assert_eq!(fixture.bytes(id).await, b"fallback cache bytes");
 }
 
 #[tokio::test]
