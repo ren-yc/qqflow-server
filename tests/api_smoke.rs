@@ -2662,11 +2662,11 @@ async fn source_replacement_flips_the_account_to_error() {
 /// 基线记成 B，后续采样永不推进世代，换库被整个吞掉。基线绑定构建时文件、
 /// 安装前在同一临界区内复查；身份变化丢弃后账号转 Error 待重注册。
 ///
-/// 编排：注册受理后立即覆写。小语料构建毫秒级完成，覆写赶不上——所以夹具
-/// 用**中等语料**（`open_fake_source` 的 extra 参数拉长构建到秒级）给覆写留出
-/// 「构建进行中」的窗口；等 ready 的 30 秒预算足够覆盖剩余构建。替换文件保持
-/// **可被旧密钥解开**（独立造一份同密钥 fake 库）——否则 install 复查前的
-/// 失败走的是解密报错路径，而不是本回归要钉的「构建期身份变化」丢弃。
+/// 编排：注册受理后立即覆写。构建必须**慢于**「注册响应返回 + 覆写落盘」，
+/// 否则 install 复查时文件还没被换、索引正常装入——夹具用**大语料**（2 万行）
+/// 把构建拉长到秒级（CI 上更慢，等 ready 的 120 秒预算覆盖剩余构建）。替换
+/// 文件保持**可被旧密钥解开**（独立造一份同密钥 fake 库）——否则 install
+/// 复查前的失败走的是解密报错路径，而不是本回归要钉的「构建期身份变化」丢弃。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn build_time_source_replacement_discards_the_index() {
     let seq = REAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2677,7 +2677,7 @@ async fn build_time_source_replacement_discards_the_index() {
     ));
     let _ = std::fs::remove_dir_all(&root);
     let nt_db = root.join("nt_db");
-    let (writer, main) = common::open_fake_source(&nt_db, 1_500);
+    let (writer, main) = common::open_fake_source(&nt_db, 20_000);
     common::write_fake_group_info(&nt_db);
 
     let state = state_with(Store::default(), false);
@@ -2712,13 +2712,14 @@ async fn build_time_source_replacement_discards_the_index() {
     std::fs::write(&main, all).expect("覆写 nt_msg.db 为新身份库");
     drop(writer); // 换库写场景下原 writer 已无意义；覆写落盘后再释放
 
-    // 等待初始化收尾：换库发现 → 索引丢弃 → 账号转 Error。
+    // 等待初始化收尾：换库发现 → 索引丢弃 → 账号转 Error。大语料构建秒级
+    // （CI 更慢），预算给足。
     let detail = common::wait_account_state(
         &build_router(state.clone()),
         "test-token-123456",
         common::FAKE_QQ,
         "error",
-        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(120),
     )
     .await;
     let entry = common::account_entry(&detail, common::FAKE_QQ);
