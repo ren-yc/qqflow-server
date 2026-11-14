@@ -121,9 +121,19 @@ async fn sync_once(account: Arc<AccountSync>) {
     // poll_once may do blocking IO (SQLCipher open on reconnect) — run it
     // on the blocking pool; the reader mutex + store write lock serialize
     // overlapping passes.
-    match tokio::task::spawn_blocking(move || account.poll_once()).await {
+    let poll_account = account.clone();
+    match tokio::task::spawn_blocking(move || poll_account.poll_once()).await {
         Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!("watch sync error: {e:#}"),
+        Ok(Err(e)) => {
+            // 换库不是「下一轮重试」能恢复的失败：旧水位线属于旧文件的行号空间，
+            // 盲目重试既补不回漏掉的行、也让账号在坏状态下继续假装正常。处置
+            // 回调（服务层注入）把账号转 Error 待重注册；未注入时按普通失败记
+            // 日志（处置责任在调用方）。
+            if crate::sync::is_source_replaced(&e) && account.notify_source_replaced() {
+                return;
+            }
+            tracing::warn!("watch sync error: {e:#}")
+        }
         Err(e) => tracing::error!("sync task panicked: {e}"),
     }
 }

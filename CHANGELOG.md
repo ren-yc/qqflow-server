@@ -20,6 +20,8 @@
 
 ### 修复
 
+- 轮询发现数据源身份变化（换库）时账号转 Error 待重注册，不再带旧水位线继续增量：替换库中 rowid 不超过旧水位线的行会被永久滤掉。迁移：重注册即全量重建，无需额外操作。回归：`source_replacement_flips_the_account_to_error`。
+- 索引基线绑定构建时的数据源，安装前复查指纹：构建期间换库丢弃本次索引并转 Error，不再把替换后的文件当旧索引的基线装进账号。回归：`build_time_source_replacement_discards_the_index`。
 - 定向媒体在临时文件写完后复查注册，再发布产物；取消清理临时文件，已有有效副本可在源缓存清理后复用。回归：`targeted_export_cancels_staged_bytes_after_account_switch`。
 - 账号注销与初始化最终提交串行化；旧任务不能重挂 watcher、置为就绪或移除后来的注册，拒绝的 watcher 显式取消。回归：`lifecycle_commit_excludes_deregister_through_watcher_and_ready`、`stale_cleanup_and_watcher_cannot_remove_new_registration`。
 - 账号路径只在取得绑定后登记，避免被并发失败请求覆盖。排队中的旧初始化不能替换新索引。回归：`source_path_only_changes_for_winning_binding`、`queued_initialization_cannot_replace_a_new_account_index`。

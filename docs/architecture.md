@@ -362,6 +362,8 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 - 失效分两档：语法坏或版本未知是 400；v1 旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
   - 判据只看身份不看内容：QQ 的追加写入与 WAL checkpoint 都不改变身份线索，放进判据等于让游标每次新消息都失效。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
 - 数据源世代由同步侧每轮采样推进（`db/source_identity.rs`），基线在建索引完成后立一次——没有基线时首个新消息触发的采样会把「建索引时的文件」当首次 sighting，换库窗口被吞掉。回归 `replacing_the_database_changes_the_fingerprint`。
+- 换库（轮询采样发现身份变化）后**增量续读必须停止**：旧水位线属于旧文件的行号空间，替换库中 rowid 不超过它的行会被永久滤掉，且现有连接可能仍指向旧文件。账号转 Error 待重注册——重注册即全量重建，是唯一能兑现「新库、新水位线」的路径。回归 `source_replacement_flips_the_account_to_error`。
+- 构建期换库同样不能装：基线绑定**构建时**的文件，安装前在同一临界区内复查指纹，不一致（或采样失败=无法证明未变）丢弃本次索引、账号转 Error。基线若在构建完成后才采，构建期间换库时 store 里是 A 的数据、基线却记成 B，换库被整个吞掉。回归 `build_time_source_replacement_discards_the_index`。
 - 账号切换时清理本次临时文件，不发布旧任务结果。已有可取副本优先复用；新产物按实际字节摘要命名。
 - 定向导出发布成功时把 digest 句柄登记进 store 的媒体登记表（进程内，不落盘）。
   - 源缓存被 QQ 清掉后 digest 名无法从元数据重新推导（它是对字节的摘要），没有登记就找不到已发布的副本。

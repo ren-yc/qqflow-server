@@ -34,6 +34,24 @@ use crate::sync::history::EventBus;
 
 pub use events::Event;
 
+/// 同步轮的**判别性**失败：换库后不能继续增量（见 `poll_once`），调用方必须
+/// 把账号转 Error 待重注册，而不是按普通读失败无限重试。
+#[derive(Debug)]
+pub struct SourceReplaced;
+
+impl std::fmt::Display for SourceReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "数据源已被替换（库文件身份变化），增量续读无法保证不漏：需要重新注册以全量重建")
+    }
+}
+
+impl std::error::Error for SourceReplaced {}
+
+/// 下游（watch / sync_all）判别「这轮失败是换库」用。
+pub fn is_source_replaced(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SourceReplaced>().is_some()
+}
+
 /// One account's sync machinery: the live reader (mutex-guarded so the
 /// manual sync endpoint and the poll loop can share it) plus everything
 /// needed to run a sync pass.
@@ -65,6 +83,11 @@ pub struct AccountSync {
     /// 新注册的 store 覆盖掉。None = 未注入（嵌入者直接构造的句柄），复查
     /// 退化为只看 stopped。
     registration_guard: Mutex<Option<Box<dyn Fn() -> bool + Send>>>,
+    /// 数据源被替换时的**账号侧处置**回调（由服务层注入，持注册令牌与 AppState
+    /// 的 Weak）：换库后增量续读无法保证不漏（旧水位线属于旧文件的行号空间），
+    /// 账号必须转 Error 待重注册。None = 未注入（嵌入者直接构造的句柄），换库
+    /// 只推进游标世代并按错误终止本轮——处置责任在调用方。
+    on_source_replaced: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Source main db path — derives the `-wal` path the fallback stats.
     ///
     /// 只读暴露给定向导出：发布前的身份复查要在**导出自己**的阻塞任务里再采一次
@@ -110,6 +133,7 @@ impl AccountSync {
             retry: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             registration_guard: Mutex::new(None),
+            on_source_replaced: Mutex::new(None),
             db_path,
             db_dir,
             key,
@@ -123,6 +147,24 @@ impl AccountSync {
     /// 闭包返回 false = 该句柄所属的注册已失效。
     pub fn set_registration_guard(&self, guard: Box<dyn Fn() -> bool + Send>) {
         *self.registration_guard.lock() = Some(guard);
+    }
+
+    /// 注入「数据源被替换」的处置回调（生产路径由 activate_account 注入）。
+    /// 回调在 watch 任务 / 手动同步的上下文里执行，必须自己拿注册令牌校验，
+    /// 不得借助本句柄的锁。
+    pub fn set_on_source_replaced(&self, on_replace: Box<dyn Fn() + Send>) {
+        *self.on_source_replaced.lock() = Some(on_replace);
+    }
+
+    /// 触发换库处置（回调存在且注入时）。返回是否已触发。
+    pub(crate) fn notify_source_replaced(&self) -> bool {
+        match self.on_source_replaced.lock().as_ref() {
+            Some(f) => {
+                f();
+                true
+            }
+            None => false,
+        }
     }
 
     /// 这个句柄还允许写共享 Store 吗？stopped（注销停机）与注册令牌复查
@@ -288,10 +330,18 @@ impl AccountSync {
     /// filter applied). Safe to call concurrently — the reader mutex and
     /// the store write lock serialize overlapping passes (the second one
     /// finds nothing new).
+    ///
+    /// 数据源身份变化（换库）时返回
+    /// [`SyncError::SourceReplaced`]：此刻**不能**继续增量——旧水位线属于旧
+    /// 文件的行号空间，替换库中 rowid 不超过它的行会被「`rowid > 水位线`」
+    /// 永久滤掉，且现有连接可能仍指向旧文件。调用方据此时账号转 Error、
+    /// 待重注册恢复（重注册 = 全量重建，是唯一能兑现「新库、新水位线」的路径）。
     pub fn poll_once(&self) -> Result<Vec<MessageOut>> {
         // 每轮同步前采一次数据源指纹：换了库就在这里推进世代。放在读阶段之前
         // ——本轮读出的行如果来自新文件，游标也必须从这一代开始算。
-        self.sample_source();
+        if self.sample_source() {
+            return Err(anyhow::Error::new(SourceReplaced));
+        }
         let mut reader = self.reader.lock();
         let result = self.poll_locked(&mut reader);
         if result.is_err() {
@@ -527,7 +577,14 @@ impl SyncEngine {
                     }
                     account.refresh_names();
                 }
-                Err(e) => tracing::warn!("manual sync error: {e:#}"),
+                Err(e) => {
+                    // 换库在手动同步路径同样不能「等下一轮」：处置回调已把账号转
+                    // Error（watch 与手动同步共用同一注入），这里只记日志说明本轮
+                    // 没有产出。未注入时按普通失败记日志（处置责任在调用方）。
+                    if !(is_source_replaced(&e) && account.notify_source_replaced()) {
+                        tracing::warn!("manual sync error: {e:#}");
+                    }
+                }
             }
         }
         (new_count, revoke_count)

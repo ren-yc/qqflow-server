@@ -723,6 +723,35 @@ fn activate_account(
         move || weak.upgrade().is_some_and(|s| !token.is_cancelled(&s.init))
     };
     account.set_registration_guard(Box::new(current.clone()));
+    // 换库处置：轮询发现数据源身份变化时，账号转 Error 待重注册（重注册 =
+    // 全量重建，是唯一能兑现「新库、新水位线」的路径）。闭包持 Weak（理由同
+    // registration_guard：持 Arc 会形成引用环），捕获的只有 qq 的 String 与
+    // 令牌副本——两者都不是 Arc，不参与引用环。先验注册令牌再写状态：旧注册
+    // 的换库发现不能改写新注册的状态。
+    let on_replace_state = Arc::downgrade(state);
+    let on_replace_qq = account.qq.clone();
+    account.set_on_source_replaced(Box::new(move || {
+        let Some(state) = on_replace_state.upgrade() else { return };
+        if token.is_cancelled(&state.init) {
+            tracing::debug!("[sync] 数据源替换发现来自已失效的注册，处置丢弃");
+            return;
+        }
+        // Error 态下旧句柄仍可能被手动同步触发，poll_once 每轮采样都会再次发现
+        // 换库并重复此路径——状态写回是幂等的，不会放大。
+        if set_account_state_if_current(
+            &state,
+            &on_replace_qq,
+            token,
+            AccountStatus::Error,
+            0,
+            Some(
+                "数据源已被替换（库文件身份变化）：增量续读无法保证不漏，请重新注册以全量重建"
+                    .to_string(),
+            ),
+        ) {
+            tracing::warn!("[sync] 数据源已被替换，账号转 Error 待重新注册");
+        }
+    }));
     let _lifecycle = state.init.lifecycle.lock();
     if !state.sync.register_if_current(account.clone(), &current) {
         account.stop();
@@ -790,6 +819,11 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
         let mut reader = LiveReader::new(info_for_build.path.clone(), key_for_build.clone());
         reader.open()?; // verify the key now — bad key → error state (unchanged UX)
         let conn = reader.acquire()?;
+        // **身份基线绑定到构建时的数据源**：open 之后立刻采一次指纹。基线若在
+        // 构建完成之后才采（旧形态），构建期间换库时 store 里是 A 的数据、基线
+        // 却记成 B——后续采样永不推进世代，换库被整个吞掉（客户端拿不到任何
+        // 失效信号）。
+        let build_identity = crate::db::source_identity::fingerprint(&info_for_build.path)?;
         // 媒体根与群名映射都在 `build_with` 里处理（嵌入者走同一段）。
         let nt_db_dir = info_for_build
             .path
@@ -802,7 +836,45 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
         // drop the freshly built index instead of installing it. The check
         // and the swap are one critical section inside install_index, so no
         // deregistration can slip between them.
-        if !install_index(&state_for_build.init.lifecycle, &store, &bus, st, cancelled_in_build) {
+        //
+        // 安装前在同一临界区内复查指纹：构建期间文件被替换（删库重建 / 备份
+        // 还原成另一份）时，这份索引描述的是旧文件——不能装，更不能把替换后
+        // 的文件当这份旧索引的基线。指纹失败按「无法证明未变」处理，同样丢弃。
+        let identity_unchanged = || {
+            match crate::db::source_identity::fingerprint(&info_for_build.path) {
+                Ok(fp) => {
+                    if fp.digest == build_identity.digest {
+                        true
+                    } else {
+                        tracing::warn!("[init] 安装前指纹与构建时不一致（身份变化）");
+                        false
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[init] 安装前指纹采样失败: {e}；按无法证明未变处理");
+                    false
+                }
+            }
+        };
+        let install_cancelled = cancelled_in_build.clone();
+        let install_identity = identity_unchanged;
+        // install_index 的判据参数沿用「cancelled」这一历史形态的名字，实际语义是
+        // 「**本次注册仍然有效、且构建时的数据源还是当前文件**」——true 才安装。
+        if !install_index(&state_for_build.init.lifecycle, &store, &bus, st, move || {
+            let still_valid = install_cancelled();
+            let identity_ok = install_identity();
+            if !still_valid {
+                tracing::warn!("[init] 构建期间注册已失效，丢弃本次索引");
+                return false;
+            }
+            if !identity_ok {
+                tracing::warn!(
+                    "[init] 构建期间数据源被替换（库文件身份变化），丢弃本次索引；请重新注册以对当前文件重建"
+                );
+                return false;
+            }
+            true
+        }) {
             return Ok(None);
         }
         Ok(Some((Arc::new(Mutex::new(reader)), count)))
@@ -843,7 +915,28 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
             tracing::info!("[init] QQ {qq} 索引完成: {count} 条消息");
         }
         Ok(Ok(None)) => {
-            tracing::info!("[init] QQ {qq} 初始化中被注销，已放弃本次构建");
+            // 两种来源都在 install 的判据里留下了日志（注册失效 / 构建期换库）；
+            // 这里只确认状态面：换库丢弃时账号仍是 indexing，转 Error 待重注册。
+            let still_indexing = state
+                .accounts
+                .read()
+                .iter()
+                .find(|a| a.qq == qq)
+                .is_some_and(|a| a.state == AccountStatus::Indexing);
+            if still_indexing
+                && set_account_state_if_current(
+                    state,
+                    &qq,
+                    token,
+                    AccountStatus::Error,
+                    0,
+                    Some("构建期间数据源被替换：索引已丢弃，请重新注册以全量重建".to_string()),
+                )
+            {
+                tracing::warn!("[init] QQ {qq} 构建期换库，账号转 Error 待重新注册");
+            } else {
+                tracing::info!("[init] QQ {qq} 初始化中被注销，已放弃本次构建");
+            }
             return;
         }
         Ok(Err(e)) => {

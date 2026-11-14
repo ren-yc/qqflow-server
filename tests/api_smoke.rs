@@ -2589,6 +2589,162 @@ async fn deregister_post_alias_is_gone_and_delete_still_works() {
     assert!(qqflow_server::server::bound_account(&state.accounts.read()).is_none());
 }
 
+/// 轮询发现数据源身份变化（换库）时，账号必须转 Error 待重注册——而不是
+/// 带着旧水位线继续增量：替换库中 rowid 不超过旧水位线的行会被
+/// 「`rowid > 水位线`」永久滤掉，且现有连接可能仍指向旧文件。处置回调由
+/// activate_account 注入，watch 与手动同步两条路径共用。
+///
+/// 手动同步路径直接经 `POST /api/v1/sync` 驱动（watch 任务的触发链已在
+/// `sync_once` 共用同一判别，此处不需要单独的时序编排）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_replacement_flips_the_account_to_error() {
+    let (state, root) = real_test_state().await;
+    let _app = build_router(state.clone());
+    let nt_db = root.join("nt_db");
+
+    // 换库：写一份 salt 不同的合法 QQ 形状 nt_msg.db。**不动** raw.db 与存活
+    // writer——真实换库（删库重建/备份还原）也不会动运行中 QQ 进程外的东西。
+    // 此时索引已建成（ready），换库发现走轮询采样路径。
+    let db = nt_db.join("nt_msg.db");
+    let mut bytes = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
+    bytes.extend_from_slice(&[0xEEu8; 16]);
+    bytes.extend_from_slice(&[0u8; 4096]);
+    std::fs::write(&db, bytes).expect("写替换库");
+
+    // 手动同步触发一轮 poll：采样发现身份变化 → 账号转 Error。
+    let app = build_router(state.clone());
+    let (s, v) = common::post_json(
+        app,
+        "/api/v1/sync?access_token=test-token-123456",
+        &[],
+        json!({}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // 轮询到 error 态（不能经 `wait_account_state`：它把 error 一律当意外失败）。
+    let mut reason = String::new();
+    let mut reached = false;
+    for _ in 0..100 {
+        let (_, dv) = common::get_json(
+            build_router(state.clone()),
+            "/api/v1/accounts",
+            &[("authorization", "Bearer test-token-123456")],
+        )
+        .await;
+        let entry = common::account_entry(&dv, common::FAKE_QQ);
+        if entry["state"] == "error" {
+            reason = entry["error"].as_str().unwrap_or_default().to_string();
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(reached, "账号必须在换库后转 Error");
+    assert!(
+        reason.contains("数据源已被替换"),
+        "错误原因必须说明换库与恢复方式: {reason}"
+    );
+
+    // 收尾：注销清场（error 态账号允许注销）。
+    let app = build_router(state.clone());
+    let (s, _) = common::delete_json(
+        app,
+        &format!("/api/v1/accounts/{}?access_token=test-token-123456", common::FAKE_QQ),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+/// 构建期换库（索引从旧文件建成、安装前文件被替换）必须**丢弃本次索引**，
+/// 不能把替换后的文件当旧索引的基线装进账号——否则 store 里是 A 的数据、
+/// 基线记成 B，后续采样永不推进世代，换库被整个吞掉。基线绑定构建时文件、
+/// 安装前在同一临界区内复查；身份变化丢弃后账号转 Error 待重注册。
+///
+/// 编排：注册受理后立即覆写。小语料构建毫秒级完成，覆写赶不上——所以夹具
+/// 用**中等语料**（`open_fake_source` 的 extra 参数拉长构建到秒级）给覆写留出
+/// 「构建进行中」的窗口；等 ready 的 30 秒预算足够覆盖剩余构建。替换文件保持
+/// **可被旧密钥解开**（独立造一份同密钥 fake 库）——否则 install 复查前的
+/// 失败走的是解密报错路径，而不是本回归要钉的「构建期身份变化」丢弃。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn build_time_source_replacement_discards_the_index() {
+    let seq = REAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "qqflow_build_swap_{}_{}",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let nt_db = root.join("nt_db");
+    let (writer, main) = common::open_fake_source(&nt_db, 1_500);
+    common::write_fake_group_info(&nt_db);
+
+    let state = state_with(Store::default(), false);
+    let app = build_router(state.clone());
+    let (s, v) = common::post_json(
+        app,
+        "/api/v1/accounts?access_token=test-token-123456",
+        &[],
+        json!({
+            "qq": common::FAKE_QQ,
+            "key": common::FAKE_KEY,
+            "db_path": main.to_string_lossy(),
+        }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "注册失败: {v}");
+
+    // 注册受理即覆写：构建闭包 open 时采的基线是旧文件，此刻文件被替换成另一份
+    // 同密钥可解的库（不同内容 → salt 必然不同）。写场景 = 删库重建。**不动
+    // raw.db 与存活 writer**（Windows 上会撞夹具的打开句柄）——在独立文件上
+    // 造库，再按 materialize 的形态（QQ 明文头 + 库字节）覆写 nt_msg.db 本体。
+    let swap_dir = root.join("swap_src");
+    {
+        let (conn, _raw) = qqflow_server::testing::open_fake_writer(&swap_dir);
+        qqflow_server::testing::seed_dataset(&conn, 2);
+        drop(conn);
+    }
+    let swap_raw = std::fs::read(swap_dir.join("raw.db")).unwrap();
+    let mut all = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
+    all[0..8].copy_from_slice(b"QQNTDB!1");
+    all.extend_from_slice(&swap_raw);
+    std::fs::write(&main, all).expect("覆写 nt_msg.db 为新身份库");
+    drop(writer); // 换库写场景下原 writer 已无意义；覆写落盘后再释放
+
+    // 等待初始化收尾：换库发现 → 索引丢弃 → 账号转 Error。
+    let detail = common::wait_account_state(
+        &build_router(state.clone()),
+        "test-token-123456",
+        common::FAKE_QQ,
+        "error",
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    let entry = common::account_entry(&detail, common::FAKE_QQ);
+    let reason = entry["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("数据源被替换"),
+        "构建期换库必须转 Error 并说明原因: {reason}"
+    );
+    // 索引没有装进去：store 是空的。
+    assert!(
+        state.store.read().convs.is_empty(),
+        "被丢弃的索引不得进入 store"
+    );
+
+    // 收尾。
+    let app = build_router(state.clone());
+    let (s, _) = common::delete_json(
+        app,
+        &format!("/api/v1/accounts/{}?access_token=test-token-123456", common::FAKE_QQ),
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Golden 快照：每个 JSON 响应的**逐字节**护栏（含状态码）。
 ///
 /// 为什么必须在 DTO 化**之前**有它：DTO 是重写每一个响应构造，而「断言几个字段」的测试
