@@ -2662,11 +2662,12 @@ async fn source_replacement_flips_the_account_to_error() {
 /// 基线记成 B，后续采样永不推进世代，换库被整个吞掉。基线绑定构建时文件、
 /// 安装前在同一临界区内复查；身份变化丢弃后账号转 Error 待重注册。
 ///
-/// 编排：注册受理后立即覆写。构建必须**慢于**「注册响应返回 + 覆写落盘」，
-/// 否则 install 复查时文件还没被换、索引正常装入——夹具用**大语料**（2 万行）
-/// 把构建拉长到秒级（CI 上更慢，等 ready 的 120 秒预算覆盖剩余构建）。替换
-/// 文件保持**可被旧密钥解开**（独立造一份同密钥 fake 库）——否则 install
-/// 复查前的失败走的是解密报错路径，而不是本回归要钉的「构建期身份变化」丢弃。
+/// 编排用**构建闸门**（`init_account_with_build_gate`，testing feature）：闸门
+/// 在「基线已采、解密建索引未开始」的窗口阻塞后台构建线程，测试在闸门里覆写
+/// 文件——覆写必然落在基线采样之后、install 复查之前，不依赖构建时长与时序
+/// 运气（大语料编排在本机绿、在 CI 的 Windows 机器上覆写晚于 install，回归
+/// 超时）。替换文件保持**可被旧密钥解开**（独立造一份同密钥 fake 库）——否则
+/// 走的是解密报错路径，而不是本回归要钉的「构建期身份变化」丢弃。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn build_time_source_replacement_discards_the_index() {
     let seq = REAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2677,28 +2678,18 @@ async fn build_time_source_replacement_discards_the_index() {
     ));
     let _ = std::fs::remove_dir_all(&root);
     let nt_db = root.join("nt_db");
-    let (writer, main) = common::open_fake_source(&nt_db, 20_000);
+    let (writer, main) = common::open_fake_source(&nt_db, 0);
     common::write_fake_group_info(&nt_db);
 
     let state = state_with(Store::default(), false);
-    let app = build_router(state.clone());
-    let (s, v) = common::post_json(
-        app,
-        "/api/v1/accounts?access_token=test-token-123456",
-        &[],
-        json!({
-            "qq": common::FAKE_QQ,
-            "key": common::FAKE_KEY,
-            "db_path": main.to_string_lossy(),
-        }),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "注册失败: {v}");
+    let qqflow_server::server::BindOutcome::Bound(token) = qqflow_server::server::begin_indexing(&state, common::FAKE_QQ)
+    else {
+        panic!()
+    };
 
-    // 注册受理即覆写：构建闭包 open 时采的基线是旧文件，此刻文件被替换成另一份
-    // 同密钥可解的库（不同内容 → salt 必然不同）。写场景 = 删库重建。**不动
-    // raw.db 与存活 writer**（Windows 上会撞夹具的打开句柄）——在独立文件上
-    // 造库，再按 materialize 的形态（QQ 明文头 + 库字节）覆写 nt_msg.db 本体。
+    // 换库目标库**提前**在测试线程上造好（SQLCipher 建库不该发生在构建线程的
+    // 闸门里——跨进程并行时它与另一 exe 的 SQLCipher 并发初始化有干扰，表现为
+    // 对方的共享夹具读出「解密失败」）。闸门闭包只做纯文件拷贝覆写。
     let swap_dir = root.join("swap_src");
     {
         let (conn, _raw) = qqflow_server::testing::open_fake_writer(&swap_dir);
@@ -2706,20 +2697,34 @@ async fn build_time_source_replacement_discards_the_index() {
         drop(conn);
     }
     let swap_raw = std::fs::read(swap_dir.join("raw.db")).unwrap();
-    let mut all = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
-    all[0..8].copy_from_slice(b"QQNTDB!1");
-    all.extend_from_slice(&swap_raw);
-    std::fs::write(&main, all).expect("覆写 nt_msg.db 为新身份库");
-    drop(writer); // 换库写场景下原 writer 已无意义；覆写落盘后再释放
 
-    // 等待初始化收尾：换库发现 → 索引丢弃 → 账号转 Error。大语料构建秒级
-    // （CI 更慢），预算给足。
+    // 闸门闭包在构建线程上运行（基线已采、建索引未开始）：纯文件拷贝覆写，
+    // 再放行构建——覆写必然先于 install 复查，不依赖任何时序。
+    let gate_main = main.clone();
+    let gate_handle = Box::new(move || {
+        let mut all = vec![0u8; qqflow_server::db::scan::CUSTOM_HEADER_LEN as usize];
+        all[0..8].copy_from_slice(b"QQNTDB!1");
+        all.extend_from_slice(&swap_raw);
+        std::fs::write(&gate_main, all).expect("覆写 nt_msg.db 为新身份库");
+    });
+    // 直接调 init_account（begin_indexing 已受理、状态已翻 indexing）：闸门
+    // 保证覆写精确落在「基线已采、install 未跑」的窗口里。
+    qqflow_server::server::init_account_with_build_gate(
+        &state,
+        qqflow_server::db::scan::DbInfo { qq: common::FAKE_QQ.into(), path: main },
+        common::FAKE_KEY.into(),
+        token,
+        gate_handle,
+    )
+    .await;
+    drop(writer); // 换库写场景下原 writer 已无意义
+
     let detail = common::wait_account_state(
         &build_router(state.clone()),
         "test-token-123456",
         common::FAKE_QQ,
         "error",
-        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(30),
     )
     .await;
     let entry = common::account_entry(&detail, common::FAKE_QQ);

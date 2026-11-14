@@ -455,9 +455,23 @@ pub fn materialize_source(nt_db_dir: &Path) -> std::path::PathBuf {
             // place), so the existing link stays valid — and a reader may
             // have it open/mapped, so removing it would fail on Windows
             // (ERROR_USER_MAPPED_FILE).
-            continue;
+            //
+            // EXCEPT an empty WAL link: a link whose inode was checkpointed
+            // to zero bytes by a previous test's writer-drop is a dead link —
+            // this round's writer wrote its frames to a NEW raw.db-wal inode,
+            // and a reader following the dead link sees an empty WAL over a
+            // one-page main file, failing sqlite_master verification
+            // (misdiagnosed as a key mismatch). Re-point dead links at the
+            // live inode; live links with frames keep the skip.
+            if ext == "db-wal" {
+                let dead = std::fs::metadata(&side).map(|m| m.len() == 0).unwrap_or(true);
+                if dead {
+                    let _ = std::fs::remove_file(&side);
+                }
+            }
         }
-        if raw_side.exists() {
+        let still_there = side.exists();
+        if !still_there && raw_side.exists() {
             std::fs::hard_link(&raw_side, &side).unwrap();
         }
     }

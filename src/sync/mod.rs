@@ -112,6 +112,11 @@ pub struct AccountSync {
     generation: Arc<AtomicU32>,
     /// 上一次采样到的指纹摘要（基线）。`None` = 尚未采样成功过。
     source_digest: Mutex<Option<[u8; 32]>>,
+    /// 换库已发现的持久失效标志。置位后本句柄的每次 `poll_once` 都直接返回
+    /// [`SourceReplaced`]，不再进入读阶段——只拒绝一轮的话，下一轮对替换库的
+    /// 采样返回「无变化」，旧的连接与水位线就又被拿去增量了。句柄的余生都是
+    /// 这个状态；只有重注册（全量重建出的新句柄）才重新开始。
+    source_replaced: AtomicBool,
 }
 
 impl AccountSync {
@@ -140,6 +145,7 @@ impl AccountSync {
             last_wal: Mutex::new(None),
             generation: Arc::new(AtomicU32::new(0)),
             source_digest: Mutex::new(None),
+            source_replaced: AtomicBool::new(false),
         }
     }
 
@@ -337,9 +343,15 @@ impl AccountSync {
     /// 永久滤掉，且现有连接可能仍指向旧文件。调用方据此时账号转 Error、
     /// 待重注册恢复（重注册 = 全量重建，是唯一能兑现「新库、新水位线」的路径）。
     pub fn poll_once(&self) -> Result<Vec<MessageOut>> {
+        // 换库发现是**句柄的终态**：置位后每一轮都在读阶段之前拒绝（见
+        // `source_replaced` 字段的说明）。
+        if self.source_replaced.load(Ordering::SeqCst) {
+            return Err(anyhow::Error::new(SourceReplaced));
+        }
         // 每轮同步前采一次数据源指纹：换了库就在这里推进世代。放在读阶段之前
         // ——本轮读出的行如果来自新文件，游标也必须从这一代开始算。
         if self.sample_source() {
+            self.source_replaced.store(true, Ordering::SeqCst);
             return Err(anyhow::Error::new(SourceReplaced));
         }
         let mut reader = self.reader.lock();

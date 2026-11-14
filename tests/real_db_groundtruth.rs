@@ -34,26 +34,32 @@ use tower::ServiceExt;
 mod common;
 use common::{FAKE_KEY, FAKE_QQ};
 
-/// Fake DB location (also used by the behavioral-repro procedure).
-pub fn fake_db_path() -> std::path::PathBuf {
+/// Fake DB location, **per-test isolated** (`qqflow_fake/<tag>/...`).
+///
+/// 每个测试一个独立目录：共享目录（旧形态）靠 FAKE_DB_LOCK 串行 + 跨测试复用
+/// 同一组 WAL hard-link——link 指向的 inode 在上一测试的 writer drop（checkpoint）
+/// 时被清成 0 字节，而 `open_fake_writer` 对占用文件的 remove 可能失败（上一
+/// async 测试的 runtime 还持有映射），link 就停在空 inode 上：reader 读到
+/// 「1 页空 schema + 空 WAL」，sqlite_master 校验失败被误诊成「解密失败」。
+/// 进程内/跨进程的运行顺序变化都会让这个窗口显形（同一份改动下时序不同，
+/// 结果从全绿变稳定红）。每测试独立目录后 hard-link 只在**本测试的**
+/// writer/reader 之间共享，生命周期一起开始结束，窗口不存在。
+pub fn fake_db_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join("qqflow_fake")
+        .join(tag)
         .join(FAKE_QQ)
         .join("nt_qq")
         .join("nt_db")
         .join("nt_msg.db")
 }
 
-/// Rebuild the shared fake DB fixture (serialized against parallel tests).
-fn build_fake_db() -> std::path::PathBuf {
-    let fake_root = std::env::temp_dir().join("qqflow_fake");
+/// 重建某一测试自己的 fake DB 夹具（目录随 tag 隔离，无需进程内互斥）。
+fn build_fake_db(tag: &str) -> std::path::PathBuf {
+    let fake_root = fake_db_path(tag).ancestors().nth(3).unwrap().to_path_buf();
     let _ = std::fs::remove_dir_all(&fake_root);
-    common::write_fake_source(fake_db_path().parent().unwrap(), 0)
+    common::write_fake_source(fake_db_path(tag).parent().unwrap(), 0)
 }
-
-/// Both fake-db tests rebuild the same fixture directory — serialize them
-/// (integration tests run in parallel threads of one process).
-static FAKE_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// [GT] per-column value statistics for one table — the arbitration data
 /// for the loader's value-driven classification (store::names): a `u_`
@@ -128,8 +134,7 @@ fn probe_columns(conn: &rusqlite::Connection, table: &str) {
 /// reader + direct row counts). The behavioral-repro procedure depends on it.
 #[test]
 fn fake_db_for_behavioral_repro() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let path = build_fake_db();
+    let path = build_fake_db("fake_db_for_behavioral_repro");
     let mut reader = LiveReader::new(path.clone(), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
@@ -152,8 +157,7 @@ fn fake_db_for_behavioral_repro() {
 /// rows.flatten()). Now a permanent guard: both c2c rows must be indexed.
 #[test]
 fn fake_db_indexes_c2c_rows() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let path = build_fake_db();
+    let path = build_fake_db("fake_db_indexes_c2c_rows");
     let mut reader = LiveReader::new(path, FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
@@ -180,8 +184,7 @@ fn fake_db_indexes_c2c_rows() {
 /// `group_info.db` (headed — exercises the offset VFS on a non-nt_msg file).
 #[test]
 fn fake_db_names_loaded() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let path = build_fake_db();
+    let path = build_fake_db("fake_db_names_loaded");
     let nt_db = path.parent().unwrap().to_path_buf();
     common::write_fake_group_info_headed(&nt_db);
     common::write_fake_profile_info(&nt_db);
@@ -293,14 +296,13 @@ fn fake_db_names_loaded() {
 // 与同文件其它 async 夹具用例同款：夹具目录必须整条测试独占，而断言要 await。
 #[allow(clippy::await_holding_lock)]
 async fn fake_db_group_members_is_roster_union_senders() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
     // 显式重建夹具：别的用例会往同一个库里追加行（图片行是 u_c 发的），
     // 不重建的话「u_d 没发过言」这个前提取决于执行顺序。
-    build_fake_db();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    build_fake_db("fake_db_group_members_is_roster_union_senders");
+    let nt_db = fake_db_path("fake_db_group_members_is_roster_union_senders").parent().unwrap().to_path_buf();
     common::write_fake_group_info(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_group_members_is_roster_union_senders"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     let mut store = qqflow_server::store::index::build_index(conn, None, None).unwrap();
@@ -364,13 +366,12 @@ async fn fake_db_group_members_is_roster_union_senders() {
 /// and MessageOut exposes is_send + media + mediaId.
 #[test]
 fn fake_db_index_media_metadata() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("fake_db_index_media_metadata").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     let md5 = common::append_image_row(&writer, 7, &nt_db);
     common::materialize_source(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_index_media_metadata"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     // Media registration needs the account's nt_data root: `resolve_local_path`
@@ -425,13 +426,12 @@ fn fake_db_index_media_metadata() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn fake_db_media_endpoint_serves_bytes() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("fake_db_media_endpoint_serves_bytes").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     let md5 = common::append_image_row(&writer, 7, &nt_db);
     common::materialize_source(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_media_endpoint_serves_bytes"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     // See `fake_db_index_media_metadata`: without the nt_data root the local
@@ -502,8 +502,7 @@ async fn fake_db_media_endpoint_serves_bytes() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn fake_db_media_fallback_registers_and_serves() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("fake_db_media_fallback_registers_and_serves").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     // Row 7's 45812 points at the standard fake media file — delete it so
     // the exact path is dead and only the cache fallback can rescue it.
@@ -512,7 +511,7 @@ async fn fake_db_media_fallback_registers_and_serves() {
     let cache_file = common::write_fake_cache_file(&nt_db, &format!("Pic/2026-08/Ori/{md5}.jpg"));
     common::materialize_source(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_media_fallback_registers_and_serves"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
@@ -570,8 +569,7 @@ async fn fake_db_media_fallback_registers_and_serves() {
 /// unregistered and the fetchability filter omits its mediaId.
 #[test]
 fn fake_db_media_fallback_first_wins_and_no_match() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("fake_db_media_fallback_first_wins_and_no_match").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     // md5_a: row 7 carries a LIVE 45812; row 8 repeats the same key with no
     // 45812 — a cache file exists, but the live exact entry must win.
@@ -583,7 +581,7 @@ fn fake_db_media_fallback_first_wins_and_no_match() {
     common::append_image_row_no_local(&writer, 9, md5_b, "ghost.png");
     common::materialize_source(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_media_fallback_first_wins_and_no_match"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     let media_root = qqflow_server::store::media::media_root_of(&nt_db);
@@ -617,13 +615,12 @@ fn fake_db_media_fallback_first_wins_and_no_match() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn fake_db_media_export_serves_exported_bytes() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("fake_db_media_export_serves_exported_bytes").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     let md5 = common::append_image_row(&writer, 7, &nt_db);
     common::materialize_source(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_media_export_serves_exported_bytes"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     // See `fake_db_index_media_metadata`: the export copies FROM the local
@@ -738,10 +735,9 @@ async fn fake_db_media_export_serves_exported_bytes() {
 /// what `POST /api/v1/sync` drives).
 #[test]
 fn manual_sync_picks_up_new_rows() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("manual_sync_picks_up_new_rows").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
-    let path = fake_db_path();
+    let path = fake_db_path("manual_sync_picks_up_new_rows");
     let reader = std::sync::Arc::new(parking_lot::Mutex::new(
         LiveReader::new(path, FAKE_KEY.into()),
     ));
@@ -754,8 +750,8 @@ fn manual_sync_picks_up_new_rows() {
         reader,
         store,
         bus,
-        fake_db_path(),
-        fake_db_path().parent().unwrap().to_path_buf(),
+        fake_db_path("manual_sync_picks_up_new_rows"),
+        fake_db_path("manual_sync_picks_up_new_rows").parent().unwrap().to_path_buf(),
         FAKE_KEY.into(),
     );
 
@@ -811,11 +807,10 @@ fn manual_sync_picks_up_new_rows() {
 /// exactly once — the old combined read+apply pass duplicated rows here.
 #[test]
 fn failed_sync_leaves_store_untouched() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("failed_sync_leaves_store_untouched").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     let reader = std::sync::Arc::new(parking_lot::Mutex::new(
-        LiveReader::new(fake_db_path(), FAKE_KEY.into()),
+        LiveReader::new(fake_db_path("failed_sync_leaves_store_untouched"), FAKE_KEY.into()),
     ));
     reader.lock().open().unwrap();
     let store = std::sync::Arc::new(parking_lot::RwLock::new(qqflow_server::store::Store::default()));
@@ -825,8 +820,8 @@ fn failed_sync_leaves_store_untouched() {
         reader,
         store.clone(),
         bus,
-        fake_db_path(),
-        fake_db_path().parent().unwrap().to_path_buf(),
+        fake_db_path("failed_sync_leaves_store_untouched"),
+        fake_db_path("failed_sync_leaves_store_untouched").parent().unwrap().to_path_buf(),
         FAKE_KEY.into(),
     );
 
@@ -876,8 +871,7 @@ fn failed_sync_leaves_store_untouched() {
 // would rebuild the shared file underneath the in-flight initialization.
 #[allow(clippy::await_holding_lock)]
 async fn client_registers_account_with_key_and_db_path() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let path = build_fake_db();
+    let path = build_fake_db("client_registers_account_with_key_and_db_path");
     let db_path = path.to_string_lossy().to_string();
 
     let state = Arc::new(AppState {
@@ -1010,13 +1004,12 @@ async fn client_registers_account_with_key_and_db_path() {
 /// a right one.
 #[test]
 fn fake_db_reply_is_stated_only_when_unambiguous() {
-    let _guard = FAKE_DB_LOCK.lock().unwrap();
-    let nt_db = fake_db_path().parent().unwrap().to_path_buf();
+    let nt_db = fake_db_path("fake_db_reply_is_stated_only_when_unambiguous").parent().unwrap().to_path_buf();
     let (writer, _raw) = common::open_fake_source(&nt_db, 0);
     common::seed_reply_rows(&writer);
     common::materialize_source(&nt_db);
 
-    let mut reader = LiveReader::new(fake_db_path(), FAKE_KEY.into());
+    let mut reader = LiveReader::new(fake_db_path("fake_db_reply_is_stated_only_when_unambiguous"), FAKE_KEY.into());
     reader.open().unwrap();
     let conn = reader.acquire().unwrap();
     let store = qqflow_server::store::index::build_index(conn, None, None).unwrap();

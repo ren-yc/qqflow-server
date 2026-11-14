@@ -725,19 +725,31 @@ fn activate_account(
     account.set_registration_guard(Box::new(current.clone()));
     // 换库处置：轮询发现数据源身份变化时，账号转 Error 待重注册（重注册 =
     // 全量重建，是唯一能兑现「新库、新水位线」的路径）。闭包持 Weak（理由同
-    // registration_guard：持 Arc 会形成引用环），捕获的只有 qq 的 String 与
-    // 令牌副本——两者都不是 Arc，不参与引用环。先验注册令牌再写状态：旧注册
-    // 的换库发现不能改写新注册的状态。
+    // registration_guard：持 Arc 会形成引用环），捕获的只有 qq 的 String、
+    // 账号句柄的 Arc 与令牌副本。先验注册令牌再写状态：旧注册的换库发现不能
+    // 改写新注册的状态。
+    //
+    // 处置是**整套退役**而不只是写状态：只把账号翻成 Error 时，旧句柄仍留在
+    // SyncEngine 注册表里——客户端按提示重注册同一 QQ，activate_account 的
+    // register_if_current 会因「已有同 qq」拒绝，重注册永远完不成。按句柄身份
+    // （Arc::ptr_eq）从注册表移除旧条目并停掉 watcher，重注册才能装新句柄；
+    // 身份比对保证这个退役只命中本句柄自己，绝不波及后来注册的新账号。
+    //
+    // 退役与状态写入**各自持锁**，不在一把大锁内做完：set_account_state_if_current
+    // 自己拿 lifecycle 锁，先拿锁再调它会同线程重入死锁（parking_lot Mutex 不可
+    // 重入）。原子性由令牌校验保证——本处置运行期间插入的重注册推进 registration，
+    // 令牌校验让写状态与退役都不产生可见效果（退役按句柄身份，新注册的句柄不是
+    // 这个 Arc，不会被误伤）。
     let on_replace_state = Arc::downgrade(state);
     let on_replace_qq = account.qq.clone();
+    let on_replace_handle = account.clone();
     account.set_on_source_replaced(Box::new(move || {
         let Some(state) = on_replace_state.upgrade() else { return };
         if token.is_cancelled(&state.init) {
             tracing::debug!("[sync] 数据源替换发现来自已失效的注册，处置丢弃");
             return;
         }
-        // Error 态下旧句柄仍可能被手动同步触发，poll_once 每轮采样都会再次发现
-        // 换库并重复此路径——状态写回是幂等的，不会放大。
+        let retired = state.sync.unregister_if(&on_replace_handle);
         if set_account_state_if_current(
             &state,
             &on_replace_qq,
@@ -749,7 +761,13 @@ fn activate_account(
                     .to_string(),
             ),
         ) {
-            tracing::warn!("[sync] 数据源已被替换，账号转 Error 待重新注册");
+            // 账号离开 Ready 的同一次处置里刷新全局 readiness：只写状态不清 ready
+            // 时，依赖该标志的请求仍会把旧索引当可用。
+            update_ready(&state);
+            tracing::warn!(
+                retired = retired,
+                "[sync] 数据源已被替换，账号转 Error 待重新注册（旧同步句柄已退役）"
+            );
         }
     }));
     let _lifecycle = state.init.lifecycle.lock();
@@ -774,6 +792,32 @@ fn activate_account(
 /// The caller (the registration handler) has already flipped the account
 /// to `indexing` synchronously so /health shows it immediately.
 pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, token: RegistrationToken) {
+    init_account_inner(state, info, key, token, None).await;
+}
+
+/// `init_account` 的测试编排变体：`build_gate` 在构建闭包**采完基线之后、开始
+/// 解密建索引之前**被调用（阻塞后台构建线程，直到测试放行）。测试用它把「换库
+/// 覆写」精确插进「基线已采、install 未跑」的窗口——大语料拉长构建的编排
+/// （`build_time_source_replacement_discards_the_index` 的旧形态）依赖时序运气，
+/// CI 的 Windows 机器上覆写可能晚于 install 复查，回归等不到 Error 超时。
+#[cfg(feature = "testing")]
+pub async fn init_account_with_build_gate(
+    state: &Arc<AppState>,
+    info: DbInfo,
+    key: String,
+    token: RegistrationToken,
+    build_gate: Box<dyn FnOnce() + Send>,
+) {
+    init_account_inner(state, info, key, token, Some(build_gate)).await;
+}
+
+async fn init_account_inner(
+    state: &Arc<AppState>,
+    info: DbInfo,
+    key: String,
+    token: RegistrationToken,
+    build_gate: Option<Box<dyn FnOnce() + Send>>,
+) {
     let qq = info.qq.clone();
     // 与 `begin_indexing` 创建的是同一份计数：从账号状态里取回 `Arc`，不要另起一份，
     // 否则 HTTP 侧永远读到零。
@@ -824,6 +868,11 @@ pub async fn init_account(state: &Arc<AppState>, info: DbInfo, key: String, toke
         // 却记成 B——后续采样永不推进世代，换库被整个吞掉（客户端拿不到任何
         // 失效信号）。
         let build_identity = crate::db::source_identity::fingerprint(&info_for_build.path)?;
+        // 测试闸门：基线已采、解密建索引未开始的窗口交给测试（见
+        // `init_account_with_build_gate`）。生产路径 None，零开销。
+        if let Some(gate) = build_gate {
+            gate();
+        }
         // 媒体根与群名映射都在 `build_with` 里处理（嵌入者走同一段）。
         let nt_db_dir = info_for_build
             .path
