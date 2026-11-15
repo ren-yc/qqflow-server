@@ -2,6 +2,27 @@
 
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.0] - 未发布
+
+### 破坏性变更
+
+- **拉取面进度游标升级为两段式**：第一段在**链开始时已索引的行**里按时间序交付窗口内的行，第二段按行标识补发此后入库的行。修掉的是「首页按时间排序、续页按行标识过滤」把「时间更晚、行标识更小」的行永久跨过去的少行形态。迁移：旧游标（v1 / v2）一律 409 加 `reason: "cursor_reset_required"`，丢弃后从头拉一次即可；不传 `cursor` 的时间序翻页行为不变。回归：`chatlab_pull_cursor_v3_phases`、`cursor_snapshot_is_frozen_while_new_rows_wait`、契约用例 `cursor-window-drain-equals-single-page`。
+- **第二段可能带出窗口外的行**：它不应用 `since` / `end`，响应里因此可能出现早于 `since` 或晚于 `end` 的行，那一段的 `nextSince` 是 `watermark`。迁移：需要严格窗口的调用方在落盘前自行丢弃窗口外的行，CLI 的批量导出已按 `--since` 这么做。回归：`export_with_since_drops_out_of_window_rows`。
+- **批量导出改走游标链**：`export` 每页原样回传 `sync.nextCursor`，不再按 `since` / `offset` 续拉——后者在乱序行上会跨过未交付的行，而产物看起来完整。迁移：无需动作；游标中途失效时导出以非零码退出并提示 `--resume` 重跑。回归：`export_with_since_drives_the_cursor_not_the_offset_chain`。
+
+### 变更
+
+- 接口契约 pin 升 `v0.12.0`：新增 `group_out_of_order` 槽位与两条游标用例，随一致性套件执行。
+
+### 修复
+
+- 空页结算不再可能把进度编码成「从头拉取」：`end` 界内的一切都记进位置，周期轮询的客户端采纳空页游标再丢掉时间过滤不会重放历史。回归：`cursor_empty_page_settles_at_the_request_end`、`cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order`。
+- 被 `end` 挡住的行不再可能被切段冻死：段切换只在「`end` 视作无上界时第一段也为空」时发生。回归：`cursor_end_window_does_not_freeze_the_chain`。
+- 批量导出的窗口过滤按用户口径（含边界，请求带 `since - 1`）判：判据写成 `>` 会让起点那一条凭空消失。回归：`export_with_since_drops_out_of_window_rows`。
+- **空页不再被当成导出终点**：首屏是「空页 + `hasMore=true`」（第一段耗尽的结算形态）时，旧代码直接收尾，第二段整段丢失而退出码仍是 0。回归：`export_follows_an_empty_page_that_still_has_more`。
+- **游标的长度预算先折回原始载荷、再扣身份字段**：原来的顺序把 base64 的 4/3 膨胀算在扣减之后，分片多的会话能签出一条超过解码上限、自己解不回的游标（续拉永远失败）。回归：`issued_cursor_never_exceeds_the_length_ceiling`。
+- **批量导出的写盘错误立即中止本轮**：此前存起来继续取页，后续页的取数错误会把它盖掉——若是令牌泄露，整轮本该中止却降级成「跳过这个会话」、退出码仍为 0。回归：`export_aborts_on_a_write_error_instead_of_masking_it`。
+
 ## [0.11.1] - 2026-11-15
 
 ### 新增

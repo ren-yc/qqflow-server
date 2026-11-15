@@ -60,23 +60,12 @@ pub async fn handler(
     let end = params.end.as_deref().and_then(|s| parse_time_bound(s, true));
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
 
+    // 四个量（账号、注册代次、数据源世代）与会话内容必须在**同一把锁**下取：store 的
+    // 读锁就是生命周期闸门——注销要拿写锁，而且顺序固定为「清空 store → 推进注册代次
+    // → 摘掉账号绑定」。持读锁期间这三件事都发生不了，所以在锁内采样得到的是同一时刻
+    // 的一致视图。锁外采样会留下「A 的账号与世代 + B 的 store 内容」这种混合身份：
+    // 响应是 B 的数据、游标却绑着 A，下一次请求 409，拉取被中途打断。
     let store = state.store.read();
-    // find_conversation falls back to the other chat type when the primary
-    // classification misses (an all-digit c2c peer uid classifies as group).
-    let Some(conv) = store.find_conversation(&id) else {
-        return Err(ApiError::not_found(format!("会话不存在: {id}")));
-    };
-    let chat_type = conv.chat_type;
-    let talker = conv.talker.clone();
-
-    // 游标上下文：本进程 + 本账号 + 本会话 + (注册代次, 数据源世代)。会话摘要
-    // 绑**解析后的** `(chat_type, talker)` 而不是裸 `id`：两个不同的裸 id 落到
-    // 同一个会话（`find_conversation` 的回退）时必须编出同一条线，而不是互相
-    // 误判成跨会话。注册代次用注册令牌的二元组序数（注销与重注册都推进它），
-    // 数据源世代来自该账号同步句柄的指纹采样（库身份变化才推进）。
-    let registration = state.init.registration.load(std::sync::atomic::Ordering::SeqCst);
-    // 绑定账号（与下面 `ownerId` 的取法同源）：store 没有账号维度，注册表里
-    // 唯一的绑定条目就是它。
     let bound_qq = state
         .accounts
         .read()
@@ -91,7 +80,20 @@ pub async fn handler(
         .find(|a| a.qq == bound_qq)
         .map(|a| a.generation_handle().load(std::sync::atomic::Ordering::SeqCst))
         .unwrap_or(0);
+    let registration = state.init.registration.load(std::sync::atomic::Ordering::SeqCst);
+    // find_conversation falls back to the other chat type when the primary
+    // classification misses (an all-digit c2c peer uid classifies as group).
+    let Some(conv) = store.find_conversation(&id) else {
+        return Err(ApiError::not_found(format!("会话不存在: {id}")));
+    };
+    let chat_type = conv.chat_type;
+    let talker = conv.talker.clone();
+
     let session_key = crate::store::conv_key(chat_type, &talker);
+    // 游标上下文：本进程 + 本账号 + 本会话 + (注册代次, 数据源世代)。会话摘要绑
+    // **解析后的** `(chat_type, talker)` 而不是裸 `id`：`find_conversation` 的类型回退
+    // 让同一个裸 id 落到某个会话时，两条请求必须编出同一条线。回归
+    // `all_digit_c2c_talker_resolves_via_fallback`、`every_identity_mismatch_is_a_reset_not_a_silent_restart`。
     let cursor_ctx = crate::server::cursor::CursorContext::for_session(
         &bound_qq,
         &session_key,
@@ -101,69 +103,162 @@ pub async fn handler(
     // 解码失败分两种——语法坏是 400，身份/代次不符是 409 + `reason:
     // cursor_reset_required`；两者都不退回时间模式：静默退回等于让客户端以为
     // 续上了、实际从头重放。
-    let cursor_rowid = match params.cursor.as_deref() {
+    let cursor_progress = match params.cursor.as_deref() {
         Some(raw) => Some(cursor_ctx.decode(raw).map_err(|e| e.into_api_error())?),
         None => None,
     };
 
-    // Chronological messages within (since, end] — `since` is exclusive, so
-    // a client resuming with `nextSince` never re-fetches the boundary
-    // second and can neither loop nor see duplicates.
-    // 进度游标模式（cursor 给出）下整个分页只用行标识（rowid）：过滤用
-    // 「rowid > 游标值」的排他下界，排序与页推进都按 rowid 单调——入库序与
-    // 时间序在乱序行上分叉时，续拉严格无重放、无跳行；乱序行的 messages
-    // 顺序不再是时间升序，这是「排空判据=入库进度」的直接后果。无 cursor
-    // 的时间模式保持规范原行为：(ts, rowid) 复合键升序、页不跨秒推进。
-    let mut idx: Vec<usize> = conv.msgs.iter().enumerate().map(|(i, _)| i).collect();
-    if cursor_rowid.is_some() {
-        idx.sort_by_key(|&i| conv.msgs[i].rowid);
-    } else {
-        idx.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
-    }
-    let filtered: Vec<usize> = idx
-        .into_iter()
-        .filter(|&i| {
-            let m = &conv.msgs[i];
-            // 进度游标是权威起点：给出时忽略 since/offset（时间只是元数据，
-            // 入库进度才是增量判据）。排空后同秒晚入库的行由 rowid 排他性覆盖。
-            if let Some(rid) = cursor_rowid {
-                return m.rowid > rid && end.is_none_or(|e| m.ts <= e);
-            }
-            since.is_none_or(|s| m.ts > s) && end.is_none_or(|e| m.ts <= e)
-        })
-        .collect();
+    // ── 两段式游标：第一段窗口快照扫描，第二段入库补发（契约 0.12.0）──────
+    //
+    // 首页按时间键交付、续页只按行标识过滤时，两种序下的「已交付集合」互不为前缀：
+    // 时间更晚、行标识更小的行会被 `rowid > 水位` 跨过去、此后永不交付。两段式把
+    // 集合按「链开始时的行标识上界」切干净，每段内部只剩一种序——第一段时间键、
+    // 第二段行标识——「已交付 = 该序的前缀」才成立。判据与载荷见 `server::cursor`。
+    //
+    // 本仓一个会话恒落一张表（`group_msg_table` / `c2c_msg_table`），所以分片维度
+    // 恒为 1：分片号取表名摘要，保留这个维度只是为了让两仓的判据逐字对应。
+    //
+    // 回归：`cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order`
+    // （乱序行经链可达、不重放）、`cursor_end_window_does_not_freeze_the_chain`
+    // （`end` 挡住的行留在第一段）、`cursor_snapshot_is_frozen_while_new_rows_wait`
+    // （快照冻结后链中途入库的行仍可达）、契约用例 `cursor-drain-equals-full-out-of-order`。
+    let shard = crate::server::cursor::shard_code(match chat_type {
+        ChatType::Group => crate::store::index::GROUP_TABLE,
+        ChatType::C2c => crate::store::index::C2C_TABLE,
+    });
+    // 快照取**已索引**上界：索引事后补齐的行行标识必然更大，因此落第二段；
+    // 取库文件上界会把它们冻在第一段里又被键过滤掉。
+    let snapshot: Vec<(u64, i64)> = conv
+        .msgs
+        .iter()
+        .map(|m| m.rowid)
+        .max()
+        .map(|rowid| vec![(shard, rowid)])
+        .unwrap_or_default();
 
-    let total = filtered.len();
-    // Page from `offset`, extending to the end of the last second's ts
-    // group: pages never split a second, so `nextSince` strictly advances.
-    // 进度游标模式下 offset 无意义（游标已定位到行），恒从 0 开始。
-    let start = if cursor_rowid.is_some() { 0 } else { offset.min(total) };
-    let mut page_end = start;
-    if cursor_rowid.is_some() {
-        // 游标模式：页推进按 rowid 组——与排序键一致，页边界不切断单调序，
-        // 页末 rowid 是严格的「已交付上界」。
-        let mut prev_rid = None;
-        while page_end < total {
-            let rid = conv.msgs[filtered[page_end]].rowid;
-            if prev_rid.is_some_and(|p| p != rid) && page_end - start >= limit {
-                break;
-            }
-            prev_rid = Some(rid);
-            page_end += 1;
+    // 窗口下界随游标走（它表达「这条链从哪儿开始」）；`end` 每页活跃、不进游标。
+    let fresh_chain = cursor_progress.is_none();
+    let excluded_since = cursor_progress
+        .as_ref()
+        .map_or(since.unwrap_or(i64::MIN), |p| p.excluded_since());
+    let progress = cursor_progress
+        .unwrap_or_else(|| crate::server::cursor::CursorProgress::start(snapshot.clone(), since));
+
+    // 第一段候选：窗口内 + 快照内 + 键在位置之后，按时间键升序。
+    // 第一段**不推进**快照——推进会把「已被页切掉、但键更小」的新行跨过去。
+    let phase1 = |bound_end: Option<i64>| -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..conv.msgs.len())
+            .filter(|&i| {
+                let m = &conv.msgs[i];
+                m.ts > excluded_since
+                    && bound_end.is_none_or(|e| m.ts <= e)
+                    && progress.admits1(
+                        shard,
+                        crate::server::cursor::TimeKey { ts: m.ts, rowid: m.rowid },
+                    )
+            })
+            .collect();
+        rows.sort_by_key(|&i| (conv.msgs[i].ts, conv.msgs[i].rowid));
+        rows
+    };
+    // 第二段候选：行标识在快照之后，**不看时间**——这一段就是「链开始后入库的行
+    // 无论时间戳都能经游标拿到」的载体。按 (分片, 行标识) 升序，页因此是各分片
+    // 行标识前缀的并，水位推进不会跨过未交付的行。
+    let phase2 = || -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..conv.msgs.len())
+            .filter(|&i| progress.admits2(shard, conv.msgs[i].rowid))
+            .collect();
+        rows.sort_by_key(|&i| (shard, conv.msgs[i].rowid));
+        rows
+    };
+    // 页边界：第一段**不切秒组**（`nextSince` 要能无损续页，等键行也必须同页）；
+    // 第二段按行标识逐个推进，没有秒组可切。
+    let page_end_for = |rows: &[usize], split_second: bool| -> usize {
+        if !split_second {
+            return rows.len().min(limit);
         }
-    } else {
-        let mut prev_ts = None;
-        while page_end < total {
-            let ts_j = conv.msgs[filtered[page_end]].ts;
-            if prev_ts.is_some_and(|p| p != ts_j) && page_end - start >= limit {
+        let mut end = 0usize;
+        let mut prev_ts: Option<i64> = None;
+        while end < rows.len() {
+            let ts = conv.msgs[rows[end]].ts;
+            if prev_ts.is_some_and(|p| p != ts) && end >= limit {
                 break;
             }
-            prev_ts = Some(ts_j);
-            page_end += 1;
+            prev_ts = Some(ts);
+            end += 1;
+        }
+        end
+    };
+    let delivered_bounds = |page: &[usize]| -> Vec<(u64, i64)> {
+        page.iter().map(|&i| (shard, conv.msgs[i].rowid)).collect()
+    };
+
+    let mut page: Vec<usize> = Vec::new();
+    let next_progress;
+    let mut has_more = false;
+    // `offset` 只在**无游标**的翻页里生效：游标链的进度由游标承载，混用两者会让
+    // 「已交付」出现两个互不同步的来源。
+    let mut start = 0usize;
+    if progress.phase() == 2 {
+        let rows = phase2();
+        let end = page_end_for(&rows, false);
+        page = rows[..end].to_vec();
+        has_more = end < rows.len();
+        next_progress = progress.advance_phase2(delivered_bounds(&page));
+    } else {
+        let rows = phase1(end);
+        let skip = if fresh_chain { offset.min(rows.len()) } else { 0 };
+        let rows = &rows[skip..];
+        if !rows.is_empty() {
+            let end = page_end_for(rows, true);
+            page = rows[..end].to_vec();
+            has_more = end < rows.len();
+            start = skip;
+            // 页末行的时间键就是本页的最大键：页不切秒组，排序键与页推进一致。
+            let last = &conv.msgs[*page.last().expect("非空页必有末行")];
+            next_progress = progress.with_position(crate::server::cursor::TimeKey {
+                ts: last.ts,
+                rowid: last.rowid,
+            });
+        } else if fresh_chain {
+            // 无游标的空页 = **空页结算**：`end` 界内的一切都已确立。位置时间取
+            // `watermark`（`end` 缺省时是当前时刻），时间更大的行键更大、仍然可达
+            // ——「被 `end` 挡住的行没有丢」正落在这里。
+            let max_rowid = conv
+                .msgs
+                .iter()
+                .filter(|m| m.ts <= watermark)
+                .map(|m| m.rowid)
+                .max()
+                .unwrap_or(0);
+            next_progress = crate::server::cursor::CursorProgress::settled(
+                watermark,
+                max_rowid,
+                snapshot.clone(),
+                since,
+            );
+        } else if !phase1(None).is_empty() {
+            // 被 `end` 挡住不算耗尽：那些行键大于位置，客户端抬高 `end` 后照样交付。
+            // 在这里切段会把它们永久留在第一段之外（第二段只认行标识大于快照）。
+            next_progress = progress.clone();
+        } else {
+            // 第一段确实耗尽 ⇒ 切第二段，本页直接交付第二段的行。不返回空页：
+            // 「排空即停」的客户端会把空页当成链结束，第二段的行就永远拿不到。
+            let rows = phase2();
+            let end = page_end_for(&rows, false);
+            page = rows[..end].to_vec();
+            has_more = end < rows.len();
+            next_progress = progress.into_phase2().advance_phase2(delivered_bounds(&page));
         }
     }
-    let page = &filtered[start..page_end];
-    let has_more = page_end < total;
+    // 第一段耗尽、但第二段已有行 ⇒ 仍要报「还有更多」：否则「排空即停」的客户端
+    // 永远看不到第二段（链开始后入库的行），而它正是游标承诺的一部分。判据是
+    // 「本请求已把第一段（`end` 视作无上界）消费完」——只看 `phase1(None)` 是否为空
+    // 会把「本页正好交付完窗口内的行」误判成没耗尽：那时它恰好等于本页那几行。
+    // 被 `end` 挡住不算耗尽：那些行属于第一段，客户端抬高 `end` 才该继续。
+    if !has_more && next_progress.phase() == 1 && phase1(None).len() <= start + page.len() {
+        has_more = !phase2().is_empty();
+    }
 
     // WeFlow's Pull contract keeps these two SEPARATE: `accountName` is the
     // account's own name, `groupNickname` is the per-conversation group card
@@ -268,49 +363,20 @@ pub async fn handler(
         .map(|a| a.qq.clone())
         .unwrap_or_default();
 
-    let next_since = page.last().map(|&i| conv.msgs[i].ts).unwrap_or(since.unwrap_or(0));
-    // 进度游标编码「**已交付集合**」的进度上界——不是页末行：
-    //
-    // - cursor 模式：排序按 rowid 单调，页末行就是已交付集合的最大 rowid，
-    //   两者重合；空页时以本次游标值为准（进度不回退）。
-    // - 时间模式非空页：排序按时间复合键，页末行 rowid **可能不是已交付集合
-    //   里最大的**（回溯入库的行：时间早、rowid 大）。编码页末行会让后续游标
-    //   链重放它；必须编码「本次响应已交付的行里最大的 rowid」。
-    // - 时间模式空页：本响应没有交付任何行，但请求窗口 (since, end] 为空本身
-    //   就是进度陈述——窗口内无行，则一切 ts ≤ end 的行都已确立。游标编码
-    //   「end 界内已确立的最大 rowid」（end 缺省时水位线=now 覆盖全部行）。
-    //   编码 0 是「从头拉取」，周期轮询的客户端采纳它再丢掉时间过滤就会重放
-    //   全历史。
-    let last_rowid = if cursor_rowid.is_some() {
-        page.iter()
-            .map(|&i| conv.msgs[i].rowid)
-            .max()
-            .or(cursor_rowid)
-            .unwrap_or(0)
-    } else if page.is_empty() {
-        // 水位线内找不到任何行时**不能**退回 0：那种情况下客户端已经拉过一批
-        // （否则它的 `since` 从哪来），编码 0 等于让它从头重放。改为退到
-        // 「`since` 界内已确立的最大 rowid」——`since` 之前的行客户端见过。
-        // 两者都空（首次请求就没有行）才编码 0，那才是真正的「从头拉」。
-        conv.msgs
-            .iter()
-            .filter(|m| m.ts <= watermark)
-            .map(|m| m.rowid)
-            .max()
-            .or_else(|| {
-                since.and_then(|s| {
-                    conv.msgs
-                        .iter()
-                        .filter(|m| m.ts <= s)
-                        .map(|m| m.rowid)
-                        .max()
-                })
-            })
-            .unwrap_or(0)
+    // 第二段按行标识排序，页末行的时间会回退——按它续拉会把已交付的行重放一遍。
+    // 因此第二段一律给出 `watermark`；第一段沿用「页末时间戳 / 排空取 watermark」。
+    let next_since = if next_progress.phase() == 2 || !has_more {
+        watermark
     } else {
-        page.iter().map(|&i| conv.msgs[i].rowid).max().unwrap_or(0)
+        page.last().map(|&i| conv.msgs[i].ts).unwrap_or(watermark)
     };
-    let next_cursor = cursor_ctx.encode(last_rowid);
+    // `offset` 只在无游标、且时间戳无法推进的退化页里承载进度；游标模式恒为 0。
+    let next_offset = if fresh_chain && has_more && next_since <= since.unwrap_or(i64::MIN) {
+        start.saturating_add(page.len())
+    } else {
+        0
+    };
+    let next_cursor = cursor_ctx.encode(&next_progress).map_err(|e| e.into_api_error())?;
     let body = serde_json::to_value(PullEnvelope {
         chatlab: crate::server::chatlab::header(),
         members,
@@ -324,18 +390,15 @@ pub async fn handler(
         sync: PullSync {
             has_more,
             next_cursor: Some(next_cursor),
-            next_since: if has_more { next_since } else { watermark },
+            next_since,
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the
             // page ends on a complete ts group, so re-filtering with it drops
             // exactly the rows already served — leaving the next unseen row at
             // offset 0. `nextOffset` therefore only carries weight in the
-            // degenerate case where the timestamp could not advance at all.
-            next_offset: if has_more && next_since <= since.unwrap_or(i64::MIN) {
-                start.saturating_add(page.len())
-            } else {
-                0
-            },
+            // degenerate case where the timestamp could not advance at all,
+            // and never on a cursor chain（进度由游标承载）。
+            next_offset,
             watermark,
         },
     })

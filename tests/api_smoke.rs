@@ -1859,24 +1859,51 @@ async fn chatlab_pull_drains_when_client_echoes_both_cursors() {
     assert_eq!(unique.len(), 7, "no duplicates across pages: {ids:?}");
 }
 
-/// 进度游标 v2 的失效语义：同一个游标必须能用，语法坏是 400，v1 旧形态、
-/// 跨会话一律 409 且响应体带 `reason: "cursor_reset_required"`。
+/// 进度游标 v3：两段式判据与失效语义。
 ///
-/// 服务端**绝不静默退回时间模式**：退回会让客户端以为续上了，实际从头重放。
-/// 旧行为（v1 认不出 → None → 时间模式；跨代次 → Some(0) → 从头拉）正是这两条
-/// 失败模式，本测试把它们钉死在错误信封上。
+/// 两段式把集合按「链开始时已索引的行标识上界」切成两段：第一段在快照内按时间键交付
+/// 窗口内的行，第二段按行标识补发其后的行。本测试钉住三件事：游标原样可用、
+/// `end` 挡住的行留在第一段（空页时游标**逐字不变**）、语法坏 400 与旧版本（v1 / v2）
+/// 409 + `reason`。第二条是本版新判据：在空页上贸然切段会让被 `end` 挡住的行永久留在
+/// 第一段之外（第二段只认行标识大于快照的行）。跨会话这一维不在这里造——见游标单测
+/// `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
 #[tokio::test]
-async fn chatlab_pull_cursor_v2_reset_semantics() {
-    let app = build_router(test_state());
+async fn chatlab_pull_cursor_v3_phases() {
+    let app = build_router(ts_boundary_state());
     let pull = "/api/v1/sessions/10001/messages";
+    let base: i64 = 0x6771A6B5;
 
-    // 第一页拿到 v2 游标；同一个游标能用（回传后仍 200，且能拿到第二页游标）。
+    // 第一段：limit=2 但页会补齐整秒组 ⇒ 交付同一秒的 5 行；游标在场。
     let (s1, v1) = call(app.clone(), &format!("{pull}?limit=2&access_token=test-token-123456")).await;
     assert_eq!(s1, StatusCode::OK);
-    let c0 = v1["sync"]["nextCursor"].as_str().expect("v2 游标必须在场").to_string();
+    assert_eq!(v1["messages"].as_array().unwrap().len(), 5, "页不切秒组");
+    assert_eq!(v1["sync"]["hasMore"], true);
+    let c0 = v1["sync"]["nextCursor"].as_str().expect("v3 游标必须在场").to_string();
+
+    // 原样回传：第二段的行（时间更大、行标识更大）照常交付，然后排空。
     let (s2, v2) = call(app.clone(), &format!("{pull}?limit=2&cursor={c0}&access_token=test-token-123456")).await;
     assert_eq!(s2, StatusCode::OK, "服务端签发的游标原样回传必须可用");
-    assert!(v2["sync"]["nextCursor"].as_str().is_some(), "续页仍要给出游标");
+    assert_eq!(v2["messages"].as_array().unwrap().len(), 2, "剩余两行");
+    assert_eq!(v2["sync"]["hasMore"], false);
+
+    // `end` 挡住的行留在第一段：同一 `end` 的续页是空页，而游标必须**逐字不变**
+    // （切段会让那两行永久留在第一段之外）。
+    let (s3, v3) = call(
+        app.clone(),
+        &format!("{pull}?limit=2&cursor={c0}&end={base}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK);
+    assert!(v3["messages"].as_array().unwrap().is_empty(), "end 让本页为空");
+    assert_eq!(v3["sync"]["hasMore"], false, "空页不是「还有更多」");
+    assert_eq!(
+        v3["sync"]["nextCursor"].as_str(),
+        Some(c0.as_str()),
+        "被 end 挡住不是耗尽：游标不得前进到第二段"
+    );
+    // 抬高 end（不传）后，那两行仍可经同一游标到达。
+    let (_, v4) = call(app.clone(), &format!("{pull}?limit=5000&cursor={c0}&access_token=test-token-123456")).await;
+    assert_eq!(v4["messages"].as_array().unwrap().len(), 2, "被挡住的行走同一游标必须仍可达");
 
     // 语法坏 → 400（不是退回时间模式）。
     for bad in ["", "!!!", "AAAA"] {
@@ -1890,38 +1917,94 @@ async fn chatlab_pull_cursor_v2_reset_semantics() {
         assert!(v["reason"].is_null(), "400 不是失效，不得带 reason: {v}");
     }
 
-    // 伪造的 v1 旧形态 → 409 + reason。v1 是本服务签发过的历史形态，所以是
-    // 「需要重拉」信号，不是垃圾输入。
-    let v1_cursor = "djEuMC41"; // base64("v1.0.5")，URL-safe 变体
-    let (s, v) = call(app.clone(), &format!("{pull}?cursor={v1_cursor}&access_token=test-token-123456")).await;
-    assert_eq!(s, StatusCode::CONFLICT, "v1 旧游标必须 409: {v}");
-    assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+    // 旧版本 → 409 + reason。v1 / v2 都是本服务签发过的历史形态，语义与两段式不兼容，
+    // 只能重拉；把它们当垃圾输入（400）会让客户端重试同样一条必败的请求。
+    for (cursor, what) in [("djEuMC41", "v1"), ("djIuMC41", "v2")] {
+        let (s, v) = call(app.clone(), &format!("{pull}?cursor={cursor}&access_token=test-token-123456")).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{what} 旧游标必须 409: {v}");
+        assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+    }
 
-    // 跨会话 → 409 + reason：把群会话的游标拿到 c2c 会话上续拉。两个会话的
-    // 摘要不同，解码必须判「跨会话」而不是沿用。
-    let (s, v) = call(
-        app.clone(),
-        &format!("/api/v1/sessions/u_12345/messages?cursor={c0}&access_token=test-token-123456"),
-    )
-    .await;
-    assert_eq!(s, StatusCode::CONFLICT, "跨会话的游标必须 409: {v}");
-    assert_eq!(v["reason"], "cursor_reset_required", "409 响应体必须带机器可读 reason");
+    // 跨会话 → 409 的判据不在这里造第二个会话：夹具只能**造库**，不能造索引，手工插一个
+    // 会话等于让断言落在一个真实运行时不存在的状态上。会话摘要这一维由游标单测
+    // `every_identity_mismatch_is_a_reset_not_a_silent_restart` 钉（它把每条身份线各编
+    // 一条游标，逐条断言 Reset），409 + `reason` 的信封形状由上面两条旧格式游标钉。
+}
 
-    // 游标模式的空页：进度保持（游标值不变），不回退为从头拉取。
-    // `watermark` 是易变值（VOLATILE_KEYS），用绝对 `end` 钉死它，让两次
-    // `nextCursor` 逐字可比。
-    let (s, v) = call(
-        app.clone(),
-        &format!("{pull}?limit=2&cursor={c0}&end=1622505700&access_token=test-token-123456"),
-    )
-    .await;
+/// 无游标的空页 = **空页结算**：`end` 界内的一切都已确立，位置停在 `end`。
+///
+/// 采纳这条游标并丢掉 `end` 后，被 `end` 挡住的行必须仍然可达（它们键更大），
+/// 而 `end` 界内的行不得重放——「周期轮询的客户端采纳空页游标再丢掉时间过滤」
+/// 是这条判据的原始场景。
+#[tokio::test]
+async fn cursor_empty_page_settles_at_the_request_end() {
+    let app = build_router(ts_boundary_state());
+    let pull = "/api/v1/sessions/10001/messages";
+    let base: i64 = 0x6771A6B5;
+
+    // end 卡在第一行之前：窗口内没有任何行。
+    let (s, v) = call(app.clone(), &format!("{pull}?end={}&access_token=test-token-123456", base - 10)).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v["messages"].as_array().unwrap().len(), 0, "end 过滤让本页为空");
+    assert!(v["messages"].as_array().unwrap().is_empty(), "窗口为空");
+    let settled = v["sync"]["nextCursor"].as_str().expect("空页也必须给游标").to_string();
+
+    // 采纳游标、丢掉 `end`：被挡住的行全部可达（它们在 `end` 之后，键更大）。
+    let (_, v2) = call(app.clone(), &format!("{pull}?limit=5000&cursor={settled}&access_token=test-token-123456")).await;
     assert_eq!(
-        v["sync"]["nextCursor"].as_str(),
-        Some(c0.as_str()),
-        "带 cursor 的空页必须保持进度（游标不变，不回退为从头拉取）"
+        v2["messages"].as_array().unwrap().len(),
+        7,
+        "被 end 挡住的行必须仍可达：{v2}"
     );
+}
+
+/// `end` 挡住的行**不算**第一段耗尽：带同一 `end` 的续页是空页，但**不能切段**。
+///
+/// 第二段只认「行标识大于快照」的行，因此在被 `end` 挡住的空页上切段会让那些行
+/// （行标识在快照内、时间大于 `end`）永久留在第一段之外。判据必须是「`end` 视作
+/// 无上界时第一段也为空」。
+#[tokio::test]
+async fn cursor_end_window_does_not_freeze_the_chain() {
+    let app = build_router(ts_boundary_state());
+    let pull = "/api/v1/sessions/10001/messages";
+    let base: i64 = 0x6771A6B5;
+    let ids = |v: &Value| -> Vec<String> {
+        v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 基准：全量。
+    let (_, full) = call(app.clone(), &format!("{pull}?limit=5000&access_token=test-token-123456")).await;
+    let mut full_ids = ids(&full);
+    full_ids.sort();
+
+    // 窗口：end 卡住第二秒的两行。
+    let (_, window) = call(app.clone(), &format!("{pull}?limit=5000&end={base}&access_token=test-token-123456")).await;
+    let mut window_ids = ids(&window);
+    window_ids.sort();
+    assert_eq!(window_ids.len(), 5, "end 界内五行：{window_ids:?}");
+    let c0 = window["sync"]["nextCursor"].as_str().unwrap().to_string();
+
+    // 同一 end 的续页：空页、hasMore=false，游标在场且**不得前进**——被 end 挡住的行
+    // 属于第一段，空页上切段或推进位置都会让它们永久够不到。
+    let (_, empty) = call(app.clone(), &format!("{pull}?limit=5000&cursor={c0}&end={base}&access_token=test-token-123456")).await;
+    assert!(ids(&empty).is_empty(), "窗口内已排空");
+    assert_eq!(empty["sync"]["hasMore"], false);
+    let c1 = empty["sync"]["nextCursor"].as_str().unwrap().to_string();
+    assert_eq!(c1, c0, "被 end 挡住的空页不得推进游标：那些行还在第一段里等更高的 end");
+
+    // 丢掉 end：被挡住的两行必须经**空页返回的**游标到达（用旧的 c0 会掩盖「空页
+    // 错误推进游标」这一缺陷：旧游标照样能取回剩余行，集合断言于是假通过），
+    // 且与窗口页无重放、无缺口。
+    let (_, rest) = call(app.clone(), &format!("{pull}?limit=5000&cursor={c1}&access_token=test-token-123456")).await;
+    let rest_ids = ids(&rest);
+    assert!(!rest_ids.is_empty(), "被 end 挡住的行不可达：空页上切了段");
+    let mut union: Vec<String> = window_ids.iter().chain(rest_ids.iter()).cloned().collect();
+    union.sort();
+    assert_eq!(union, full_ids, "窗口页 + 抬高 end 的续页必须恰好覆盖全量");
 }
 
 #[tokio::test]
@@ -1970,10 +2053,20 @@ async fn all_digit_c2c_talker_resolves_via_fallback() {
     assert_eq!(v["messages"].as_array().unwrap().len(), 1);
     assert_eq!(v["messages"][0]["content"], "在吗");
 
-    let (s, v) = call(app, "/api/v1/sessions/12345/messages?access_token=test-token-123456").await;
+    let (s, v) = call(app.clone(), "/api/v1/sessions/12345/messages?access_token=test-token-123456").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(v["meta"]["type"], "private");
     assert_eq!(v["meta"]["groupId"], "12345");
+    // 同一裸 id 经类型回退解析出的会话，游标链必须能接着走：会话摘要绑的是**解析后**
+    // 的 `(chat_type, talker)`，不是请求里的裸串。改动若退回按裸 id 取摘要，这条就红。
+    let cursor = v["sync"]["nextCursor"].as_str().expect("排空后仍要给游标").to_string();
+    let (s, v) = call(
+        app,
+        &format!("/api/v1/sessions/12345/messages?cursor={cursor}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "回退解析出的会话，其游标必须可用: {v}");
+    assert_eq!(v["sync"]["hasMore"], false);
 }
 
 #[tokio::test]
