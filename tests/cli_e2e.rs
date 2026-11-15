@@ -128,12 +128,13 @@ async fn pull(
         }));
     }
     if id == "win-talker" {
-        // 续页判据跟着 CLI 走：导出按**不透明游标**续拉，不再靠 offset ——
-        // 夹具必须认 `cursor=`，否则第二页永不出现（或第一页被反复重放）。
         let raw = q.unwrap_or_default();
-        let second = raw.split('&').any(|kv| kv == "cursor=win-page-2");
-        // 续页起点只用来给消息 id 分页编号（夹具原先从 offset 推得，游标模式没有 offset）。
-        let offset: usize = if second { 150 } else { 0 };
+        let offset: usize = raw
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("offset="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let second = offset > 0;
         let n = if second { 100 } else { 150 };
         let base = if second { 1_700_001_000 } else { 1_700_000_000 };
         let messages: Vec<Value> = (0..n)
@@ -150,9 +151,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {"hasMore": !second,
-                     "nextCursor": if second { json!(null) } else { json!("win-page-2") },
-                     "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
+            "sync": {"hasMore": !second, "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
         }));
     }
     let messages = if id == "gone-talker" {

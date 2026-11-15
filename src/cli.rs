@@ -768,19 +768,19 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             .enable_all()
             .build()
             .context("建 tokio 运行时失败")?;
-        let mut cursor: Option<String> = None;
+        // 这里**不**用进度游标续拉：本仓的游标只带一条 rowid 水位，没有 weflow 那边的
+        // 排除线与分片历史。首页用 `since` 定界、续页按入库序推进时，乱序入库的行
+        // （rowid 更小、时间更晚）会被水位跨过去——产物少几条消息且无从发现。等游标
+        // 补齐排除线再切，届时续拉才与时间窗等价。
+        let mut next_since = since_pull;
+        let mut next_offset = 0u64;
         // SDK 的回调要求它自己的错误类型，而这里真正会失败的是**写盘**：把写失败硬塞成
         // ClientError 会丢信息，所以错误先存起来、循环后立即上抛，后续页只跳过不再写
         // （半途而废的会话由 run 删掉，交给 --resume 重来）。
         let mut write_err: Option<anyhow::Error> = None;
         loop {
             let page = rt
-                .block_on(client.pull_page_cursor(
-                    &talker,
-                    cursor.as_deref(),
-                    since_pull,
-                    None,
-                ))
+                .block_on(client.pull_page(&talker, next_since, next_offset, None))
                 .map_err(anyhow::Error::new)?;
             if page.messages.is_empty() {
                 break;
@@ -823,18 +823,8 @@ fn run_export(a: &ExportArgs) -> Result<()> {
             if !page.sync.has_more {
                 break;
             }
-            // hasMore 却没有游标、或游标与本次请求的原样相同，都是本端形状判断的问题：
-            // 继续用旧游标会原地打转（同一页反复追加进产物、永不完成），当作排空
-            // 又会静默丢数据——两种都不能算成功。
-            match page.sync.next_cursor.clone() {
-                Some(next) if cursor.as_deref() == Some(next.as_str()) => anyhow::bail!(
-                    "会话 {talker} 的拉取面在 hasMore=true 时返回了与请求相同的游标（原地打转），导出中止"
-                ),
-                Some(next) => cursor = Some(next),
-                None => anyhow::bail!(
-                    "会话 {talker} 的拉取面在 hasMore=true 时没有给出 nextCursor"
-                ),
-            }
+            next_since = Some(page.sync.next_since);
+            next_offset = page.sync.next_offset;
         }
         match write_err {
             Some(e) => Err(e),

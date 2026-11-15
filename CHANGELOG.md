@@ -6,12 +6,8 @@
 
 ### 新增
 
-- **两个 SDK 补齐拉取面的游标续传**：`pull_page_cursor` / `drain_session_cursor` 原样回传服务端签发的 `sync.nextCursor`（给出游标时不再发 `since` / `offset`），Python 同步门面 `SyncClient` 同步提供两个入口。游标按入库序（rowid）翻页，与 `since` / `offset` 的时间序不同——那是 0.11.0 起服务端的权威进度模型，此前 SDK 完全没有入口。回归：`pull_cursor_page_sends_the_token_verbatim_and_drops_since`（Rust）、`test_pull_cursor_page_sends_the_token_verbatim`（Python）。
+- **两个 SDK 补齐拉取面的游标续传**：`pull_page_cursor` / `drain_session_cursor` 原样回传服务端签发的 `sync.nextCursor`（给出游标时不再发 `since` / `offset`），Python 同步门面 `SyncClient` 同步提供两个入口。游标按入库序（rowid）翻页，与 `since` / `offset` 的时间序不同——那是 0.11.0 起服务端的权威进度模型，此前 SDK 完全没有入口。回归：`pull_cursor_page_sends_the_token_verbatim_and_drops_since`（Rust）、`test_pull_cursor_page_sends_the_token_verbatim`（Python）。CLI 的批量导出仍走 `since` / `offset`：本仓游标只带一条 rowid 水位，没有排除线与分片历史，首页按时间窗定界、续页按入库序推进会跨过「rowid 更小、时间更晚」的乱序行，产物少几条而无人察觉；切游标等游标补齐排除线后另行处置。
 - **游标失效单独成一类错误**：409 且体里 `reason == "cursor_reset_required"` 时抛 `ClientError::CursorReset` / `CursorReset`（Python 侧继承 `StatusError`，只按状态码分支的旧调用方仍接得住），不再并进 `Status`。`drain_session_cursor` 把它原样上抛：循环已把先前的页交给回调，自动从头重来会重复交付、`total` 重复计数。回归：`drain_session_cursor_propagates_cursor_reset_without_restarting`（Rust）、`test_sync_client_drain_session_cursor_propagates_cursor_reset`（Python）。
-
-### 变更
-
-- **CLI 批量导出改走不透明游标续拉**：`export` 的会话翻页不再拼 `since` / `offset`，改用 `pull_page_cursor` 并原样回传 `nextCursor`；`hasMore=true` 却没有游标、或游标与本次请求相同即中止该会话——继续翻页会把同一页反复追加进产物、永不完成。`--since` 的含边界语义不变（首页仍传 `since - 1`）。回归：`export_writes_a_file_against_a_live_service`（夹具按 `cursor=` 出第二页）。
 
 ### 修复
 
