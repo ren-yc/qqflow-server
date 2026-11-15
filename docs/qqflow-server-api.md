@@ -639,18 +639,20 @@ curl -N "http://127.0.0.1:5032/chatlab/push/messages?access_token=<token>"
 **只读查询**：
 
 - 账号与就绪：`health()` / `accounts()` / `wait_ready()`
-- 消息：`pull_page()` / `drain_session()` / `list_messages()` / `chatlab_messages()`
+- 消息：`pull_page()` / `pull_page_cursor()` / `drain_session()` / `drain_session_cursor()` / `list_messages()` / `chatlab_messages()`
 - 其它面：`contacts()` / `group_members()` / `list_all_sessions()`
 - 媒体与推送：`media_bytes()` / `media_bytes_by_id()` / `watch()`
 
 **动作**：`register()`（非阻塞，返回原始 `state`/`status`）、`ensure_ready()`（注册 + 轮询，200 的拒绝态立即失败）、`sync_now()`（写动作，只有显式调用才触发）。
 
 - 一页语义 vs 取尽语义：`pull_page` / `list_messages` / `chatlab_messages` / `contacts` 只取一页；`drain_session` / `list_all_sessions` 内部翻页到 `hasMore=false`。
-- 游标必须原样回传：`pull_page` 的 `nextSince` / `nextOffset` 叠加会二次跳过同一批行。
-- 拉取面的游标失效（409 + `reason: "cursor_reset_required"`）当前归入 `Status`：两个 SDK 的游标续传方法（`pull_page_cursor` / `drain_session_cursor`）随契约 v0.11.0 的 pin 升级同批补齐，见仓库计划。
+- 游标必须原样回传：`pull_page` 的 `nextSince` / `nextOffset` 叠加会二次跳过同一批行；`pull_page_cursor` / `drain_session_cursor` 走不透明游标，给出游标时不发 `since` / `offset`。
+- 游标失效（409 + `reason: "cursor_reset_required"`）单独成一类错误：`ClientError::CursorReset` / `CursorReset`，不并进 `Status`。
+  - `drain_session_cursor` 把它**原样上抛**：循环已把先前的页交给回调，自动从头重来会重复交付已交付的页；从头拉一次并对已交付集合去重是调用方的事。
+  - 翻页中「下一游标为空或与请求游标相同」是形状错误，同样上抛（继续翻页会原地打转）。
 - `group_members` 的计数开关关闭时不发参数（不是发 `0`）；`list_all_sessions` 的 `page_size` 上限 10000。`media_bytes` 在 404 后按「先 `media=1` 导出再取」自动重试一次；`media_bytes_by_id` 不触发导出。
 - 重试时导出行按（平台消息 id、sender、timestamp）三元组定位：恰好一行用它的落盘名重试，零行报「导出页不含目标」，多行报「无法确定哪一行才是本条」。
 - `watch()` 的游标只在帧被消费时推进；只有 `id:` 没有 `data:` 的悬空帧不推进。类型与操作客户端由 `/openapi.json` 生成（`cargo run -p qqflow-regen` / `python scripts/regen.py`），生成物入库、CI 断言无 diff；不要手改生成物。
-- 行为层手写：`clients/rust/src/client.rs` 与 `clients/python/src/qqflow_sdk/client.py`。Python 另有 `SyncClient`，方法面与 `Client` 一一对应，内部跑专属事件循环线程。
+- 行为层手写：`clients/rust/src/client.rs` 与 `clients/python/src/qqflow_sdk/client.py`。Python 另有 `SyncClient`，方法面与 `Client` 一一对应（含两个游标入口），内部跑专属事件循环线程。
 - 错误按性质分派：HTTP 非 2xx → `Status`；连接/超时/重置/URL 解析失败 → `Transport`；JSON 合法但不合承诺形状 → `Shape`。
 - 超时按单次操作计时、有进展即复位，没有总时限：连接 5s、普通 JSON 请求 30s、成本由数据量决定的一族 90s（`group_members` 带计数、媒体取字节、`sync_now`、`watch`）。鉴权走 `Authorization: Bearer`；客户端从不把 token 放进 URL。

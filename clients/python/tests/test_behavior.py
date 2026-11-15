@@ -5,6 +5,7 @@ JSON the server's golden snapshots pin."""
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import queue
@@ -20,6 +21,7 @@ from qqflow_sdk import (
     STALL_TIMEOUT,
     Client,
     ClientError,
+    CursorReset,
     MessageEvent,
     NotReady,
     ShapeError,
@@ -44,6 +46,10 @@ class Mock:
         self.states: list[str] = []
         self.pull_pages: list[dict] = []
         self.pull_queries: list[dict] = []
+        #: Consulted per request before the page queue: None = serve a page,
+        #: (status, body) = answer that error instead. A cursor reset is a 409
+        #: with ``reason``, which the normal 200-shaped fixtures cannot express.
+        self.pull_errors: list[tuple[int, dict] | None] = []
         self.media_calls: list[str] = []
         self.export_calls: list[dict] = []
         self.export_status = 200
@@ -144,6 +150,13 @@ class Mock:
                     body = {"success": True, "accounts": [entry]}
             elif path.endswith("/messages") and path.startswith("/api/v1/sessions/"):
                 mock.pull_queries.append(query)
+                slot = mock.pull_errors.pop(0) if mock.pull_errors else None
+                if slot is not None:
+                    await send({"type": "http.response.start", "status": slot[0],
+                                "headers": [(b"content-type", b"application/json")]})
+                    await send({"type": "http.response.body",
+                                "body": json.dumps(slot[1]).encode()})
+                    return
                 if mock.pull_pages:
                     body = mock.pull_pages.pop(0)
                 else:
@@ -273,15 +286,17 @@ def make_sync_client(mock: Mock, monkeypatch) -> SyncClient:
     return SyncClient("http://mock", TOKEN)
 
 
-def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: int) -> dict:
+def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: int,
+              next_cursor: str | None = None) -> dict:
     return {
         "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
         "members": [],
         "messages": msgs,
         "meta": {"groupId": "", "name": "", "ownerId": "",
                  "platform": "qq", "type": "chat"},
-        "sync": {"hasMore": has_more, "nextSince": next_since,
-                 "nextOffset": next_offset, "watermark": 2000},
+        "sync": {"hasMore": has_more, "nextCursor": next_cursor,
+                 "nextSince": next_since, "nextOffset": next_offset,
+                 "watermark": 2000},
     }
 
 
@@ -354,6 +369,80 @@ async def test_pull_page_omits_defaulted_cursors_instead_of_sending_zero() -> No
     client = make_client(mock)
     await client.pull_page("alice", None)
     assert mock.pull_queries[0] == {}
+    await client.aclose()
+
+
+# ---- opaque progress cursor (v2) -----------------------------------------
+
+
+async def test_pull_cursor_page_sends_the_token_verbatim() -> None:
+    """The token must ride the wire verbatim: parsing it copies the server model."""
+    mock = Mock()
+    mock.pull_pages = [pull_page([], False, 0, 0, next_cursor="c1")]
+    client = make_client(mock)
+    await client.pull_page_cursor("alice", "djIudG9r", since=1700000000)
+    assert mock.pull_queries[0] == {"cursor": "djIudG9r"}
+    await client.aclose()
+
+
+async def test_drain_session_cursor_propagates_cursor_reset_without_restarting() -> None:
+    """A reset is raised as-is: pages already handed to ``on_page`` cannot be
+    revoked, and silently restarting would deliver them twice."""
+    mock = Mock()
+    mock.pull_errors = [
+        None,
+        (409, {"success": False, "code": 409, "message": "游标已失效",
+               "reason": "cursor_reset_required"}),
+    ]
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+    ]
+    client = make_client(mock)
+    pages: list[list[int]] = []
+    with pytest.raises(CursorReset):
+        await client.drain_session_cursor(
+            "alice", None,
+            lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+        )
+    # Only the page before the 409 was delivered; no further request, no replay.
+    assert pages == [[1]]
+    assert len(mock.pull_queries) == 2, mock.pull_queries
+    # Request order: cursor-less first page (200) -> cursor echo (409).
+    assert "cursor" not in mock.pull_queries[0], "the first page must not carry a cursor"
+    assert mock.pull_queries[1] == {"cursor": "c1"}, "the reset lands on the echo request"
+    await client.aclose()
+
+
+async def test_drain_session_cursor_rejects_a_non_advancing_cursor() -> None:
+    """``hasMore=true`` with a next cursor equal to the request cursor would
+    spin forever, handing the same page to ``on_page`` over and over."""
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+    ]
+    client = make_client(mock)
+    pages: list[list[int]] = []
+    with pytest.raises(ShapeError):
+        await client.drain_session_cursor(
+            "alice", None,
+            lambda batch: pages.append([int(m.platform_message_id) for m in batch]),
+        )
+    # The looping page must not be delivered; one request beyond the first.
+    assert pages == [[1]]
+    assert len(mock.pull_queries) == 2, mock.pull_queries
+    await client.aclose()
+
+
+async def test_plain_409_without_the_reason_is_not_a_cursor_reset() -> None:
+    """A 409 without ``reason`` is not a restart signal: raise it as-is."""
+    mock = Mock()
+    mock.pull_errors = [(409, {"success": False, "code": 409, "message": "目标不唯一"})]
+    client = make_client(mock)
+    with pytest.raises(StatusError) as caught:
+        await client.pull_page_cursor("alice", "djIudG9r")
+    assert not isinstance(caught.value, CursorReset)
+    assert caught.value.status == 409
     await client.aclose()
 
 
@@ -1668,6 +1757,117 @@ def test_sync_client_drain_session_runs_callbacks_on_the_caller_thread(monkeypat
     assert all(ident == caller for ident, _ in seen), "on_page must stay on the caller thread"
     assert mock.pull_queries[0] == {"since": "500"}
     assert mock.pull_queries[1] == {"since": "1000", "offset": "7"}
+
+
+def test_sync_client_pull_page_cursor_sends_the_token_verbatim(monkeypatch) -> None:
+    mock = Mock()
+    mock.pull_pages = [pull_page([], False, 0, 0, next_cursor="c1")]
+    client = make_sync_client(mock, monkeypatch)
+    try:
+        page = client.pull_page_cursor("alice", "djIudG9r", since=1700000000)
+    finally:
+        client.close()
+    assert page.sync.next_cursor == "c1"
+    # The token rides the wire verbatim and ``since`` is *not* sent with it: the
+    # server treats a given cursor as the authoritative start.
+    assert mock.pull_queries[0] == {"cursor": "djIudG9r"}
+
+
+def test_sync_client_drain_session_cursor_runs_callbacks_on_the_caller_thread(monkeypatch) -> None:
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 990), msg(2, 1000)], True, 1000, 7, next_cursor="c1"),
+        pull_page([msg(3, 1500)], False, 2000, 0, next_cursor="c2"),
+    ]
+    client = make_sync_client(mock, monkeypatch)
+    caller = threading.get_ident()
+    seen: list[tuple[int, list[str]]] = []
+    try:
+        total = client.drain_session_cursor(
+            "alice",
+            None,
+            lambda batch: seen.append(
+                (threading.get_ident(), [str(m.platform_message_id) for m in batch])
+            ),
+        )
+    finally:
+        client.close()
+    assert total == 3
+    assert [ids for _, ids in seen] == [["1", "2"], ["3"]]
+    assert all(ident == caller for ident, _ in seen), "on_page must stay on the caller thread"
+    assert "cursor" not in mock.pull_queries[0], "the first page must not carry a cursor"
+    assert mock.pull_queries[1] == {"cursor": "c1"}
+
+
+def test_sync_client_drain_session_cursor_propagates_cursor_reset(monkeypatch) -> None:
+    mock = Mock()
+    mock.pull_errors = [
+        None,
+        (409, {"success": False, "code": 409, "message": "游标已失效",
+               "reason": "cursor_reset_required"}),
+    ]
+    mock.pull_pages = [pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1")]
+    client = make_sync_client(mock, monkeypatch)
+    pages: list[list[str]] = []
+    try:
+        with pytest.raises(CursorReset):
+            client.drain_session_cursor(
+                "alice", None,
+                lambda batch: pages.append([str(m.platform_message_id) for m in batch]),
+            )
+    finally:
+        client.close()
+    # No silent restart: the page before the 409 is delivered once, and the
+    # reset lands on the request that echoes the cursor.
+    assert pages == [["1"]]
+    assert len(mock.pull_queries) == 2, mock.pull_queries
+    assert mock.pull_queries[1] == {"cursor": "c1"}
+
+
+def test_sync_client_drain_session_cursor_rejects_a_non_advancing_cursor(monkeypatch) -> None:
+    mock = Mock()
+    mock.pull_pages = [
+        pull_page([msg(1, 1000)], True, 1000, 0, next_cursor="c1"),
+        pull_page([msg(2, 1000)], True, 1000, 0, next_cursor="c1"),
+    ]
+    client = make_sync_client(mock, monkeypatch)
+    pages: list[list[str]] = []
+    try:
+        with pytest.raises(ShapeError):
+            client.drain_session_cursor(
+                "alice", None,
+                lambda batch: pages.append([str(m.platform_message_id) for m in batch]),
+            )
+    finally:
+        client.close()
+    # The looping page is rejected before delivery; the send stops there.
+    assert pages == [["1"]]
+    assert len(mock.pull_queries) == 2, mock.pull_queries
+
+
+def test_sync_client_surface_mirrors_client() -> None:
+    """Every public coroutine of ``Client`` has a same-named ``SyncClient`` entry.
+
+    The facade's docstring promises a one-to-one surface and nothing checked it:
+    an entry could land on ``Client`` alone and no caller would notice, because
+    the plugins that consume this SDK never call the sync face. Reflection turns
+    the promise into a failing test the moment the next entry is added to one
+    side only.
+    """
+    async_entries = {
+        name
+        for name, value in vars(Client).items()
+        if not name.startswith("_") and inspect.iscoroutinefunction(value)
+    }
+    sync_entries = {
+        name for name in vars(SyncClient) if not name.startswith("_")
+    }
+    # ``aclose`` does not carry over: the loop-owning side tears down its thread
+    # as well, and calls that ``close``. ``watch`` is an async generator on
+    # ``Client`` and a plain iterator here, so it is absent from the first set.
+    missing = sorted(async_entries - {"aclose"} - sync_entries)
+    assert not missing, f"SyncClient is missing Client entries: {missing}"
+    assert sync_entries - async_entries == {"close", "watch"}
 
 
 def test_sync_client_wait_ready_timeout_names_the_last_state(monkeypatch) -> None:

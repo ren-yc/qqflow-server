@@ -128,6 +128,7 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
   - `ensure_ready` 把注册应答的 200 拒绝态（`account_conflict` / `invalid_key` / `invalid_db_path` / `unknown_qq`）映射成 `StatusError` 快速失败。
   - `watch` 单连接连续产出多帧：字节级 LF 分帧、1 MiB 缓冲上限、单帧解码失败跳过不杀流、EOF 冲刷未终结残行、退避仅在干净结束时复位。
   - `MessageEvent` 携带 `event` 字段（载荷缺省时回落帧头事件名），`message.new` 与 `message.revoke` 可区分——这两个载荷不在描述 schema 里，由行为层解码。
+  - `SyncClient` 是 `Client` 的同步门面：方法面一一对应由 `test_sync_client_surface_mirrors_client` 反射校验。缺这条校验时，新入口可以只落在异步侧而无人察觉——没有调用方失败，也就没有测试失败。两个游标入口的形状守卫（下一游标为空或不推进）由 `_advanced_cursor` 单点提供，异步与同步两条循环不会各自作答。
 - **`clients/ts`**：TypeScript 示例客户端（仅示例，不发布 npm）。演示级子集；配套 `stub-server.mjs` 可无真实服务跑 smoke。不进 CI 产物矩阵。
 
 分层的理由：描述文档只声明「形状」，不声明「翻页到什么时候停、断线后从哪续」——后者是行为，生成不出来。SDK 不反依赖服务端 crate：只依赖 `reqwest`，对 API 的耦合全部在「描述 → 生成」这一步。

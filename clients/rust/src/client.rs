@@ -49,6 +49,16 @@ pub enum ClientError {
         /// Request URL, for the operator reading the log.
         url: String,
     },
+    /// 服务端说这条进度游标已经失效（409 + `reason: "cursor_reset_required"`）。
+    ///
+    /// 处置是**丢弃游标、从头拉一次**，不是重试同一条游标——重试会一直 409。
+    /// 单列一个变体而不是并进 [`ClientError::Status`]：上层若只能看到状态码，
+    /// 就只能靠猜来决定「重拉」还是「报错」。
+    #[error("{url}: cursor is no longer valid; restart the pull without a cursor")]
+    CursorReset {
+        /// Request URL.
+        url: String,
+    },
     /// Transport-level failure (connect, timeout, reset).
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
@@ -437,6 +447,17 @@ impl Client {
     async fn decode<T: DeserializeOwned>(resp: reqwest::Response, url: &str) -> Result<T> {
         let status = resp.status();
         if !status.is_success() {
+            // 409 + `reason` 是**可处置**的冲突：读一次体把原因认出来，别让上层
+            // 只能按状态码猜。体读失败就按普通 Status 处理。
+            let body = resp.bytes().await.unwrap_or_default();
+            if status.as_u16() == 409 {
+                let reason = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string));
+                if reason.as_deref() == Some("cursor_reset_required") {
+                    return Err(ClientError::CursorReset { url: url.to_string() });
+                }
+            }
             return Err(ClientError::Status { status: status.as_u16(), url: url.to_string() });
         }
         // 先拿字节、再单独解码：`resp.json::<T>()` 把**解码失败**也包成 reqwest::Error，
@@ -657,6 +678,94 @@ impl Client {
         }
         self.get_json(&format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)), &q)
             .await
+    }
+
+    /// 用**不透明进度游标**取一页（`cursor` 给出时服务端忽略 `since`/`offset`）。
+    ///
+    /// 游标必须原样回传：解析它等于把服务端的进度模型抄一份到客户端，服务端
+    /// 换代（v2 起绑定进程/账号/会话/数据源世代）后那份实现就错了。
+    pub async fn pull_page_cursor(
+        &self,
+        talker: &str,
+        cursor: Option<&str>,
+        since: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<gen_types::PullEnvelope> {
+        let mut q = BTreeMap::new();
+        match cursor {
+            Some(c) => {
+                q.insert("cursor", c.to_string());
+            }
+            None => {
+                if let Some(s) = since {
+                    q.insert("since", s.to_string());
+                }
+            }
+        }
+        if let Some(l) = limit {
+            q.insert("limit", l.to_string());
+        }
+        self.get_json(&format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)), &q)
+            .await
+    }
+
+    /// 用不透明游标把一个会话排空；游标**原样**回传（`sync.nextCursor`）。
+    ///
+    /// 收到 [`ClientError::CursorReset`] 时**直接上抛**：本循环已经把先前的页交给
+    /// 了 `on_page`，没有任何撤销回调结果或通知调用方清空结果的机制——在已交付
+    /// 之后静默从头重来，追加式调用方会拿到重复记录，`total` 也会重复计数。失效
+    /// 的处置（从头拉一次、对已交付集合去重）是**调用方**的事：它知道自己怎么
+    /// 消费这些页。
+    ///
+    /// 服务端返回的下一游标为空或**与本次请求的游标相同**都是形状错误：继续翻页
+    /// 会原地打转、把同一页反复交给 `on_page`。两者都以错误终止，而不是猜测。
+    pub async fn drain_session_cursor<F>(
+        &self,
+        talker: &str,
+        since: Option<i64>,
+        mut on_page: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(&[gen_types::PullMessage]) -> Result<()>,
+    {
+        let mut cursor: Option<String> = None;
+        let mut total = 0u64;
+        loop {
+            let page = self
+                .pull_page_cursor(talker, cursor.as_deref(), since, None)
+                .await?;
+            if !page.sync.has_more {
+                total += page.messages.len() as u64;
+                on_page(&page.messages)?;
+                return Ok(total);
+            }
+            // 形状守卫在**交付之前**：hasMore=true 却不推进游标（缺失，或原样回环）
+            // 时，继续翻页只会原地打转、把同一页反复交给 `on_page`。先把这一页的
+            // 形状判完，再决定交付与续页——被拒页不进回调。
+            let next = match page.sync.next_cursor.clone() {
+                None => {
+                    // 服务端在没有排空的情况下不给游标，是本端形状判断的问题：
+                    // 继续用旧游标会原地打转，静默退出又会丢数据。
+                    return Err(ClientError::UnexpectedBody {
+                        url: format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)),
+                        detail: "sync.hasMore=true but sync.nextCursor is absent".to_string(),
+                    });
+                }
+                Some(next) if cursor.as_deref() == Some(next.as_str()) => {
+                    return Err(ClientError::UnexpectedBody {
+                        url: format!("/api/v1/sessions/{}/messages", encode_path_segment(talker)),
+                        detail: format!(
+                            "sync.nextCursor did not advance beyond the request cursor \
+                             (hasMore=true would loop forever): {next}"
+                        ),
+                    });
+                }
+                Some(next) => next,
+            };
+            total += page.messages.len() as u64;
+            on_page(&page.messages)?;
+            cursor = Some(next);
+        }
     }
 
     /// Drain one session through the ChatLab Pull cursor loop, calling

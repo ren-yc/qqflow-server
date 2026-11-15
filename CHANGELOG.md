@@ -2,6 +2,21 @@
 
 本文件记录 qqflow-server 的版本变更，自 v0.5.0 起维护。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.11.1] - 2026-11-15
+
+### 新增
+
+- **两个 SDK 补齐拉取面的游标续传**：`pull_page_cursor` / `drain_session_cursor` 原样回传服务端签发的 `sync.nextCursor`（给出游标时不再发 `since` / `offset`），Python 同步门面 `SyncClient` 同步提供两个入口。游标按入库序（rowid）翻页，与 `since` / `offset` 的时间序不同——那是 0.11.0 起服务端的权威进度模型，此前 SDK 完全没有入口。回归：`pull_cursor_page_sends_the_token_verbatim_and_drops_since`（Rust）、`test_pull_cursor_page_sends_the_token_verbatim`（Python）。
+- **游标失效单独成一类错误**：409 且体里 `reason == "cursor_reset_required"` 时抛 `ClientError::CursorReset` / `CursorReset`（Python 侧继承 `StatusError`，只按状态码分支的旧调用方仍接得住），不再并进 `Status`。`drain_session_cursor` 把它原样上抛：循环已把先前的页交给回调，自动从头重来会重复交付、`total` 重复计数。回归：`drain_session_cursor_propagates_cursor_reset_without_restarting`（Rust）、`test_sync_client_drain_session_cursor_propagates_cursor_reset`（Python）。
+
+### 变更
+
+- **CLI 批量导出改走不透明游标续拉**：`export` 的会话翻页不再拼 `since` / `offset`，改用 `pull_page_cursor` 并原样回传 `nextCursor`；`hasMore=true` 却没有游标、或游标与本次请求相同即中止该会话——继续翻页会把同一页反复追加进产物、永不完成。`--since` 的含边界语义不变（首页仍传 `since - 1`）。回归：`export_writes_a_file_against_a_live_service`（夹具按 `cursor=` 出第二页）。
+
+### 修复
+
+- **翻页拒绝不推进的游标**：`hasMore=true` 且下一游标为空或与请求游标相同时判为形状错误，并在**交付前**判定，同一页不再反复交给 `on_page`。回归：`drain_session_cursor_rejects_a_non_advancing_cursor`（Rust）、`test_drain_session_cursor_rejects_a_non_advancing_cursor`（Python）。
+
 ## [0.11.0] - 2026-11-14
 
 ### 新增
