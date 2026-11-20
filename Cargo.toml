@@ -12,7 +12,7 @@ async-stream = { version = "0.3", optional = true }
 axum = { version = "0.8", optional = true }
 base64 = "0.22"
 chrono = "0.4"
-dirs = "6"
+dirs = "7"
 keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "linux-native"] }
 parking_lot = "0.12"
 rand = "0.8"
