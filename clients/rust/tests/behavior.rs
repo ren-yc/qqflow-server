@@ -1305,6 +1305,41 @@ async fn drain_session_cursor_rejects_a_non_advancing_cursor() {
     assert_eq!(queries.len(), 2, "{queries:?}");
 }
 
+/// 游标第二段不应用窗口：页里夹着早于 `since` 的回溯行时，排空循环必须在交给
+/// `on_page` 之前丢掉它们，`total` 也只能数实际交付的条数——否则调用方会拿到、
+/// 也会计到它没要的时间段。
+#[tokio::test]
+async fn drain_session_cursor_drops_rows_below_the_since_bound() {
+    let mock = Mock::default();
+    *mock.pull_pages.lock().unwrap() = vec![
+        serde_json::json!({
+            "chatlab": {"version": "1", "generator": "mock", "exportedAt": 1},
+            "members": [],
+            "messages": [
+                {"accountName":"","content":"in","groupNickname":"","platformMessageId":"in-1",
+                 "sender":"alice","timestamp":1700000530,"type":0},
+                {"accountName":"","content":"out","groupNickname":"","platformMessageId":"out-1",
+                 "sender":"alice","timestamp":1700000400,"type":0},
+            ],
+            "meta": {"groupId": "", "name": "", "ownerId": "", "platform": "qq", "type": "chat"},
+            "sync": {"hasMore": false, "nextSince": 1700000530, "nextOffset": 0, "nextCursor": "c1", "watermark": 1700000530},
+        }),
+    ];
+    let base = spawn_mock(mock.clone()).await;
+    let client = Client::new(&base, TOKEN);
+
+    let mut delivered: Vec<String> = Vec::new();
+    let total = client
+        .drain_session_cursor("alice", Some(1_700_000_500), |page| {
+            delivered.extend(page.iter().map(|m| m.platform_message_id.clone()));
+            Ok(())
+        })
+        .await
+        .expect("排空应成功");
+    assert_eq!(delivered, vec!["in-1".to_string()], "窗口外的行不得交付：{delivered:?}");
+    assert_eq!(total, 1, "计数只能是实际交付的条数");
+}
+
 /// 没有 `reason` 的 409 不是「重拉」信号：照旧当错误上抛，别把真冲突吞成重试。
 #[tokio::test]
 async fn plain_409_without_the_reason_stays_a_status_error() {

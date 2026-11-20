@@ -358,10 +358,23 @@ v0.6.1 至 v0.6.6 都是纯文档 tag，v0.7.0 新增跨仓文档模板；v0.8.0
 
 游标是**不透明的身份绑定串**：客户端原样回传，失效时响亮失败，绝不静默退回时间模式。
 
-- 载荷是本进程 nonce、账号摘要、注册代次、数据源世代、会话摘要与最后交付的 rowid。
-  - 会话摘要绑**解析后**的 `(chat_type, talker)` 而不是裸 id：`find_conversation` 的类型回退让两个裸 id 落到同一个会话，它们必须编出同一条线。回归 `chatlab_pull_cursor_v2_reset_semantics`。
-- 失效分两档：语法坏或版本未知是 400；v1 旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
+- 载荷是本进程 nonce、账号摘要、注册代次、数据源世代、会话摘要，加上**两段式进度**：段号、第一段的时间键位置、各分片的行标识边界、窗口下界。
+  - 边界是「链开始时该分片**已索引**行的最大行标识」：第一段只交付这些行里窗口内的部分，第二段按行标识补发其后的行。本仓一个会话恒落一张表，分片维度恒为 1（分片号取表名摘要），保留它只为与另一端逐字对应。
+  - 两段为什么必须分开：首页按时间键交付、续页若只按行标识过滤，两种序下的已交付集合互不为前缀，时间更晚而行标识更小的行会被跨过去、永不交付。回归 `cursor_snapshot_is_frozen_while_new_rows_wait` 与契约用例 `cursor-window-drain-equals-single-page`。
+  - 快照取已索引上界而不是库文件上界：索引事后补齐的行行标识必然更大、落第二段；取库文件上界会把它们冻在第一段里又被键过滤掉。第一段**不推进**这个边界。
+  - 第二段不应用窗口，它承载的是「链开始后入库的行可达」；需要严格窗口的调用方在落盘前自行丢弃。回归 `cursor_continuation_is_monotonic_when_row_order_diverges_from_time_order`。
+  - 段切换只在一处判：**`end` 视作无上界时第一段也为空**才切。被 `end` 挡住不算耗尽——那些行键大于位置，客户端抬高 `end` 后照样交付。回归 `cursor_end_window_does_not_freeze_the_chain`。
+  - 会话摘要绑**解析后**的 `(chat_type, talker)`，不是请求里的裸 id：类型回退让同一个裸 id 落到某个会话时，两次请求必须编出同一条线。
+  - 回归 `all_digit_c2c_talker_resolves_via_fallback`（同一 id 取游标、续拉接着交付）与 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
+- 失效分两档：语法坏或版本未知是 400；v1 / v2 旧格式、跨进程、跨账号、跨会话、注册代次或数据源世代不符是 409 加 `reason: "cursor_reset_required"`。
   - 判据只看身份不看内容：QQ 的追加写入与 WAL checkpoint 都不改变身份线索，放进判据等于让游标每次新消息都失效。回归 `every_identity_mismatch_is_a_reset_not_a_silent_restart`。
+- **编码与解码的长度上限同源**：解码拒收超限游标（400），编码按同一上限换算预算、放不下就**拒绝签发**（500）。回归 `progress_beyond_the_budget_is_refused_not_issued`、`issued_cursor_never_exceeds_the_length_ceiling`。
+- **同一条游标被重放是 at-least-once**：服务端不保存「谁消费过这条游标」。第二段按重放时已入索引的行筛选，两次重放之间有新行入库时，两次拿到的页与后继游标可能不同。
+- **要「恰好一次」，落盘与存游标必须原子**：只串行化一条链只消除并发重放——落盘之后、存游标之前崩溃，重启会以旧游标重拉同一页。另一条路是按 `(timestamp, sender, platformMessageId)` 去重（`platformMessageId` 单独不是全局唯一身份：不同来源表可以重复）。
+- **跨版本升级时进行中的链一律作废**：新版把 v1 / v2 判成 409（可重拉），旧版对新格式只能判 400（不是 reset 信号，客户端不会重来）。升级 0.12.0 时让在跑的批量导出重跑，而不是让一条链跨在两个版本上。
+- **`hasMore` 说的是「本页之后还有要交付的行」，不是「第二段还有行」**：第一段没走完（页被 `limit` 或秒组切开）时为真，第一段走完但第二段有行时也为真；被 `end` 挡住的第一段行不算「还有」。
+- 因此首页 `hasMore=true` 不意味第二段有数据，`hasMore=false` 也不意味「不会再有新行」——活库持续入库时下一条链照样交付。
+- **行标识被源端复用时会跨过一行**：第二段的水位判据是 `rowid > 水位`，源删掉最大行标识后又插入一条正好复用它时，那条新行不满足判据。身份线索不含行标识，所以这种情况不会触发 409，只能靠上游不要复用行标识。
 - 数据源世代由同步侧每轮采样推进（`db/source_identity.rs`），基线在建索引完成后立一次——没有基线时首个新消息触发的采样会把「建索引时的文件」当首次 sighting，换库窗口被吞掉。回归 `replacing_the_database_changes_the_fingerprint`。
 - 换库（轮询采样发现身份变化）后**增量续读必须停止**：旧水位线属于旧文件的行号空间，替换库中 rowid 不超过它的行会被永久滤掉，且现有连接可能仍指向旧文件。账号转 Error 待重注册——重注册即全量重建，是唯一能兑现「新库、新水位线」的路径。回归 `source_replacement_flips_the_account_to_error`。
 - 构建期换库同样不能装：基线绑定**构建时**的文件，安装前在同一临界区内复查指纹，不一致（或采样失败=无法证明未变）丢弃本次索引、账号转 Error。基线若在构建完成后才采，构建期间换库时 store 里是 A 的数据、基线却记成 B，换库被整个吞掉。回归 `build_time_source_replacement_discards_the_index`。

@@ -21,6 +21,11 @@ const TOKEN: &str = "e2e-token-0123456789abcdef";
 /// 群号（`type: 2`）：导出要据此决定 meta 的 `type`，而本仓无法从 talker 反推会话类型。
 const TALKER: &str = "90001";
 
+/// `ooo-talker` 的请求流水（查询串）：`export_with_since_drives_the_cursor_not_the_offset_chain`
+/// 用它钉「第二页带 cursor、不带 offset」。只有那条 e2e 会碰这个会话，因此不必加锁隔离。
+static OOO_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+
 /// Record legacy window requests so targeted restoration can assert none occur.
 /// Concurrent tests use separate conversation IDs before comparing records.
 static WINDOW_QUERIES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
@@ -129,29 +134,165 @@ async fn pull(
     }
     if id == "win-talker" {
         let raw = q.unwrap_or_default();
-        let offset: usize = raw
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("offset="))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let second = offset > 0;
-        let n = if second { 100 } else { 150 };
-        let base = if second { 1_700_001_000 } else { 1_700_000_000 };
+        // 游标链：`w1` 是第二页（150→100），再往后是空页。CLI 必须原样回传
+        // `nextCursor`；按 offset 续拉会拿到同一页（假游标判据见下面的 ooo-talker）。
+        let has = |c: &str| raw.split('&').any(|kv| kv == c);
+        let (n, base, page_offset, next_cursor, more) = if has("cursor=w2") {
+            (0usize, 1_700_001_000i64, 250usize, "w3", false)
+        } else if has("cursor=w1") {
+            (100usize, 1_700_001_000, 150, "w2", true)
+        } else {
+            (150usize, 1_700_000_000, 0, "w1", true)
+        };
         let messages: Vec<Value> = (0..n)
             .map(|k| {
                 let mut m = pull_message();
-                m["platformMessageId"] = json!(format!("w{offset}-{k}"));
+                m["platformMessageId"] = json!(format!("w{page_offset}-{k}"));
                 m["timestamp"] = json!(base + (k as i64 / 50));
                 m["media"] = json!({"fileName": format!("{:032x}.png", k), "type": "image"});
                 m
             })
             .collect();
-        let next_ts = base + ((n as i64 - 1) / 50);
+        let next_ts = base + ((n as i64 - 1).max(0) / 50);
         return Json(json!({
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {"hasMore": !second, "nextSince": next_ts, "nextOffset": if second { 0 } else { 150 }, "watermark": next_ts},
+            "sync": {"hasMore": more, "nextCursor": next_cursor, "nextSince": next_ts,
+                     "nextOffset": 0, "watermark": next_ts},
+        }));
+    }
+    if id == "leak-talker" {
+        // 第一页正文带访问令牌（写入即触发泄露中止），第二页回一个缺字段的 200：
+        // 旧实现把写错误存起来继续取数，这个取数失败会把泄露错误盖掉、整轮不中止。
+        let raw = q.unwrap_or_default();
+        if raw.split('&').any(|kv| kv == "cursor=leak1") {
+            return Json(json!({"unexpected": "缺 messages 的响应，客户端必须按取数失败处理"}));
+        }
+        let mut m = pull_message();
+        m["platformMessageId"] = json!("leak-1");
+        m["content"] = json!(format!("正文里混进了令牌 {TOKEN}"));
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": [m],
+            "meta": {"groupId": TALKER, "name": "泄露会话", "ownerId": "", "platform": "qq", "type": "private"},
+            "sync": {
+                "hasMore": true, "nextCursor": "leak1",
+                "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000,
+            },
+        }));
+    }
+    if id == "ooo-window-talker" {
+        // 首页**按 since 过滤**（真服务的第一段就是排他窗口），续页故意不理会 since
+        // （真服务的第二段是宽口径）。这样「客户端有没有把 --since 折成 since - 1」
+        // 才会被这条用例发现：发 509 时首页带回 ooo-c（ts 恰等于 --since），发 510 就带不回。
+        let raw = q.unwrap_or_default();
+        let has = |c: &str| raw.split('&').any(|kv| kv == c);
+        let since: Option<i64> = raw
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("since="))
+            .and_then(|v| v.parse().ok());
+        let rows: Vec<(&str, i64)> = if has("cursor=w2") {
+            Vec::new()
+        } else if has("cursor=w1") {
+            vec![("ooo-b", 1_700_000_520), ("ooo-d", 1_700_000_400)]
+        } else {
+            [("ooo-a", 1_700_000_530i64), ("ooo-c", 1_700_000_510)]
+                .into_iter()
+                .filter(|(_, ts)| since.is_none_or(|s| *ts > s))
+                .collect()
+        };
+        let messages: Vec<Value> = rows
+            .iter()
+            .map(|(mid, ts)| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(mid);
+                m["timestamp"] = json!(ts);
+                m
+            })
+            .collect();
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": TALKER, "name": "窗口会话", "ownerId": "", "platform": "qq", "type": "private"},
+            "sync": {
+                "hasMore": !has("cursor=w2"),
+                "nextCursor": if has("cursor=w1") { "w2" } else { "w1" },
+                "nextSince": 1_700_000_530, "nextOffset": 0, "watermark": 1_700_000_530,
+            },
+        }));
+    }
+    if id == "ooo-talker" {
+        // 时间序与交付序分叉：第二页给的是**时间更早**的行（真服务里它们来自入库补发段）。
+        // 整条链共 4 行，分两页交付，第三页为空页收尾。
+        //
+        // 桩**不理会 `since`**：真服务的第二段就是宽口径（不应用窗口），窗口的严格性由
+        // 调用方在落盘前保证。这正是下面两条 e2e 要钉的东西。
+        //
+        // 两个会话 id 而不是一个：两条用例并行跑，共用一条请求流水会互相污染。
+        let raw = q.unwrap_or_default();
+        // 请求流水：断言「第二页带 cursor、不带 offset」用它。只有 ooo-talker 那条会读。
+        if id == "ooo-talker"
+            && let Ok(mut seen) = OOO_REQUESTS.lock()
+        {
+            seen.push(raw.clone());
+        }
+        let has = |c: &str| raw.split('&').any(|kv| kv == c);
+        let rows: Vec<(&str, i64)> = if has("cursor=ooo2") {
+            Vec::new()
+        } else if has("cursor=ooo1") {
+            vec![("ooo-c", 1_700_000_510), ("ooo-d", 1_700_000_400)]
+        } else {
+            vec![("ooo-a", 1_700_000_530), ("ooo-b", 1_700_000_520)]
+        };
+        let messages: Vec<Value> = rows
+            .iter()
+            .map(|(mid, ts)| {
+                let mut m = pull_message();
+                m["platformMessageId"] = json!(mid);
+                m["timestamp"] = json!(ts);
+                m
+            })
+            .collect();
+        let next_cursor = if has("cursor=ooo1") { "ooo2" } else { "ooo1" };
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": TALKER, "name": "分叉会话", "ownerId": "", "platform": "qq", "type": "private"},
+            "sync": {
+                "hasMore": !has("cursor=ooo2"),
+                "nextCursor": next_cursor,
+                "nextSince": 1_700_000_530, "nextOffset": 0, "watermark": 1_700_000_530,
+            },
+        }));
+    }
+    if id == "ooo-empty-talker" {
+        // 首屏是**空页 + hasMore=true**：这就是服务端「第一段耗尽、第二段还有行」的
+        // 结算形态。按「空页即结束」收尾的导出会把后面那段静默截断。
+        let raw = q.unwrap_or_default();
+        let second = raw.split('&').any(|kv| kv == "cursor=e1");
+        let messages: Vec<Value> = if second {
+            [("e-a", 1_700_000_520i64), ("e-b", 1_700_000_510)]
+                .iter()
+                .map(|(mid, ts)| {
+                    let mut m = pull_message();
+                    m["platformMessageId"] = json!(mid);
+                    m["timestamp"] = json!(ts);
+                    m
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Json(json!({
+            "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
+            "members": [], "messages": messages,
+            "meta": {"groupId": TALKER, "name": "结算页会话", "ownerId": "", "platform": "qq", "type": "private"},
+            "sync": {
+                "hasMore": !second,
+                "nextCursor": if second { "e2" } else { "e1" },
+                "nextSince": 1_700_000_520, "nextOffset": 0, "watermark": 1_700_000_520,
+            },
         }));
     }
     let messages = if id == "gone-talker" {
@@ -442,6 +583,138 @@ async fn every_subcommand_works_against_a_live_service() {
     // 键名在场不等于值被转发：解析出来断言**值**（`--json` 是美化输出，字符串比较会依赖空格）。
     let v: Value = serde_json::from_str(&run(&base, &["sync", "--json"]).1).expect("--json 应是 JSON");
     assert_eq!(v["newMessages"], json!(1), "sync 应转发服务端给的新消息数: {v}");
+}
+
+/// 读导出目录里唯一那份 jsonl。
+fn exported_body(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(
+        std::fs::read_dir(dir)
+            .expect("导出目录应存在")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .expect("应写出 jsonl"),
+    )
+    .expect("jsonl 应可读")
+}
+
+/// `--since` 导出必须**逐页回传游标**：桩把时间更早的行放在第二页，只有真的跟着
+/// `nextCursor` 走才拿得到。请求流水同时钉住「第二页带 `cursor`、不带 `offset`」——
+/// 按 offset 续拉的实现会拿到重复页，产物里出现重复行。
+/// `--since` 取 1700000300（严格小于桩里最早那行的 1700000400）：这一条测的是
+/// 「链能不能走到底」，窗口边界由 `export_with_since_drops_out_of_window_rows` 钉。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_with_since_drives_the_cursor_not_the_offset_chain() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("qqflow-e2e-ooo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Ok(mut seen) = OOO_REQUESTS.lock() {
+        seen.clear();
+    }
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl",
+          "--session", "ooo-talker", "--since", "1700000300"],
+    );
+    assert_eq!(code, 0, "分叉会话导出应退出 0；stdout: {stdout} stderr: {stderr}");
+    let body = exported_body(&dir);
+    let messages = body.matches("\"_type\":\"message\"").count();
+    assert_eq!(messages, 4, "两页四行都要落盘（时间序分叉不得少行）：{body}");
+    for mid in ["ooo-a", "ooo-b", "ooo-c", "ooo-d"] {
+        // 只数行数与「有没有出现」挡不住「重复一条、少一条」：逐条钉次数。
+        assert_eq!(body.matches(mid).count(), 1, "{mid} 必须恰好出现一次（重复行也是缺陷）：{body}");
+    }
+    // 导出物保持交付序：第二页的行（时间更早）落在首页的行之后，不做二次排序。
+    let pos_c = body.find("ooo-c").expect("ooo-c 在场");
+    let pos_a = body.find("ooo-a").expect("ooo-a 在场");
+    assert!(pos_a < pos_c, "导出物应按交付序排列，不得按时间重排：{body}");
+
+    let seen = OOO_REQUESTS.lock().map(|v| v.clone()).unwrap_or_default();
+    assert_eq!(seen.len(), 3, "整条链三个请求（首屏 + 两页游标）：{seen:?}");
+    assert!(!seen[0].contains("cursor="), "首屏不得带游标：{seen:?}");
+    assert!(
+        seen[1].contains("cursor=ooo1"),
+        "第二页必须回传服务端给的游标：{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|q| q.contains("offset=")),
+        "游标链不得按 offset 续拉：{seen:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 入库补发段是**宽口径**（不应用窗口），窗口的严格性由调用方在落盘前保证：
+/// 早于 `--since` 的行必须被丢掉，且不得因为它出现在页里就让整页作废。
+/// `--since` 对用户是**含边界**的（请求带的是 `since - 1`，服务端排他），所以时间戳
+/// 恰好等于 `--since` 的 ooo-c 必须留下——判据写成 `>` 会让起点那一条凭空消失。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_with_since_drops_out_of_window_rows() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("qqflow-e2e-ooo-window-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl",
+          "--session", "ooo-window-talker", "--since", "1700000510"],
+    );
+    assert_eq!(code, 0, "导出应退出 0；stdout: {stdout} stderr: {stderr}");
+    let body = exported_body(&dir);
+    let messages = body.matches("\"_type\":\"message\"").count();
+    assert_eq!(messages, 3, "窗口内三行要落盘、窗口外一行要丢：{body}");
+    assert!(!body.contains("ooo-d"), "早于 --since 的行不得进产物：{body}");
+    for mid in ["ooo-a", "ooo-b", "ooo-c"] {
+        assert!(body.contains(mid), "缺了 {mid}（含边界，ooo-c 的时间戳等于 --since）：{body}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 写盘错误必须**立刻**中止本轮，不能存起来继续取数：后续某一页的取数错误会把它盖掉。
+/// 被盖掉的若是令牌泄露（本应中止整轮），run 会把它降级成「跳过这个会话」，退出码仍是 0
+/// —— 泄露检查形同不存在。桩的首页正文带令牌、第二页回一个缺字段的响应，正好构成这个交错。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_aborts_on_a_write_error_instead_of_masking_it() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("qqflow-e2e-leak-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl",
+          "--session", "leak-talker"],
+    );
+    assert_ne!(
+        code, 0,
+        "令牌泄露必须整轮中止（非零退出）；stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("访问令牌"),
+        "报出的必须是写盘错误（令牌泄露），而不是被后续页的取数错误盖掉：{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 首屏是空页 + `hasMore=true`（服务端「第一段耗尽、第二段还有行」的结算形态）时，
+/// 导出必须跟着游标继续，而不是把空页当结束——否则后面那段被静默截断，产物看起来完整。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_follows_an_empty_page_that_still_has_more() {
+    let base = spawn_stub().await;
+    let dir = std::env::temp_dir().join(format!("qqflow-e2e-ooo-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (code, stdout, stderr) = run(
+        &base,
+        &["export", "--out", dir.to_str().unwrap(), "--format", "jsonl",
+          "--session", "ooo-empty-talker"],
+    );
+    assert_eq!(code, 0, "导出应退出 0；stdout: {stdout} stderr: {stderr}");
+    let body = exported_body(&dir);
+    assert_eq!(
+        body.matches("\"_type\":\"message\"").count(),
+        2,
+        "空页之后的第二段两行都要落盘：{body}"
+    );
+    for mid in ["e-a", "e-b"] {
+        assert!(body.contains(mid), "缺了 {mid}：{body}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 验收 1b：`export` 落盘（同样对着桩服务端）。

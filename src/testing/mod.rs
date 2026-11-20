@@ -33,6 +33,11 @@ use rusqlite::Connection;
 /// Fabricated account number (random, not a real QQ).
 pub const FAKE_QQ: &str = "335663881";
 pub const FAKE_KEY: &str = "0123456789abcdef";
+/// 「时间序与入库序分叉」的专用群：一致性套件的 `group_out_of_order` 槽位绑它。
+pub const FAKE_OOO_GROUP: &str = "10002";
+/// `group_out_of_order` 槽位的窗口下界，以及该会话里「时间最晚」那一行的时间戳。
+pub const OOO_SINCE: i64 = 1_700_000_500;
+pub const OOO_LATEST_TS: i64 = 1_700_000_530;
 
 pub fn pragma_suite(key: &str) -> String {
     format!(
@@ -247,6 +252,40 @@ pub fn append_group_row_backdated(conn: &Connection, n: i64, seq_no: i64, ts: i6
         rusqlite::params!["10001", (ts << 32) | seq_no, "u_a", "张三", format!("回溯入库-{n}").as_bytes(), 1, ts, "张三群名片"],
     )
     .unwrap();
+}
+
+/// 「时间序与入库序分叉」的专用会话（一致性套件 `group_out_of_order` 槽位）。
+///
+/// 行按 rowid 升序插入，时间戳故意反着走：**窗口内时间最晚的那一行 rowid 最小**，
+/// 另有一条时间早于窗口下界的回溯行 rowid 最大。单水位游标（首页按时间交付、
+/// 续页只按 `rowid > 水位` 过滤）在小页下会把「时间更晚、行标识更小」的那行永久
+/// 跨过去；没有排除线的实现还会把回溯行放出来。两个方向分别由
+/// `cursor-window-drain-equals-single-page` 与 `cursor-drain-equals-full-out-of-order` 钉住。
+///
+/// 单开一个群（[`FAKE_OOO_GROUP`]）而不是往 10001 里加行，是为了不扰动既有用例的行数。
+pub fn seed_out_of_order_group(conn: &Connection) {
+    let rows = [
+        (OOO_LATEST_TS, 1, "分叉-时间最晚、入库最早"),
+        (1_700_000_510i64, 2, "分叉-窗口内早"),
+        (1_700_000_520i64, 3, "分叉-窗口内中"),
+        (1_700_000_400i64, 4, "分叉-回溯入库"),
+    ];
+    for (ts, n, text) in rows {
+        conn.execute(
+            "INSERT INTO group_msg_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                FAKE_OOO_GROUP,
+                (ts << 32) | n,
+                "u_a",
+                "张三",
+                text.as_bytes(),
+                1,
+                ts,
+                "张三群名片"
+            ],
+        )
+        .unwrap();
+    }
 }
 
 /// Add the reply columns ("40003" inner number, "40850" reply target) to the

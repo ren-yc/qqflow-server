@@ -295,7 +295,7 @@ fn harness_router(
 
 /// 夹具声明的契约版本。**必须与 `conformance.pin` 同改** —— 见下面的
 /// `pinned_contract_version_matches_the_fixture`。
-const CONTRACT_VERSION: &str = "0.11.0";
+const CONTRACT_VERSION: &str = "0.12.0";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "由 CI 的一致性步骤显式运行：需要 FLOW_CONTRACT_DIR"]
@@ -319,6 +319,10 @@ async fn conformance_suite_passes() {
     // 自己新开一个会让 WAL 的 salt 变化，硬链接失效、新行对活连接不可见。
     let (writer, _main) = common::open_fake_source(&nt_db, 0);
     let writer = Arc::new(parking_lot::Mutex::new(writer));
+    // 时间序与入库序分叉的专用会话（`group_out_of_order` 槽位）：游标两段式的用例绑它。
+    // 单开一个群而不是往 10001 里加行，是为了不扰动既有用例的行数。
+    common::seed_out_of_order_group(&writer.lock());
+    common::materialize_source(&nt_db);
     let src = nt_db.join("nt_msg.db");
     // 同族库 `group_info.db`（群名、名册、群名片、群主）必须在**注册之前**就位：
     // store 的这些映射在注册建索引时一次性读入，之后再写也不会重新加载 —— 先前它只在
@@ -421,6 +425,9 @@ async fn conformance_suite_passes() {
             "group_with_messages": { "id": "10001", "expect": { "same_second": 5 } },
             "private_with_messages": { "id": "u_12345", "expect": { "messages": 2 } },
             "same_second_burst": { "id": "10001", "expect": { "same_second": 5 } },
+            // 时间序与入库序分叉：窗口下界与窗口内行数由夹具给出，用例据此取 since。
+            "group_out_of_order": { "id": common::FAKE_OOO_GROUP,
+                "expect": { "since": common::OOO_SINCE, "messages": 3 } },
             "unknown": { "id": "999999999", "expect": {} },
             // harness 保证句柄此刻可取的媒体（mediaId 承诺用例的槽位）：
             // 夹具造库时写入的 fake_image_01.jpg，句柄即 mediaId 本身。
@@ -589,11 +596,12 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         "排空后按游标续拉必须为空（重放判据），实际交付：{got:?}"
     );
 
-    // 段二：空页游标语义。
-    //  - 带 cursor 的空页：进度保持（游标值不变，不回退为从头拉取）；
-    //  - 无 cursor 的空 time-filtered 页：游标编码「end 界内已确立的最大
-    //    rowid」——不是 0（从头拉取）。周期轮询的客户端（end=now）采纳空页
-    //    游标再丢掉时间过滤，必须不重放全历史。
+    // 段二：空页语义（两段式口径）。
+    //  - 带 cursor 的空页：**不得重放**任何已交付的行。两段式下「第一段确实耗尽」时
+    //    游标会前进到第二段，所以这里不再断言游标逐字不变（那是单水位时代的判据），
+    //    改为钉住可观察行为：采纳空页游标续拉，一个字都不交付。
+    //  - 无 cursor 的空 time-filtered 页：`end` 界内的一切都已确立，游标不得编成
+    //    「从头拉取」——否则周期轮询的客户端丢掉时间过滤就会重放窗口外的历史行。
     let v = json_of(
         &client,
         req("GET", &format!("{pull_url}?limit=5000&cursor={c0}&end={}", 1622505550)),
@@ -606,49 +614,39 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
         .collect();
     assert!(got.is_empty(), "end 过滤（早于回溯行）必须让本页为空");
-    let c1 = v["sync"]["nextCursor"].as_str().unwrap();
-    assert_eq!(c1, c0, "带 cursor 的空页必须保持进度（游标不变）");
+    let c_empty = v["sync"]["nextCursor"]
+        .as_str()
+        .expect("空页也必须给游标")
+        .to_string();
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c_empty}")),
+    )
+    .await;
+    assert!(
+        v["messages"].as_array().unwrap().is_empty(),
+        "空页游标续拉不得重放已交付的行"
+    );
 
-    // 无 cursor 的空 time-filtered 页：窗口 (1622505520, 1622505550] 内
-    // 无行，但「ts ≤ end 的行都已确立」——游标必须编码回溯行（ts=1622505500、
-    // rowid 最大），而不是 0（从头拉取）。周期轮询的客户端（end=now）采纳
-    // 空页游标再丢掉时间过滤，必须不重放全历史。
+    // 无 cursor 的空 time-filtered 页：窗口 (1622505520, 1622505550] 内无行，
+    // 于是「ts ≤ end 的行都已确立」——采纳它再丢掉时间过滤，窗口外的回溯行
+    // （ts=1622505500）**不得**冒出来；窗口内的时间更大行本来就该交付。
     let v = json_of(
         &client,
         req("GET", &format!("{pull_url}?limit=5000&since=1622505520&end=1622505550")),
     )
     .await;
-    let got: Vec<String> = v["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
-        .collect();
-    assert!(got.is_empty(), "end 过滤必须让本页为空");
-    // 游标 v2 是 URL-safe base64（无填充），载荷 `v2.<nonce>.<账号8>.<注册代次>.
-    // <世代>.<会话8>.<rowid>`——rowid 是第 7 段（零基索引 6）。不解析其余字段：
-    // 解析游标等于把服务端的进度模型抄进测试，这里只需要「不是 0」这一个位。
-    // 段缺失或解析失败必须响亮报错：回退值会让「编码 rowid 0」的回归静默过关。
-    use base64::Engine as _;
-    let c_empty_raw = v["sync"]["nextCursor"].as_str().unwrap();
-    let decoded = String::from_utf8(
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(c_empty_raw)
-            .unwrap(),
-    )
-    .unwrap();
-    let rid: i64 = decoded
-        .split('.')
-        .nth(6)
-        .expect("游标 v2 载荷缺少 rowid 段")
-        .parse()
-        .expect("游标 rowid 段必须是整数");
-    assert_ne!(rid, 0, "空页游标不得编码 rowid 0（从头拉取）：{decoded}");
-    let c_empty = c_empty_raw.to_string();
-    // 采纳空页游标续拉（不带时间过滤）：不得重放全历史。
+    assert!(
+        v["messages"].as_array().unwrap().is_empty(),
+        "窗口内无行，本页必须为空"
+    );
+    let c_settled = v["sync"]["nextCursor"]
+        .as_str()
+        .expect("空页也必须给游标")
+        .to_string();
     let v = json_of(
         &client,
-        req("GET", &format!("{pull_url}?limit=5000&cursor={c_empty}")),
+        req("GET", &format!("{pull_url}?limit=5000&cursor={c_settled}")),
     )
     .await;
     let got: Vec<String> = v["messages"]
@@ -658,8 +656,8 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
         .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
         .collect();
     assert!(
-        got.is_empty(),
-        "空页游标（end 界内已确立进度）续拉不得重放全历史，实际交付：{got:?}"
+        !got.contains(&backdated),
+        "空页结算不得把窗口外的回溯行放出来，实际交付：{got:?}"
     );
 
     // 段三：排空后追加 → 游标续拉可达（沿用契约用例的形态）。
@@ -766,4 +764,267 @@ async fn cursor_continuation_is_monotonic_when_row_order_diverges_from_time_orde
     dedup.sort();
     dedup.dedup();
     assert_eq!(dedup.len(), sorted.len(), "游标链不得重复交付（重放判据）");
+}
+
+/// 第一段的集合是**冻结**的：链开始时记下的行标识上界之后入库的行一律等第二段。
+///
+/// 形态取自单水位方案的丢行反例：页 1（`limit=1`）按时间序交付了 rowid 更大的回溯行
+/// （ts 更早、入库更晚）。若水位取「页 1 已交付的最大 rowid」，rowid 更小的常规行会被
+/// `rowid > 水位` 永久跨过去——一条都交付不出来。两段式把这些常规行留在第一段内
+/// （它们行标识不超过快照），链中入库的那行则落第二段。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn cursor_snapshot_is_frozen_while_new_rows_wait() {
+    let dir = std::env::temp_dir().join(format!("qqflow_cursor_snapshot_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nt_db = dir.join("nt_db");
+    let (writer, _main) = common::open_fake_source(&nt_db, 0);
+    let writer = Arc::new(parking_lot::Mutex::new(writer));
+    // 回溯行在注册**之前**入库：ts 早于标准数据集、rowid 最大（插入在后）。
+    {
+        let conn = writer.lock();
+        common::append_group_row_backdated(&conn, 990, 990, 1622505500);
+    }
+    common::materialize_source(&nt_db);
+    let src = nt_db.join("nt_msg.db");
+
+    let state = app_state(dir.join("export"));
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "qq": common::FAKE_QQ,
+        "key": common::FAKE_KEY,
+        "db_path": src.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", "10001");
+    let backdated = format!("{}", (1622505500i64 << 32) | 990);
+
+    // 页 1：limit=1 —— 时间序第一行就是回溯行，它的 rowid 是全会话最大。
+    let v = json_of(&client, req("GET", &format!("{pull_url}?limit=1"))).await;
+    let first: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(first, vec![backdated.clone()], "时间序第一行是回溯行（rowid 最大）");
+    assert_eq!(v["sync"]["hasMore"], json!(true));
+    let mut cursor = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+    let mut got = first;
+
+    // 链进行中入库一行（rowid 更大）：它属于第二段，不能挤进第一段。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        let writer = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = writer.lock();
+            // 时间戳刻意落在「回溯行」与「标准数据集」之间：若续页时把快照按当前
+            // 索引重算，这一行会被第一段按时间序排在**标准行之前**交付；快照冻结时
+            // 它只能走第二段、排在最后。交付顺序因此能区分「冻结」与「重算」。
+            common::append_group_row_backdated(&conn, 991 + seq, 991 + seq, 1622505550);
+        })
+        .await
+        .unwrap();
+    }
+    common::materialize_source(&nt_db);
+    let during = format!("{}", (1622505550i64 << 32) | (991 + seq));
+    // 索引是异步的：等到新行真的可见再继续翻页。必须**轮询**而不是假设一次同步就到位——
+    // 否则「链中入库的行没交付」会与「索引还没跟上」混成同一个症状。
+    let mut indexed = false;
+    for _ in 0..40 {
+        let v = json_of(
+            &client,
+            req("GET", &format!("{pull_url}?limit=5000")),
+        )
+        .await;
+        if v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["platformMessageId"].as_str() == Some(during.as_str()))
+        {
+            indexed = true;
+            break;
+        }
+        let state = state.clone();
+        let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(indexed, "链中入库的行没有进入索引：{during}");
+
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 20, "游标链必须终止，已翻 {pages} 页");
+        let v = json_of(
+            &client,
+            req("GET", &format!("{pull_url}?limit=1&cursor={cursor}")),
+        )
+        .await;
+        for m in v["messages"].as_array().unwrap() {
+            got.push(m["platformMessageId"].as_str().unwrap().to_string());
+        }
+        cursor = v["sync"]["nextCursor"]
+            .as_str()
+            .expect("游标链上 nextCursor 必须恒在场")
+            .to_string();
+        if !v["sync"]["hasMore"].as_bool().unwrap() {
+            break;
+        }
+    }
+
+    let mut dedup = got.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(dedup.len(), got.len(), "游标链不得重放：{got:?}");
+    assert_eq!(got.len(), 7, "5 条常规行 + 回溯行 + 链中入库行：{got:?}");
+    // 少行判据：rowid 更小的 5 条常规行**必须**全部交付——单水位方案在这里
+    // 按「rowid > 页 1 的最大 rowid」把它们整批跨过去。
+    let mut got_sorted = got.clone();
+    got_sorted.sort();
+    let mut want: Vec<String> = vec![backdated.clone(), during.clone()];
+    for n in 1..=5i64 {
+        want.push(format!("{}", (1622505600i64 << 32) | n));
+    }
+    want.sort();
+    assert_eq!(got_sorted, want, "续拉集合必须与全会话逐条相等");
+    // 快照**冻结**的可观察判据：链中入库的行时间戳夹在回溯行与标准行之间，若续页
+    // 重算快照，它会被第一段排在标准行之前；冻结时它只能经第二段、排在最后。
+    assert_eq!(
+        got.last().map(String::as_str),
+        Some(during.as_str()),
+        "链中入库的行必须最后交付（第二段），快照不得按当前索引重算：{got:?}"
+    );
+}
+
+/// 第二段**不应用窗口**：链开始后入库、时间戳低于 `since` 下界的回溯行，仍必须经游标交付。
+/// 只钉这一件事——段切换与快照冻结由 `cursor_snapshot_is_frozen_while_new_rows_wait` 覆盖。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "真实索引链路回归：随一致性步骤显式运行（cargo test --test conformance_runner -- --ignored）"]
+async fn phase_two_delivers_rows_below_the_since_bound() {
+    let dir = std::env::temp_dir().join(format!("qqflow_phase2_window_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let nt_db = dir.join("nt_db");
+    let (writer, _main) = common::open_fake_source(&nt_db, 0);
+    let writer = Arc::new(parking_lot::Mutex::new(writer));
+    common::materialize_source(&nt_db);
+    let src = nt_db.join("nt_msg.db");
+
+    let state = app_state(dir.join("export"));
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let body = json!({
+        "qq": common::FAKE_QQ,
+        "key": common::FAKE_KEY,
+        "db_path": src.to_string_lossy(),
+    });
+    let mut r = req("POST", "/api/v1/accounts");
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    *r.body_mut() = Body::from(body.to_string());
+    let reg = json_of(&client, r).await;
+    assert_eq!(reg["success"], json!(true), "注册失败：{reg}");
+    assert!(wait_ready(&client).await, "索引没能在 30 秒内到 ready");
+
+    let pull_url = format!("/chatlab/sessions/{}/messages", "10001");
+    // 首页带窗口下界 1622505599：标准数据集（ts=1622505600）全在窗口内。
+    let v = json_of(
+        &client,
+        req("GET", &format!("{pull_url}?limit=1&since=1622505599")),
+    )
+    .await;
+    let mut got: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["platformMessageId"].as_str().unwrap().to_string())
+        .collect();
+    // 页不切秒组：5 条常规行同属一秒，limit=1 也会把这一秒整组给完。
+    assert_eq!(got.len(), 5, "整秒组一次给完");
+    assert_eq!(v["sync"]["hasMore"], json!(false), "第一段此时已排空");
+    let mut cursor = v["sync"]["nextCursor"].as_str().unwrap().to_string();
+
+    // 链进行中入库一行：时间戳**低于**窗口下界，行标识大于链开始时的快照上界。
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    {
+        let writer = writer.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = writer.lock();
+            common::append_group_row_backdated(&conn, 991 + seq, 991 + seq, 1622505500);
+        })
+        .await
+        .unwrap();
+    }
+    common::materialize_source(&nt_db);
+    let backfilled = format!("{}", (1622505500i64 << 32) | (991 + seq));
+    // 等索引真的看见它，否则「没交付」会与「索引没跟上」混成同一个症状。
+    let mut indexed = false;
+    for _ in 0..40 {
+        let v = json_of(&client, req("GET", &format!("{pull_url}?limit=5000"))).await;
+        if v["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["platformMessageId"].as_str() == Some(backfilled.as_str()))
+        {
+            indexed = true;
+            break;
+        }
+        let state = state.clone();
+        let _ = tokio::task::spawn_blocking(move || state.sync.sync_all()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(indexed, "链中入库的回溯行没有进入索引：{backfilled}");
+
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= 20, "游标链必须终止，已翻 {pages} 页");
+        let v = json_of(
+            &client,
+            req("GET", &format!("{pull_url}?limit=5000&cursor={cursor}")),
+        )
+        .await;
+        for m in v["messages"].as_array().unwrap() {
+            got.push(m["platformMessageId"].as_str().unwrap().to_string());
+        }
+        cursor = v["sync"]["nextCursor"]
+            .as_str()
+            .expect("游标链上 nextCursor 必须恒在场")
+            .to_string();
+        if !v["sync"]["hasMore"].as_bool().unwrap() {
+            break;
+        }
+    }
+
+    let mut sorted = got.clone();
+    sorted.sort();
+    let mut dedup = sorted.clone();
+    dedup.dedup();
+    assert_eq!(dedup.len(), sorted.len(), "游标链不得重放：{got:?}");
+    assert!(
+        sorted.contains(&backfilled),
+        "第二段必须交付时间戳低于 since 下界的回溯行（窗口不应用在第二段）：{got:?}"
+    );
+    assert_eq!(sorted.len(), 6, "5 条常规行 + 回溯行：{got:?}");
 }
