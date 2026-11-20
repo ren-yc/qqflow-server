@@ -360,13 +360,34 @@ pub fn export_targeted(
         }
         output.flush()?;
         drop(output);
-        let name = format!("{:x}.{ext}", hash.finalize());
+        let name = digest_name(&hash.finalize(), &ext);
         let dest = dir.join(&name);
         anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &dest), "export target escaped root");
         Ok(PreparedExport { root: ctx.root.clone(), temp: Some(temp.clone()), result: out(&name, &dest, true) })
     })();
     if result.is_err() { let _ = std::fs::remove_file(&temp); }
     result.map(Some)
+}
+
+/// SHA-256 摘要 → 导出文件名：小写十六进制主干 ＋ 扩展名。
+///
+/// 自己按字节格式化，不用 `{:x}` 打 `finalize()` 的返回值：那依赖摘要库为它的
+/// 数组类型提供的 `LowerHex` 实现，而该实现随大版本消失（digest 0.11 起没有），
+/// 升级时会在编译期把这条路径整段打倒。名字的字节形态是跨版本承诺——它同时决定
+/// 导出目录里的文件名与 `/api/v1/media/<name>` 的句柄形态（`name_is_content_digest`
+/// 只认 64 位小写十六进制），换一种写法等于换一套文件名。回归：
+/// `digest_name_is_lowercase_hex_and_zero_padded`。
+fn digest_name(digest: &[u8], ext: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut name = String::with_capacity(digest.len() * 2 + 1 + ext.len());
+    for byte in digest {
+        // 写进 `String` 不会失败；`let _` 只是为了满足 `write!` 的 `Result`。
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push('.');
+    name.push_str(ext);
+    name
 }
 
 fn detected_extension(bytes: &[u8]) -> Option<&'static str> {
@@ -449,6 +470,21 @@ mod tests {
             local_path: path.map(String::from),
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn digest_name_is_lowercase_hex_and_zero_padded() {
+        // 漏零填充（0x0f → "0f" 写成 "f"）或写成大写（0xff → "FF"）都会让名字
+        // 不再满足 `name_is_content_digest` 的 64 位小写十六进制判据：那时
+        // `mediaUrl` 不再下发，按名取字节这条跨会话路径整段失效。
+        assert_eq!(digest_name(&[0x00, 0x0f, 0xff], "png"), "000fff.png");
+
+        let name = digest_name(&[0u8; 32], "jpg");
+        assert_eq!(name.len(), 64 + 1 + 3, "SHA-256 主干必须是 64 位：{name}");
+        assert_eq!(&name[..64], "0".repeat(64).as_str(), "零填充：{name}");
+        assert!(name.ends_with(".jpg"));
+        assert!(name_is_content_digest(&name), "摘要名必须可作句柄下发：{name}");
+        assert!(!name_is_content_digest(&digest_name(&[0u8; 33], "jpg")), "66 位不是摘要形态");
     }
 
     #[test]
