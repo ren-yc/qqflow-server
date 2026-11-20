@@ -360,13 +360,38 @@ pub fn export_targeted(
         }
         output.flush()?;
         drop(output);
-        let name = format!("{:x}.{ext}", hash.finalize());
+        let name = digest_name(&hash.finalize(), &ext);
         let dest = dir.join(&name);
         anyhow::ensure!(crate::pathsafe::is_contained(&ctx.root, &dest), "export target escaped root");
         Ok(PreparedExport { root: ctx.root.clone(), temp: Some(temp.clone()), result: out(&name, &dest, true) })
     })();
     if result.is_err() { let _ = std::fs::remove_file(&temp); }
     result.map(Some)
+}
+
+/// SHA-256 摘要 → 导出文件名：64 位小写十六进制主干 ＋ 扩展名。
+///
+/// 自己按字节格式化，不用 `{:x}` 打 `finalize()` 的返回值：那依赖摘要库为它的
+/// 数组类型提供的 `LowerHex` 实现，而该实现随大版本消失（digest 0.11 起没有），
+/// 升级时会在编译期把这条路径整段打倒。
+///
+/// 形态固定成「每字节两位、零填充、小写」，是因为这个名字就是导出副本的身份：
+/// 重导同一份字节必须算出与上次逐字相同的名字，才能命中已有文件、对上 store 里
+/// 登记的 `published_handle`，并被 `/api/v1/media/<name>` 按名解析到。少一位零填充
+/// 会让主干短于 64 位、不再被 `name_is_content_digest` 认作摘要名；换大写则让同一份
+/// 内容换一个字符串——大小写敏感的盘上多出一份副本、旧句柄 404，大小写不敏感的盘上
+/// 两个名字撞同一个文件。回归：`digest_name_is_lowercase_hex_and_zero_padded`。
+fn digest_name(digest: &[u8], ext: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut name = String::with_capacity(digest.len() * 2 + 1 + ext.len());
+    for byte in digest {
+        // 写进 `String` 不会失败；`let _` 只是为了满足 `write!` 的 `Result`。
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push('.');
+    name.push_str(ext);
+    name
 }
 
 fn detected_extension(bytes: &[u8]) -> Option<&'static str> {
@@ -449,6 +474,23 @@ mod tests {
             local_path: path.map(String::from),
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn digest_name_is_lowercase_hex_and_zero_padded() {
+        // 零填充、大小写、长度都是文件名的身份判据：重导同一份字节必须算出逐字相同的
+        // 名字，才能命中已有文件、对上 store 里登记的句柄，并被 `/api/v1/media/<name>`
+        // 按名解析到。少一位零填充会让主干短于 64 位，连摘要形状都不再成立；换大写则
+        // 不叫「句柄判定失败」——`name_is_content_digest` 按 `is_ascii_hexdigit` 收大小写
+        // ——而是文件名约定漂移：同一份内容在大小写敏感的盘上变成另一份副本。
+        assert_eq!(digest_name(&[0x00, 0x0f, 0xff], "png"), "000fff.png");
+
+        let name = digest_name(&[0u8; 32], "jpg");
+        assert_eq!(name.len(), 64 + 1 + 3, "SHA-256 主干必须是 64 位：{name}");
+        assert_eq!(&name[..64], "0".repeat(64).as_str(), "零填充：{name}");
+        assert!(name.ends_with(".jpg"));
+        assert!(name_is_content_digest(&name), "摘要名必须可作句柄下发：{name}");
+        assert!(!name_is_content_digest(&digest_name(&[0u8; 33], "jpg")), "66 位不是摘要形态");
     }
 
     #[test]
