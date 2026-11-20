@@ -369,14 +369,18 @@ pub fn export_targeted(
     result.map(Some)
 }
 
-/// SHA-256 摘要 → 导出文件名：小写十六进制主干 ＋ 扩展名。
+/// SHA-256 摘要 → 导出文件名：64 位小写十六进制主干 ＋ 扩展名。
 ///
 /// 自己按字节格式化，不用 `{:x}` 打 `finalize()` 的返回值：那依赖摘要库为它的
 /// 数组类型提供的 `LowerHex` 实现，而该实现随大版本消失（digest 0.11 起没有），
-/// 升级时会在编译期把这条路径整段打倒。名字的字节形态是跨版本承诺——它同时决定
-/// 导出目录里的文件名与 `/api/v1/media/<name>` 的句柄形态（`name_is_content_digest`
-/// 只认 64 位小写十六进制），换一种写法等于换一套文件名。回归：
-/// `digest_name_is_lowercase_hex_and_zero_padded`。
+/// 升级时会在编译期把这条路径整段打倒。
+///
+/// 形态固定成「每字节两位、零填充、小写」，是因为这个名字就是导出副本的身份：
+/// 重导同一份字节必须算出与上次逐字相同的名字，才能命中已有文件、对上 store 里
+/// 登记的 `published_handle`，并被 `/api/v1/media/<name>` 按名解析到。少一位零填充
+/// 会让主干短于 64 位、不再被 `name_is_content_digest` 认作摘要名；换大写则让同一份
+/// 内容换一个字符串——大小写敏感的盘上多出一份副本、旧句柄 404，大小写不敏感的盘上
+/// 两个名字撞同一个文件。回归：`digest_name_is_lowercase_hex_and_zero_padded`。
 fn digest_name(digest: &[u8], ext: &str) -> String {
     use std::fmt::Write as _;
 
@@ -474,9 +478,11 @@ mod tests {
 
     #[test]
     fn digest_name_is_lowercase_hex_and_zero_padded() {
-        // 漏零填充（0x0f → "0f" 写成 "f"）或写成大写（0xff → "FF"）都会让名字
-        // 不再满足 `name_is_content_digest` 的 64 位小写十六进制判据：那时
-        // `mediaUrl` 不再下发，按名取字节这条跨会话路径整段失效。
+        // 零填充、大小写、长度都是文件名的身份判据：重导同一份字节必须算出逐字相同的
+        // 名字，才能命中已有文件、对上 store 里登记的句柄，并被 `/api/v1/media/<name>`
+        // 按名解析到。少一位零填充会让主干短于 64 位，连摘要形状都不再成立；换大写则
+        // 不叫「句柄判定失败」——`name_is_content_digest` 按 `is_ascii_hexdigit` 收大小写
+        // ——而是文件名约定漂移：同一份内容在大小写敏感的盘上变成另一份副本。
         assert_eq!(digest_name(&[0x00, 0x0f, 0xff], "png"), "000fff.png");
 
         let name = digest_name(&[0u8; 32], "jpg");
