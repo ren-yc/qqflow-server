@@ -326,6 +326,9 @@ impl QqflowMcp {
             },
             // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
             "sinceResolved": since_resolved,
+            // 服务端逐页回显的链窗口下界（契约 0.13.0）。它比调用方传来的相对串权威：
+            // 游标链的窗口在建链时就定死了，后续轮次重算的「24h 前」已经前移。
+            "since": page.sync.since,
             // hint 只在确实有下界可回填时指路：since 未提供时 sinceResolved 为 null，
             // 教调用方「传响应里的 sinceResolved」会得到 null/反序列化失败。
             "hint": if cut {
