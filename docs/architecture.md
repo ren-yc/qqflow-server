@@ -125,6 +125,7 @@ clients/                       # 类型化 SDK（rust / python / ts；ts 未发�
 - **`clients/rust`（`qqflow-client`）**：类型与操作客户端 ＋ 手写行为层（就绪轮询 / 游标排空 / SSE 重连 / 媒体重试 / 检索）。`generated/` 只许生成器改（`clients/regen`，CI 断言重生成无 diff）。
   - `drain_session_cursor` 交出 `DrainOutcome`（条数 ＋ 终页游标），Python 侧同名同义。
   - 窗口外的回溯行在交付前已被丢掉，最大时间戳并不等于进度——续拉点只能由服务端游标给出。回归：`drain_session_cursor_returns_the_terminal_cursor`。
+  - 回调逐页拿到续拉点（第二个参数）：中途失败时循环交不出结果，这是调用方唯一存得下的检查点。回归：`drain_session_cursor_hands_each_page_its_resume_cursor`。
 - **`clients/regen`（`qqflow-regen`）**：生成工具。取 `server::openapi::document()`，做确定性规范化（3.1 → 3.0）后交给生成器；`--dump-spec` 同时供 Python 侧取规范化 spec。
 - **`clients/python`（`qqflow-sdk`）**：模型由 openapi-generator 从同一份规范化 spec 生成（`scripts/regen.py`）；行为层是 `httpx.AsyncClient` 异步实现，与 Rust 侧逐方法同构。
   - `ensure_ready` 把注册应答的 200 拒绝态（`account_conflict` / `invalid_key` / `invalid_db_path` / `unknown_qq`）映射成 `StatusError` 快速失败。
