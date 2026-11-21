@@ -1817,7 +1817,8 @@ async fn chatlab_pull_boundary_second_pages_cleanly() {
 /// `sync.since` 回显链的窗口下界：带 `since` 时等于它，无窗口时为 `null`，且
 /// **键始终在场**；`since=0` 与省略等价（0 是纪元起点，不是「从 1970 年起」的窗口）。
 ///
-/// 回归：`pull_since_zero_is_no_window`。与契约用例 `cursor-sync-since-window` /
+/// 回归：`chatlab_pull_echoes_the_window_lower_bound` 本身即回归位置（`since=0` 与
+/// 省略的页面逐字相同、带窗口回显该值）。这条与契约用例 `cursor-sync-since-window` /
 /// `cursor-sync-since-no-window` 同口径：那边钉跨实现的响应形状，这里钉本服务端
 /// 的两档取值与 `0` 的归一化。
 #[tokio::test]

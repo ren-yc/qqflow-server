@@ -372,6 +372,7 @@ pub struct PullSync {
     /// 的行反推下界只会得到更小的值，按它做严格窗口过滤会漏掉本该保留的行。
     #[schema(required = true)]
     pub since: Option<i64>,
+    pub watermark: i64,
     /// 不透明进度游标（`opaqueCursor` 能力）：编码入库进度，客户端原样回传、
     /// 不得解析。载荷绑定「进程 / 账号 / 会话 / 注册代次 / 数据源世代」，所以
     /// **换进程、换账号、换会话或数据源被替换后，旧游标一律失效**。
@@ -387,7 +388,6 @@ pub struct PullSync {
     /// 盲区（排空后同秒晚入库的行永远落在 `nextSince` 之后）由它补上。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    pub watermark: i64,
 }
 // ── 会话列表 ──────────────────────────────────────────────
 

@@ -285,6 +285,9 @@ impl QqflowMcp {
             Ok(v) => v,
             Err(e) => return Ok(tool_error(e)),
         };
+        // `since=0` 与省略等价（契约 0.13.0 的归一化口径，与 pull 处理器同款）：
+        // 0 是纪元起点，挡不住任何真实行，工具面沿用服务端的语义。
+        let since = since.filter(|s| *s != 0);
         let page = match self
             .client
             .pull_page(&a.talker, since, a.offset.unwrap_or(0), Some(limit as u32))
