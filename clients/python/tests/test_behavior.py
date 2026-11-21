@@ -295,7 +295,7 @@ def pull_page(msgs: list[dict], has_more: bool, next_since: int, next_offset: in
         "messages": msgs,
         "meta": {"groupId": "", "name": "", "ownerId": "",
                  "platform": "qq", "type": "chat"},
-        "sync": {"hasMore": has_more, "nextCursor": next_cursor,
+        "sync": {"since": None, "hasMore": has_more, "nextCursor": next_cursor,
                  "nextSince": next_since, "nextOffset": next_offset,
                  "watermark": 2000},
     }

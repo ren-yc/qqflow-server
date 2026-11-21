@@ -129,7 +129,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {"hasMore": false, "nextSince": 1_700_000_500, "nextOffset": 0, "watermark": 1_700_000_500},
+            "sync": {"since": null, "hasMore": false, "nextSince": 1_700_000_500, "nextOffset": 0, "watermark": 1_700_000_500},
         }));
     }
     if id == "win-talker" {
@@ -158,7 +158,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {"hasMore": more, "nextCursor": next_cursor, "nextSince": next_ts,
+            "sync": {"since": null, "hasMore": more, "nextCursor": next_cursor, "nextSince": next_ts,
                      "nextOffset": 0, "watermark": next_ts},
         }));
     }
@@ -176,7 +176,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": [m],
             "meta": {"groupId": TALKER, "name": "泄露会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": true, "nextCursor": "leak1",
                 "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000,
             },
@@ -215,7 +215,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "窗口会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !has("cursor=w2"),
                 "nextCursor": if has("cursor=w1") { "w2" } else { "w1" },
                 "nextSince": 1_700_000_530, "nextOffset": 0, "watermark": 1_700_000_530,
@@ -259,7 +259,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "分叉会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !has("cursor=ooo2"),
                 "nextCursor": next_cursor,
                 "nextSince": 1_700_000_530, "nextOffset": 0, "watermark": 1_700_000_530,
@@ -288,7 +288,7 @@ async fn pull(
             "chatlab": {"version": "0.0.2", "generator": "stub", "exportedAt": 1},
             "members": [], "messages": messages,
             "meta": {"groupId": TALKER, "name": "结算页会话", "ownerId": "", "platform": "qq", "type": "private"},
-            "sync": {
+            "sync": {"since": null,
                 "hasMore": !second,
                 "nextCursor": if second { "e2" } else { "e1" },
                 "nextSince": 1_700_000_520, "nextOffset": 0, "watermark": 1_700_000_520,
@@ -324,7 +324,7 @@ async fn pull(
         // 刻意与发现面矛盾（sessions 里 type: 2 = 群）：导出若照抄这里的 meta 就会写出 private，
         // 只有真的从发现面推导才写得出 group。
         "meta": {"groupId": TALKER, "name": "演示会话", "ownerId": "", "platform": "qq", "type": "private"},
-        "sync": {"hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
+        "sync": {"since": null, "hasMore": false, "nextSince": 1_700_000_000, "nextOffset": 0, "watermark": 1_700_000_000},
     }))
 }
 

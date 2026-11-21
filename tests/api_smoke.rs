@@ -1814,6 +1814,54 @@ async fn chatlab_pull_boundary_second_pages_cleanly() {
     assert!(ids(msgs1).is_disjoint(&ids(msgs2)), "pages must not overlap");
 }
 
+/// `sync.since` 回显链的窗口下界：带 `since` 时等于它，无窗口时为 `null`，且
+/// **键始终在场**；`since=0` 与省略等价（0 是纪元起点，不是「从 1970 年起」的窗口）。
+///
+/// 回归：`chatlab_pull_echoes_the_window_lower_bound` 本身即回归位置（`since=0` 与
+/// 省略的页面逐字相同、带窗口回显该值）。这条与契约用例 `cursor-sync-since-window` /
+/// `cursor-sync-since-no-window` 同口径：那边钉跨实现的响应形状，这里钉本服务端
+/// 的两档取值与 `0` 的归一化。
+#[tokio::test]
+async fn chatlab_pull_echoes_the_window_lower_bound() {
+    let app = build_router(ts_boundary_state());
+    let (s0, no_since) = call(
+        app.clone(),
+        "/api/v1/sessions/10001/messages?access_token=test-token-123456",
+    )
+    .await;
+    assert_eq!(s0, StatusCode::OK);
+    assert!(
+        no_since["sync"].get("since").is_some(),
+        "键必须始终在场，缺键与 null 不是一回事：{}",
+        no_since["sync"]
+    );
+    assert!(no_since["sync"]["since"].is_null(), "无窗口时回显 null：{}", no_since["sync"]);
+
+    let (_, zero) = call(
+        app.clone(),
+        "/api/v1/sessions/10001/messages?since=0&access_token=test-token-123456",
+    )
+    .await;
+    assert!(zero["sync"]["since"].is_null(), "since=0 与省略等价，回显同样是 null：{}", zero["sync"]);
+    assert_eq!(
+        zero["messages"], no_since["messages"],
+        "since=0 归一化成无下界，页面集合必须与省略时逐字相同"
+    );
+
+    let window = 0x6771A6B5i64;
+    let (_, windowed) = call(
+        app,
+        &format!("/api/v1/sessions/10001/messages?since={window}&access_token=test-token-123456"),
+    )
+    .await;
+    assert_eq!(
+        windowed["sync"]["since"].as_i64(),
+        Some(window),
+        "带窗口时回显该下界：{}",
+        windowed["sync"]
+    );
+}
+
 /// A client that echoes BOTH cursors back verbatim must still see every row.
 ///
 /// `chatlab_pull_boundary_second_pages_cleanly` resumes with `nextSince`

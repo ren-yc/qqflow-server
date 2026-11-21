@@ -57,6 +57,10 @@ pub async fn handler(
         .clamp(1, 5000);
     let offset = params.offset.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
     let since = params.since.as_deref().and_then(|s| parse_time_bound(s, false));
+    // `since=0` 与省略等价：0 是纪元起点，挡不住任何真实行，却会让游标与回显带上
+    // 一个假下界（`sync.since: 0` 读起来像「从 1970 年起」）。在建链入口归一化成
+    // 「无下界」，游标里因此统一存 `i64::MIN` 哨兵。回归：`chatlab_pull_echoes_the_window_lower_bound`。
+    let since = since.filter(|s| *s != 0);
     let end = params.end.as_deref().and_then(|s| parse_time_bound(s, true));
     let watermark = end.unwrap_or_else(|| chrono::Utc::now().timestamp());
 
@@ -391,6 +395,13 @@ pub async fn handler(
             has_more,
             next_cursor: Some(next_cursor),
             next_since,
+            // `i64::MIN` 是「无下界」的内部哨兵，0 是归一化之前签出的旧游标里才可能
+            // 出现的值；两者都回显 `null`，其余原样回显。哨兵不外泄（契约 0.13.0）。
+            since: match excluded_since {
+                i64::MIN | 0 => None,
+                bound => Some(bound),
+            },
+            watermark,
             // Both cursors are meant to be echoed back verbatim, so they must
             // not skip the same rows twice. `nextSince` is exclusive and the
             // page ends on a complete ts group, so re-filtering with it drops
@@ -399,7 +410,6 @@ pub async fn handler(
             // degenerate case where the timestamp could not advance at all,
             // and never on a cursor chain（进度由游标承载）。
             next_offset,
-            watermark,
         },
     })
     .map_err(|e| ApiError::internal(format!("序列化失败: {e}")))?;

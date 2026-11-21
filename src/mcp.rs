@@ -285,6 +285,9 @@ impl QqflowMcp {
             Ok(v) => v,
             Err(e) => return Ok(tool_error(e)),
         };
+        // `since=0` 与省略等价（契约 0.13.0 的归一化口径，与 pull 处理器同款）：
+        // 0 是纪元起点，挡不住任何真实行，工具面沿用服务端的语义。
+        let since = since.filter(|s| *s != 0);
         let page = match self
             .client
             .pull_page(&a.talker, since, a.offset.unwrap_or(0), Some(limit as u32))
@@ -326,6 +329,9 @@ impl QqflowMcp {
             },
             // 绝对下界：续拉时传它而不是原始 since 串（下一轮 now 已前移，相对串会挪窗）。
             "sinceResolved": since_resolved,
+            // 服务端逐页回显的链窗口下界（契约 0.13.0）。它比调用方传来的相对串权威：
+            // 游标链的窗口在建链时就定死了，后续轮次重算的「24h 前」已经前移。
+            "since": page.sync.since,
             // hint 只在确实有下界可回填时指路：since 未提供时 sinceResolved 为 null，
             // 教调用方「传响应里的 sinceResolved」会得到 null/反序列化失败。
             "hint": if cut {
